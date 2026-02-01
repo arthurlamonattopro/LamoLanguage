@@ -157,7 +157,7 @@ UNKNOWN
 
 - [x] Sintaxe base definida  
 - [x] Lexer implementado  
-- [ ] Parser  
+- [X] Parser  
 - [ ] AST  
 - [ ] Análise semântica  
 - [ ] Interpretador / Transpilador  
