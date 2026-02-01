@@ -1,0 +1,49 @@
+#ifndef LEXER_V2_H
+#define LEXER_V2_H
+
+typedef enum {
+    // Keywords
+    TOKEN_LET, TOKEN_FN, TOKEN_RETURN, TOKEN_IF, TOKEN_ELSE, TOKEN_WHILE, TOKEN_FOR, TOKEN_PRINT,
+    TOKEN_TRUE, TOKEN_FALSE,
+    
+    // Literals & Identifiers
+    TOKEN_IDENTIFIER, TOKEN_INT, TOKEN_STRING,
+    
+    // Operators
+    TOKEN_EQUALS, TOKEN_PLUS, TOKEN_MINUS, TOKEN_STAR, TOKEN_SLASH, TOKEN_PERCENT,
+    TOKEN_EQ_EQ, TOKEN_BANG_EQ, TOKEN_LT, TOKEN_GT, TOKEN_LT_EQ, TOKEN_GT_EQ,
+    TOKEN_AND_AND, TOKEN_OR_OR, TOKEN_BANG,
+    TOKEN_PLUS_EQ, TOKEN_MINUS_EQ, TOKEN_PLUS_PLUS, TOKEN_MINUS_MINUS,
+    
+    // Delimiters
+    TOKEN_LPAREN, TOKEN_RPAREN, TOKEN_LBRACE, TOKEN_RBRACE, 
+    TOKEN_LBRACKET, TOKEN_RBRACKET,
+    TOKEN_COMMA, TOKEN_SEMICOLON, TOKEN_COLON,
+    
+    // System
+    TOKEN_EOF, TOKEN_UNKNOWN
+} TokenType;
+
+typedef struct {
+    TokenType type;
+    char* value;
+    int line;
+    int column;
+} Token;
+
+typedef struct {
+    char* source;
+    int pos;
+    int line;
+    int column;
+} Lexer;
+
+// Funções públicas
+Lexer* lexer_init(char* source);
+void lexer_free(Lexer* lexer);
+Token lexer_next_token(Lexer* lexer);
+Token lexer_peek_token(Lexer* lexer);
+void token_free(Token t);
+const char* token_type_name(TokenType type);
+
+#endif
