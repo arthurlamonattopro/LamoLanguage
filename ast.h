@@ -15,6 +15,11 @@ typedef enum {
     AST_FOR_STMT,
     AST_RETURN_STMT,
     AST_PRINT_STMT,
+    AST_INPUT_EXPR,
+    AST_ISNUMBER_EXPR,
+    AST_ISSTRING_EXPR,
+    AST_EXIT_STMT,
+    AST_ABS_EXPR,
     AST_ASSIGN_STMT,
     AST_CALL_STMT,
     AST_BINARY_EXPR,
@@ -159,6 +164,11 @@ ASTWhileStmt* ast_new_while_stmt(ASTNode* condition, ASTNode* body, int line, in
 ASTForStmt* ast_new_for_stmt(ASTNode* initializer, ASTNode* condition, ASTNode* increment, ASTNode* body, int line, int column);
 ASTReturnStmt* ast_new_return_stmt(ASTNode* expression, int line, int column);
 ASTPrintStmt* ast_new_print_stmt(ASTNode* expression, int line, int column);
+ASTNode* ast_new_input_expr(ASTNode* prompt, int line, int column);
+ASTNode* ast_new_isnumber_expr(ASTNode* expression, int line, int column);
+ASTNode* ast_new_isstring_expr(ASTNode* expression, int line, int column);
+ASTNode* ast_new_exit_stmt(ASTNode* code, int line, int column);
+ASTNode* ast_new_abs_expr(ASTNode* expression, int line, int column);
 ASTAssignStmt* ast_new_assign_stmt(char* name, ASTNode* value, TokenType op_type, int line, int column);
 ASTCallStmt* ast_new_call_stmt(char* name, ASTNode** args, int arg_count, int line, int column);
 ASTBinaryExpr* ast_new_binary_expr(ASTNode* left, TokenType operator, ASTNode* right, int line, int column);

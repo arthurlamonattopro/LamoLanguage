@@ -82,6 +82,36 @@ ASTPrintStmt* ast_new_print_stmt(ASTNode* expression, int line, int column) {
     return node;
 }
 
+ASTNode* ast_new_input_expr(ASTNode* prompt, int line, int column) {
+    ASTPrintStmt* node = (ASTPrintStmt*)ast_new_node(AST_INPUT_EXPR, sizeof(ASTPrintStmt), line, column);
+    node->expression = prompt;
+    return (ASTNode*)node;
+}
+
+ASTNode* ast_new_isnumber_expr(ASTNode* expression, int line, int column) {
+    ASTPrintStmt* node = (ASTPrintStmt*)ast_new_node(AST_ISNUMBER_EXPR, sizeof(ASTPrintStmt), line, column);
+    node->expression = expression;
+    return (ASTNode*)node;
+}
+
+ASTNode* ast_new_isstring_expr(ASTNode* expression, int line, int column) {
+    ASTPrintStmt* node = (ASTPrintStmt*)ast_new_node(AST_ISSTRING_EXPR, sizeof(ASTPrintStmt), line, column);
+    node->expression = expression;
+    return (ASTNode*)node;
+}
+
+ASTNode* ast_new_exit_stmt(ASTNode* code, int line, int column) {
+    ASTPrintStmt* node = (ASTPrintStmt*)ast_new_node(AST_EXIT_STMT, sizeof(ASTPrintStmt), line, column);
+    node->expression = code;
+    return (ASTNode*)node;
+}
+
+ASTNode* ast_new_abs_expr(ASTNode* expression, int line, int column) {
+    ASTPrintStmt* node = (ASTPrintStmt*)ast_new_node(AST_ABS_EXPR, sizeof(ASTPrintStmt), line, column);
+    node->expression = expression;
+    return (ASTNode*)node;
+}
+
 ASTAssignStmt* ast_new_assign_stmt(char* name, ASTNode* value, TokenType op_type, int line, int column) {
     ASTAssignStmt* node = (ASTAssignStmt*)ast_new_node(AST_ASSIGN_STMT, sizeof(ASTAssignStmt), line, column);
     node->name = strdup(name);
@@ -191,6 +221,11 @@ void ast_free(ASTNode* node) {
             break;
         case AST_RETURN_STMT:
         case AST_PRINT_STMT:
+        case AST_INPUT_EXPR:
+        case AST_ISNUMBER_EXPR:
+        case AST_ISSTRING_EXPR:
+        case AST_EXIT_STMT:
+        case AST_ABS_EXPR:
             ast_free(((ASTReturnStmt*)node)->expression);
             break;
         case AST_ASSIGN_STMT:

@@ -254,6 +254,50 @@ static void generate_expression_code(ASTNode* node, FILE* out) {
             generate_expression_code(((ASTGroupingExpr*)node)->expression, out);
             fprintf(out, ")");
             break;
+        case AST_INPUT_EXPR: {
+            ASTPrintStmt* input_expr = (ASTPrintStmt*)node;
+            fprintf(out, "({ ");
+            if (input_expr->expression) {
+                if (input_expr->expression->type == AST_STRING_LITERAL) {
+                    fprintf(out, "printf(\"%%s\", ");
+                } else {
+                    fprintf(out, "printf(\"%%d\", ");
+                }
+                generate_expression_code(input_expr->expression, out);
+                fprintf(out, "); ");
+            }
+            fprintf(out, "int _val; scanf(\"%%d\", &_val); _val; })");
+            break;
+        }
+        case AST_ISNUMBER_EXPR: {
+            // For now, in this simple language, everything is an int
+            fprintf(out, "1"); 
+            break;
+        }
+        case AST_ISSTRING_EXPR: {
+            // For now, literals are known, but variables are int
+            ASTPrintStmt* is_str = (ASTPrintStmt*)node;
+            if (is_str->expression->type == AST_STRING_LITERAL) {
+                fprintf(out, "1");
+            } else {
+                fprintf(out, "0");
+            }
+            break;
+        }
+        case AST_EXIT_STMT: {
+            ASTPrintStmt* exit_stmt = (ASTPrintStmt*)node;
+            fprintf(out, "exit(");
+            generate_expression_code(exit_stmt->expression, out);
+            fprintf(out, ")");
+            break;
+        }
+        case AST_ABS_EXPR: {
+            ASTPrintStmt* abs_expr = (ASTPrintStmt*)node;
+            fprintf(out, "abs(");
+            generate_expression_code(abs_expr->expression, out);
+            fprintf(out, ")");
+            break;
+        }
         default: break;
     }
 }

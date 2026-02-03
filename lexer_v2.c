@@ -95,6 +95,11 @@ Token lexer_next_token(Lexer* l) {
         else if (strcmp(t.value, "while") == 0) t.type = TOKEN_WHILE;
         else if (strcmp(t.value, "for") == 0) t.type = TOKEN_FOR;
         else if (strcmp(t.value, "print") == 0) t.type = TOKEN_PRINT;
+        else if (strcmp(t.value, "input") == 0) t.type = TOKEN_INPUT;
+        else if (strcmp(t.value, "isnumber") == 0) t.type = TOKEN_ISNUMBER;
+        else if (strcmp(t.value, "isstring") == 0) t.type = TOKEN_ISSTRING;
+        else if (strcmp(t.value, "exit") == 0) t.type = TOKEN_EXIT;
+        else if (strcmp(t.value, "abs") == 0) t.type = TOKEN_ABS;
         else if (strcmp(t.value, "true") == 0) t.type = TOKEN_TRUE;
         else if (strcmp(t.value, "false") == 0) t.type = TOKEN_FALSE;
         else t.type = TOKEN_IDENTIFIER;
@@ -103,9 +108,18 @@ Token lexer_next_token(Lexer* l) {
     }
 
     if (c == '"') {
+printf("DEBUG: Found quote at %d\n", l->pos);
         advance(l);
         int start = l->pos;
-        while (peek(l) != '"' && peek(l) != '\0') advance(l);
+        while (peek(l) != '\0') {
+            if (peek(l) == '\\' && l->source[l->pos + 1] == '"') {
+                advance(l); advance(l);
+            } else if (peek(l) == '"') {
+                break;
+            } else {
+                advance(l);
+            }
+        }
         t.type = TOKEN_STRING;
         t.value = my_strndup(&l->source[start], l->pos - start);
         if (peek(l) == '"') advance(l);
@@ -195,6 +209,11 @@ const char* token_type_name(TokenType type) {
         case TOKEN_WHILE: return "while";
         case TOKEN_FOR: return "for";
         case TOKEN_PRINT: return "print";
+        case TOKEN_INPUT: return "input";
+        case TOKEN_ISNUMBER: return "isnumber";
+        case TOKEN_ISSTRING: return "isstring";
+        case TOKEN_EXIT: return "exit";
+        case TOKEN_ABS: return "abs";
         case TOKEN_TRUE: return "true";
         case TOKEN_FALSE: return "false";
         case TOKEN_IDENTIFIER: return "IDENTIFIER";

@@ -75,6 +75,54 @@ static ASTNode* parse_primary(Parser* p) {
         advance_p(p);
         return node;
     }
+    else if (p->current.type == TOKEN_INPUT) {
+        int line = p->current.line;
+        int col = p->current.column;
+        advance_p(p);
+        eat_p(p, TOKEN_LPAREN);
+        ASTNode* prompt = NULL;
+        if (p->current.type != TOKEN_RPAREN) {
+            prompt = parse_expression(p);
+        }
+        eat_p(p, TOKEN_RPAREN);
+        return ast_new_input_expr(prompt, line, col);
+    }
+    else if (p->current.type == TOKEN_ISNUMBER) {
+        int line = p->current.line;
+        int col = p->current.column;
+        advance_p(p);
+        eat_p(p, TOKEN_LPAREN);
+        ASTNode* expr = parse_expression(p);
+        eat_p(p, TOKEN_RPAREN);
+        return ast_new_isnumber_expr(expr, line, col);
+    }
+    else if (p->current.type == TOKEN_ISSTRING) {
+        int line = p->current.line;
+        int col = p->current.column;
+        advance_p(p);
+        eat_p(p, TOKEN_LPAREN);
+        ASTNode* expr = parse_expression(p);
+        eat_p(p, TOKEN_RPAREN);
+        return ast_new_isstring_expr(expr, line, col);
+    }
+    else if (p->current.type == TOKEN_EXIT) {
+        int line = p->current.line;
+        int col = p->current.column;
+        advance_p(p);
+        eat_p(p, TOKEN_LPAREN);
+        ASTNode* code = parse_expression(p);
+        eat_p(p, TOKEN_RPAREN);
+        return ast_new_exit_stmt(code, line, col);
+    }
+    else if (p->current.type == TOKEN_ABS) {
+        int line = p->current.line;
+        int col = p->current.column;
+        advance_p(p);
+        eat_p(p, TOKEN_LPAREN);
+        ASTNode* expr = parse_expression(p);
+        eat_p(p, TOKEN_RPAREN);
+        return ast_new_abs_expr(expr, line, col);
+    }
     else if (p->current.type == TOKEN_IDENTIFIER) {
         char* name = strdup(p->current.value);
         int line = p->current.line;
