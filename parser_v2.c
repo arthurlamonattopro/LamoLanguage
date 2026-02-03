@@ -1,63 +1,30 @@
+#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "lexer_v2.h"
-
-// === ESTRUTURAS ===
-
-typedef struct {
-    char* name;
-    int is_string;
-} Variable;
-
-typedef struct {
-    char* name;
-    char** params;
-    int param_count;
-} Function;
+#include "ast.h"
 
 typedef struct {
     Lexer* lexer;
     Token current;
-    Variable* vars;
-    int var_count;
-    Function* funcs;
-    int func_count;
-    int indent;
 } Parser;
-
-// === PARSER INIT/FREE ===
 
 Parser* parser_init(Lexer* lexer) {
     Parser* p = malloc(sizeof(Parser));
+    if (!p) {
+        perror("Failed to allocate Parser");
+        exit(EXIT_FAILURE);
+    }
     p->lexer = lexer;
     p->current = lexer_next_token(lexer);
-    p->vars = NULL;
-    p->var_count = 0;
-    p->funcs = NULL;
-    p->func_count = 0;
-    p->indent = 1;
     return p;
 }
 
 void parser_free(Parser* p) {
     if (!p) return;
-    for (int i = 0; i < p->var_count; i++) free(p->vars[i].name);
-    free(p->vars);
-    for (int i = 0; i < p->func_count; i++) {
-        free(p->funcs[i].name);
-        for (int j = 0; j < p->funcs[i].param_count; j++) free(p->funcs[i].params[j]);
-        free(p->funcs[i].params);
-    }
-    free(p->funcs);
     token_free(p->current);
     free(p);
-}
-
-// === HELPERS ===
-
-static void print_indent(Parser* p, FILE* out) {
-    for (int i = 0; i < p->indent; i++) fprintf(out, "    ");
 }
 
 static void advance_p(Parser* p) {
@@ -84,203 +51,201 @@ static void eat_p(Parser* p, TokenType type) {
     }
 }
 
-static void register_var(Parser* p, const char* name, int is_string) {
-    p->vars = realloc(p->vars, sizeof(Variable) * (p->var_count + 1));
-    p->vars[p->var_count].name = strdup(name);
-    p->vars[p->var_count].is_string = is_string;
-    p->var_count++;
-}
+ASTNode* parse_expression(Parser* p);
 
-static int is_string_var(Parser* p, const char* name) {
-    for (int i = 0; i < p->var_count; i++) {
-        if (strcmp(p->vars[i].name, name) == 0) return p->vars[i].is_string;
-    }
-    return 0;
-}
-
-static void register_func(Parser* p, const char* name, char** params, int count) {
-    p->funcs = realloc(p->funcs, sizeof(Function) * (p->func_count + 1));
-    p->funcs[p->func_count].name = strdup(name);
-    p->funcs[p->func_count].params = params;
-    p->funcs[p->func_count].param_count = count;
-    p->func_count++;
-}
-
-// === EXPRESSÕES (Precedência correta) ===
-// or -> and -> equality -> comparison -> term -> factor -> unary -> primary
-
-void parse_expression(Parser* p, FILE* out);
-
-static void parse_primary(Parser* p, FILE* out) {
+static ASTNode* parse_primary(Parser* p) {
     if (p->current.type == TOKEN_INT) {
-        fprintf(out, "%s", p->current.value);
+        int val = atoi(p->current.value);
+        ASTNode* node = (ASTNode*)ast_new_int_literal(val, p->current.line, p->current.column);
         advance_p(p);
+        return node;
     } 
     else if (p->current.type == TOKEN_STRING) {
-        fprintf(out, "\"%s\"", p->current.value);
+        ASTNode* node = (ASTNode*)ast_new_string_literal(p->current.value, p->current.line, p->current.column);
         advance_p(p);
+        return node;
     }
     else if (p->current.type == TOKEN_TRUE) {
-        fprintf(out, "1");
+        ASTNode* node = (ASTNode*)ast_new_bool_literal(1, p->current.line, p->current.column);
         advance_p(p);
+        return node;
     }
     else if (p->current.type == TOKEN_FALSE) {
-        fprintf(out, "0");
+        ASTNode* node = (ASTNode*)ast_new_bool_literal(0, p->current.line, p->current.column);
         advance_p(p);
+        return node;
     }
     else if (p->current.type == TOKEN_IDENTIFIER) {
         char* name = strdup(p->current.value);
+        int line = p->current.line;
+        int column = p->current.column;
         advance_p(p);
         
-        // Chamada de função
         if (p->current.type == TOKEN_LPAREN) {
             eat_p(p, TOKEN_LPAREN);
-            fprintf(out, "%s(", name);
-            int first = 1;
+            ASTNode** args = NULL;
+            int arg_count = 0;
             while (p->current.type != TOKEN_RPAREN && p->current.type != TOKEN_EOF) {
-                if (!first) fprintf(out, ", ");
-                first = 0;
-                parse_expression(p, out);
+                args = realloc(args, sizeof(ASTNode*) * (arg_count + 1));
+                args[arg_count++] = parse_expression(p);
                 if (p->current.type == TOKEN_COMMA) advance_p(p);
             }
             eat_p(p, TOKEN_RPAREN);
-            fprintf(out, ")");
+            ASTNode* node = (ASTNode*)ast_new_call_expr(name, args, arg_count, line, column);
+            free(name);
+            return node;
         } else {
-            fprintf(out, "%s", name);
+            ASTNode* node = (ASTNode*)ast_new_identifier(name, line, column);
+            free(name);
+            return node;
         }
-        free(name);
     }
     else if (p->current.type == TOKEN_LPAREN) {
         eat_p(p, TOKEN_LPAREN);
-        fprintf(out, "(");
-        parse_expression(p, out);
-        fprintf(out, ")");
+        ASTNode* expr = parse_expression(p);
         eat_p(p, TOKEN_RPAREN);
+        return (ASTNode*)ast_new_grouping_expr(expr, p->current.line, p->current.column);
     }
     else {
         error(p, "Expressão inválida");
+        return NULL;
     }
 }
 
-static void parse_unary(Parser* p, FILE* out) {
+static ASTNode* parse_unary(Parser* p) {
     if (p->current.type == TOKEN_BANG || p->current.type == TOKEN_MINUS) {
-        char* op = strdup(p->current.value);
+        TokenType op_type = p->current.type;
+        int line = p->current.line;
+        int column = p->current.column;
         advance_p(p);
-        fprintf(out, "%s", op);
-        parse_unary(p, out);
-        free(op);
+        ASTNode* right = parse_unary(p);
+        return (ASTNode*)ast_new_unary_expr(op_type, right, line, column);
     } else {
-        parse_primary(p, out);
+        return parse_primary(p);
     }
 }
 
-static void parse_factor(Parser* p, FILE* out) {
-    parse_unary(p, out);
+static ASTNode* parse_factor(Parser* p) {
+    ASTNode* left = parse_unary(p);
     while (p->current.type == TOKEN_STAR || p->current.type == TOKEN_SLASH || 
            p->current.type == TOKEN_PERCENT) {
-        char* op = strdup(p->current.value);
+        TokenType op_type = p->current.type;
+        int line = p->current.line;
+        int column = p->current.column;
         advance_p(p);
-        fprintf(out, " %s ", op);
-        parse_unary(p, out);
-        free(op);
+        ASTNode* right = parse_unary(p);
+        left = (ASTNode*)ast_new_binary_expr(left, op_type, right, line, column);
     }
+    return left;
 }
 
-static void parse_term(Parser* p, FILE* out) {
-    parse_factor(p, out);
+static ASTNode* parse_term(Parser* p) {
+    ASTNode* left = parse_factor(p);
     while (p->current.type == TOKEN_PLUS || p->current.type == TOKEN_MINUS) {
-        char* op = strdup(p->current.value);
+        TokenType op_type = p->current.type;
+        int line = p->current.line;
+        int column = p->current.column;
         advance_p(p);
-        fprintf(out, " %s ", op);
-        parse_factor(p, out);
-        free(op);
+        ASTNode* right = parse_factor(p);
+        left = (ASTNode*)ast_new_binary_expr(left, op_type, right, line, column);
     }
+    return left;
 }
 
-static void parse_comparison(Parser* p, FILE* out) {
-    parse_term(p, out);
+static ASTNode* parse_comparison(Parser* p) {
+    ASTNode* left = parse_term(p);
     while (p->current.type == TOKEN_LT || p->current.type == TOKEN_GT ||
            p->current.type == TOKEN_LT_EQ || p->current.type == TOKEN_GT_EQ) {
-        char* op = strdup(p->current.value);
+        TokenType op_type = p->current.type;
+        int line = p->current.line;
+        int column = p->current.column;
         advance_p(p);
-        fprintf(out, " %s ", op);
-        parse_term(p, out);
-        free(op);
+        ASTNode* right = parse_term(p);
+        left = (ASTNode*)ast_new_binary_expr(left, op_type, right, line, column);
     }
+    return left;
 }
 
-static void parse_equality(Parser* p, FILE* out) {
-    parse_comparison(p, out);
+static ASTNode* parse_equality(Parser* p) {
+    ASTNode* left = parse_comparison(p);
     while (p->current.type == TOKEN_EQ_EQ || p->current.type == TOKEN_BANG_EQ) {
-        char* op = strdup(p->current.value);
+        TokenType op_type = p->current.type;
+        int line = p->current.line;
+        int column = p->current.column;
         advance_p(p);
-        fprintf(out, " %s ", op);
-        parse_comparison(p, out);
-        free(op);
+        ASTNode* right = parse_comparison(p);
+        left = (ASTNode*)ast_new_binary_expr(left, op_type, right, line, column);
     }
+    return left;
 }
 
-static void parse_and(Parser* p, FILE* out) {
-    parse_equality(p, out);
+static ASTNode* parse_and(Parser* p) {
+    ASTNode* left = parse_equality(p);
     while (p->current.type == TOKEN_AND_AND) {
+        TokenType op_type = p->current.type;
+        int line = p->current.line;
+        int column = p->current.column;
         advance_p(p);
-        fprintf(out, " && ");
-        parse_equality(p, out);
+        ASTNode* right = parse_equality(p);
+        left = (ASTNode*)ast_new_binary_expr(left, op_type, right, line, column);
     }
+    return left;
 }
 
-void parse_expression(Parser* p, FILE* out) {
-    parse_and(p, out);
+ASTNode* parse_expression(Parser* p) {
+    ASTNode* left = parse_and(p);
     while (p->current.type == TOKEN_OR_OR) {
+        TokenType op_type = p->current.type;
+        int line = p->current.line;
+        int column = p->current.column;
         advance_p(p);
-        fprintf(out, " || ");
-        parse_and(p, out);
+        ASTNode* right = parse_and(p);
+        left = (ASTNode*)ast_new_binary_expr(left, op_type, right, line, column);
     }
+    return left;
 }
 
-// === STATEMENTS ===
+ASTNode* parse_statement(Parser* p);
 
-void parse_statement(Parser* p, FILE* out);
-
-static void parse_block(Parser* p, FILE* out) {
+static ASTNode* parse_block(Parser* p) {
     eat_p(p, TOKEN_LBRACE);
-    fprintf(out, "{\n");
-    p->indent++;
+    ASTNode* head = NULL;
+    ASTNode* current = NULL;
     while (p->current.type != TOKEN_RBRACE && p->current.type != TOKEN_EOF) {
-        parse_statement(p, out);
+        ASTNode* stmt = parse_statement(p);
+        if (stmt) {
+            if (!head) {
+                head = stmt;
+                current = stmt;
+            } else {
+                current->next = stmt;
+                current = stmt;
+            }
+        }
     }
-    p->indent--;
-    print_indent(p, out);
-    fprintf(out, "}\n");
     eat_p(p, TOKEN_RBRACE);
+    return (ASTNode*)ast_new_block(head, p->current.line, p->current.column);
 }
 
-void parse_statement(Parser* p, FILE* out) {
-    // let x = valor;
+ASTNode* parse_statement(Parser* p) {
     if (p->current.type == TOKEN_LET) {
         eat_p(p, TOKEN_LET);
         char* name = strdup(p->current.value);
+        int line = p->current.line;
+        int column = p->current.column;
         eat_p(p, TOKEN_IDENTIFIER);
         eat_p(p, TOKEN_EQUALS);
-        
-        int is_str = (p->current.type == TOKEN_STRING);
-        register_var(p, name, is_str);
-        
-        print_indent(p, out);
-        if (is_str) {
-            fprintf(out, "const char* %s = ", name);
-        } else {
-            fprintf(out, "int %s = ", name);
-        }
-        parse_expression(p, out);
-        fprintf(out, ";\n");
+        ASTNode* initializer = parse_expression(p);
         eat_p(p, TOKEN_SEMICOLON);
+        ASTNode* node = (ASTNode*)ast_new_var_decl(name, initializer, line, column);
         free(name);
+        return node;
     }
-    // fn nome(params) { ... }
     else if (p->current.type == TOKEN_FN) {
         eat_p(p, TOKEN_FN);
         char* name = strdup(p->current.value);
+        int line = p->current.line;
+        int column = p->current.column;
         eat_p(p, TOKEN_IDENTIFIER);
         eat_p(p, TOKEN_LPAREN);
         
@@ -296,203 +261,212 @@ void parse_statement(Parser* p, FILE* out) {
         }
         eat_p(p, TOKEN_RPAREN);
         
-        register_func(p, name, params, param_count);
-        
-        print_indent(p, out);
-        fprintf(out, "int %s(", name);
-        for (int i = 0; i < param_count; i++) {
-            if (i > 0) fprintf(out, ", ");
-            fprintf(out, "int %s", params[i]);
-        }
-        fprintf(out, ") ");
-        parse_block(p, out);
+        ASTNode* body = parse_block(p);
+        ASTNode* node = (ASTNode*)ast_new_fn_decl(name, params, param_count, body, line, column);
         free(name);
+        return node;
     }
-    // Atribuição: x = valor; ou x += valor;
     else if (p->current.type == TOKEN_IDENTIFIER) {
         char* name = strdup(p->current.value);
+        int line = p->current.line;
+        int column = p->current.column;
         advance_p(p);
         
         if (p->current.type == TOKEN_LPAREN) {
-            // Chamada de função como statement
             eat_p(p, TOKEN_LPAREN);
-            print_indent(p, out);
-            fprintf(out, "%s(", name);
-            int first = 1;
+            ASTNode** args = NULL;
+            int arg_count = 0;
             while (p->current.type != TOKEN_RPAREN && p->current.type != TOKEN_EOF) {
-                if (!first) fprintf(out, ", ");
-                first = 0;
-                parse_expression(p, out);
+                args = realloc(args, sizeof(ASTNode*) * (arg_count + 1));
+                args[arg_count++] = parse_expression(p);
                 if (p->current.type == TOKEN_COMMA) advance_p(p);
             }
             eat_p(p, TOKEN_RPAREN);
-            fprintf(out, ");\n");
             eat_p(p, TOKEN_SEMICOLON);
+            ASTNode* node = (ASTNode*)ast_new_call_stmt(name, args, arg_count, line, column);
+            free(name);
+            return node;
         }
         else if (p->current.type == TOKEN_EQUALS || p->current.type == TOKEN_PLUS_EQ ||
                  p->current.type == TOKEN_MINUS_EQ) {
-            char* op = strdup(p->current.value);
+            TokenType op_type = p->current.type;
             advance_p(p);
-            print_indent(p, out);
-            fprintf(out, "%s %s ", name, op);
-            parse_expression(p, out);
-            fprintf(out, ";\n");
+            ASTNode* value = parse_expression(p);
             eat_p(p, TOKEN_SEMICOLON);
-            free(op);
-        }
-        else if (p->current.type == TOKEN_PLUS_PLUS) {
+            ASTNode* node = (ASTNode*)ast_new_assign_stmt(name, value, op_type, line, column);
+            free(name);
+            return node;
+        } else if (p->current.type == TOKEN_PLUS_PLUS) {
             advance_p(p);
-            print_indent(p, out);
-            fprintf(out, "%s++;\n", name);
             eat_p(p, TOKEN_SEMICOLON);
+            ASTNode* one = (ASTNode*)ast_new_int_literal(1, line, column);
+            ASTNode* ident = (ASTNode*)ast_new_identifier(name, line, column);
+            ASTNode* expr = (ASTNode*)ast_new_binary_expr(ident, TOKEN_PLUS, one, line, column);
+            ASTNode* node = (ASTNode*)ast_new_assign_stmt(name, expr, TOKEN_EQUALS, line, column);
+            free(name);
+            return node;
         }
         else if (p->current.type == TOKEN_MINUS_MINUS) {
             advance_p(p);
-            print_indent(p, out);
-            fprintf(out, "%s--;\n", name);
             eat_p(p, TOKEN_SEMICOLON);
+            ASTNode* one = (ASTNode*)ast_new_int_literal(1, line, column);
+            ASTNode* ident = (ASTNode*)ast_new_identifier(name, line, column);
+            ASTNode* expr = (ASTNode*)ast_new_binary_expr(ident, TOKEN_MINUS, one, line, column);
+            ASTNode* node = (ASTNode*)ast_new_assign_stmt(name, expr, TOKEN_EQUALS, line, column);
+            free(name);
+            return node;
         }
         else {
-            error(p, "Esperado operador de atribuição");
+            error(p, "Esperado operador de atribuição ou chamada de função");
+            free(name);
+            return NULL;
         }
-        free(name);
     }
-    // print(expr);
     else if (p->current.type == TOKEN_PRINT) {
         eat_p(p, TOKEN_PRINT);
         eat_p(p, TOKEN_LPAREN);
-        
-        print_indent(p, out);
-        
-        if (p->current.type == TOKEN_STRING) {
-            fprintf(out, "printf(\"%%s\\n\", \"%s\");\n", p->current.value);
-            advance_p(p);
-        } else if (p->current.type == TOKEN_IDENTIFIER && is_string_var(p, p->current.value)) {
-            fprintf(out, "printf(\"%%s\\n\", %s);\n", p->current.value);
-            advance_p(p);
-        } else {
-            fprintf(out, "printf(\"%%d\\n\", ");
-            parse_expression(p, out);
-            fprintf(out, ");\n");
-        }
-        
+        ASTNode* expr = parse_expression(p);
         eat_p(p, TOKEN_RPAREN);
         eat_p(p, TOKEN_SEMICOLON);
+        return (ASTNode*)ast_new_print_stmt(expr, p->current.line, p->current.column);
     }
-    // if (cond) { ... } else { ... }
     else if (p->current.type == TOKEN_IF) {
         eat_p(p, TOKEN_IF);
+        int line = p->current.line;
+        int column = p->current.column;
         eat_p(p, TOKEN_LPAREN);
-        print_indent(p, out);
-        fprintf(out, "if (");
-        parse_expression(p, out);
-        fprintf(out, ") ");
+        ASTNode* condition = parse_expression(p);
         eat_p(p, TOKEN_RPAREN);
-        parse_block(p, out);
+        ASTNode* then_branch = parse_block(p);
         
+        ASTNode* else_branch = NULL;
         if (p->current.type == TOKEN_ELSE) {
             eat_p(p, TOKEN_ELSE);
-            print_indent(p, out);
-            fprintf(out, "else ");
             if (p->current.type == TOKEN_IF) {
-                parse_statement(p, out);
+                else_branch = parse_statement(p);
             } else {
-                parse_block(p, out);
+                else_branch = parse_block(p);
             }
         }
+        return (ASTNode*)ast_new_if_stmt(condition, then_branch, else_branch, line, column);
     }
-    // while (cond) { ... }
     else if (p->current.type == TOKEN_WHILE) {
         eat_p(p, TOKEN_WHILE);
+        int line = p->current.line;
+        int column = p->current.column;
         eat_p(p, TOKEN_LPAREN);
-        print_indent(p, out);
-        fprintf(out, "while (");
-        parse_expression(p, out);
-        fprintf(out, ") ");
+        ASTNode* condition = parse_expression(p);
         eat_p(p, TOKEN_RPAREN);
-        parse_block(p, out);
+        ASTNode* body = parse_block(p);
+        return (ASTNode*)ast_new_while_stmt(condition, body, line, column);
     }
-    // for (init; cond; step) { ... }
     else if (p->current.type == TOKEN_FOR) {
         eat_p(p, TOKEN_FOR);
+        int line = p->current.line;
+        int column = p->current.column;
         eat_p(p, TOKEN_LPAREN);
-        print_indent(p, out);
-        fprintf(out, "for (");
         
-        // init
+        ASTNode* initializer = NULL;
         if (p->current.type == TOKEN_LET) {
             eat_p(p, TOKEN_LET);
-            char* name = strdup(p->current.value);
+            char* v_name = strdup(p->current.value);
+            int v_line = p->current.line;
+            int v_column = p->current.column;
             eat_p(p, TOKEN_IDENTIFIER);
             eat_p(p, TOKEN_EQUALS);
-            register_var(p, name, 0);
-            fprintf(out, "int %s = ", name);
-            parse_expression(p, out);
-            free(name);
+            ASTNode* init_expr = parse_expression(p);
+            initializer = (ASTNode*)ast_new_var_decl(v_name, init_expr, v_line, v_column);
+            free(v_name);
+        } else if (p->current.type == TOKEN_IDENTIFIER) {
+            char* v_name = strdup(p->current.value);
+            int assign_line = p->current.line;
+            int assign_column = p->current.column;
+            advance_p(p);
+            if (p->current.type == TOKEN_EQUALS || p->current.type == TOKEN_PLUS_EQ || p->current.type == TOKEN_MINUS_EQ) {
+                TokenType op_type = p->current.type;
+                advance_p(p);
+                ASTNode* value = parse_expression(p);
+                initializer = (ASTNode*)ast_new_assign_stmt(v_name, value, op_type, assign_line, assign_column);
+            } else if (p->current.type == TOKEN_PLUS_PLUS) {
+                advance_p(p);
+                ASTNode* one = (ASTNode*)ast_new_int_literal(1, assign_line, assign_column);
+                ASTNode* ident = (ASTNode*)ast_new_identifier(v_name, assign_line, assign_column);
+                ASTNode* expr = (ASTNode*)ast_new_binary_expr(ident, TOKEN_PLUS, one, assign_line, assign_column);
+                initializer = (ASTNode*)ast_new_assign_stmt(v_name, expr, TOKEN_EQUALS, assign_line, assign_column);
+            } else if (p->current.type == TOKEN_MINUS_MINUS) {
+                advance_p(p);
+                ASTNode* one = (ASTNode*)ast_new_int_literal(1, assign_line, assign_column);
+                ASTNode* ident = (ASTNode*)ast_new_identifier(v_name, assign_line, assign_column);
+                ASTNode* expr = (ASTNode*)ast_new_binary_expr(ident, TOKEN_MINUS, one, assign_line, assign_column);
+                initializer = (ASTNode*)ast_new_assign_stmt(v_name, expr, TOKEN_EQUALS, assign_line, assign_column);
+            }
+            free(v_name);
         }
         eat_p(p, TOKEN_SEMICOLON);
-        fprintf(out, "; ");
         
-        // cond
-        parse_expression(p, out);
+        ASTNode* condition = parse_expression(p);
         eat_p(p, TOKEN_SEMICOLON);
-        fprintf(out, "; ");
         
-        // step
+        ASTNode* increment = NULL;
         if (p->current.type == TOKEN_IDENTIFIER) {
-            char* name = strdup(p->current.value);
+            char* v_name = strdup(p->current.value);
+            int inc_line = p->current.line;
+            int inc_column = p->current.column;
             advance_p(p);
             if (p->current.type == TOKEN_PLUS_PLUS) {
                 advance_p(p);
-                fprintf(out, "%s++", name);
-            } else if (p->current.type == TOKEN_PLUS_EQ) {
+                ASTNode* one = (ASTNode*)ast_new_int_literal(1, inc_line, inc_column);
+                ASTNode* ident = (ASTNode*)ast_new_identifier(v_name, inc_line, inc_column);
+                ASTNode* expr = (ASTNode*)ast_new_binary_expr(ident, TOKEN_PLUS, one, inc_line, inc_column);
+                increment = (ASTNode*)ast_new_assign_stmt(v_name, expr, TOKEN_EQUALS, inc_line, inc_column);
+            } else if (p->current.type == TOKEN_MINUS_MINUS) {
                 advance_p(p);
-                fprintf(out, "%s += ", name);
-                parse_expression(p, out);
-            } else {
-                fprintf(out, "%s", name);
+                ASTNode* one = (ASTNode*)ast_new_int_literal(1, inc_line, inc_column);
+                ASTNode* ident = (ASTNode*)ast_new_identifier(v_name, inc_line, inc_column);
+                ASTNode* expr = (ASTNode*)ast_new_binary_expr(ident, TOKEN_MINUS, one, inc_line, inc_column);
+                increment = (ASTNode*)ast_new_assign_stmt(v_name, expr, TOKEN_EQUALS, inc_line, inc_column);
+            } else if (p->current.type == TOKEN_PLUS_EQ || p->current.type == TOKEN_MINUS_EQ || p->current.type == TOKEN_EQUALS) {
+                TokenType op_type = p->current.type;
+                advance_p(p);
+                ASTNode* value = parse_expression(p);
+                increment = (ASTNode*)ast_new_assign_stmt(v_name, value, op_type, inc_line, inc_column);
             }
-            free(name);
+            free(v_name);
         }
         
-        fprintf(out, ") ");
         eat_p(p, TOKEN_RPAREN);
-        parse_block(p, out);
+        ASTNode* body = parse_block(p);
+        return (ASTNode*)ast_new_for_stmt(initializer, condition, increment, body, line, column);
     }
-    // return expr;
     else if (p->current.type == TOKEN_RETURN) {
         eat_p(p, TOKEN_RETURN);
-        print_indent(p, out);
-        fprintf(out, "return ");
-        parse_expression(p, out);
-        fprintf(out, ";\n");
+        ASTNode* expression = parse_expression(p);
         eat_p(p, TOKEN_SEMICOLON);
+        return (ASTNode*)ast_new_return_stmt(expression, p->current.line, p->current.column);
     }
     else if (p->current.type != TOKEN_EOF) {
         advance_p(p);
     }
+    return NULL;
 }
 
-// === PROGRAMA PRINCIPAL ===
+ASTProgram* parse_program_v2(Parser* p) {
+    ASTProgram* program = ast_new_program();
+    ASTNode* head = NULL;
+    ASTNode* current = NULL;
 
-void parse_program_v2(Parser* p, FILE* out) {
-    fprintf(out, "// Código gerado por Lamo v2\n");
-    fprintf(out, "#include <stdio.h>\n");
-    fprintf(out, "#include <stdlib.h>\n");
-    fprintf(out, "#include <string.h>\n\n");
-    
-    // Primeira passada: coletar funções
-    while (p->current.type == TOKEN_FN) {
-        parse_statement(p, out);
-        fprintf(out, "\n");
-    }
-    
-    fprintf(out, "int main() {\n");
-    
     while (p->current.type != TOKEN_EOF) {
-        parse_statement(p, out);
+        ASTNode* stmt = parse_statement(p);
+        if (stmt) {
+            if (!head) {
+                head = stmt;
+                current = stmt;
+            } else {
+                current->next = stmt;
+                current = stmt;
+            }
+        }
     }
-    
-    print_indent(p, out);
-    fprintf(out, "return 0;\n}\n");
+    program->declarations = head;
+    return program;
 }

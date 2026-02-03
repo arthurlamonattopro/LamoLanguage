@@ -1,39 +1,34 @@
-// Código gerado por Lamo v2
+// Código gerado por Lamo v2 (via AST)
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-    int fatorial(int n) {
-        if (n <= 1) {
-            return 1;
-        }
-        return n * fatorial(n - 1);
-    }
+int fatorial(int n);
 
-    int eh_par(int x) {
-        return x % 2 == 0;
+int fatorial(int n) {
+    if (n <= 1) {
+        return 1;
     }
+    return n * fatorial(n - 1);
+}
 
 int main() {
-    const char* msg = "Bem-vindo ao Lamo v2!";
-    printf("%s\n", msg);
-    printf("%s\n", "Contagem de 1 a 5:");
-    for (int i = 1; i <= 5; i++) {
+    int x = 10;
+    int y = 20;
+    int z = x + y;
+    printf("%s\n", "Resultado da soma:");
+    printf("%d\n", z);
+    printf("%s\n", "Fatorial de 5:");
+    printf("%d\n", fatorial(5));
+    int i = 0;
+    printf("%s\n", "Contagem ate 5:");
+    while (i < 5) {
+        i = i + 1;
         printf("%d\n", i);
     }
-    printf("%s\n", "Fatorial de 5:");
-    int resultado = fatorial(5);
-    printf("%d\n", resultado);
-    int a = 10;
-    int b = 20;
-    if (a < b && eh_par(a)) {
-        printf("%s\n", "a é menor que b E é par");
+    printf("%s\n", "Loop for:");
+    for (int j = 0; j < 3; j = j + 1) {
+        printf("%d\n", j);
     }
-    int contador = 0;
-    while (contador < 3) {
-        printf("%d\n", contador);
-        contador += 1;
-    }
-    printf("%s\n", "Fim!");
     return 0;
 }

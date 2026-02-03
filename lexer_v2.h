@@ -1,6 +1,8 @@
 #ifndef LEXER_V2_H
 #define LEXER_V2_H
 
+#define _POSIX_C_SOURCE 200809L
+
 typedef enum {
     // Keywords
     TOKEN_LET, TOKEN_FN, TOKEN_RETURN, TOKEN_IF, TOKEN_ELSE, TOKEN_WHILE, TOKEN_FOR, TOKEN_PRINT,

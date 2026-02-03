@@ -1,241 +1,234 @@
+#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 #include "lexer_v2.h"
 
-// Implementação de strndup para compatibilidade
-static char* lamo_strndup(const char* s, size_t n) {
-    size_t len = 0;
-    while (len < n && s[len] != '\0') len++;
-    char* res = malloc(len + 1);
+static char* my_strndup(const char* s, size_t n) {
+    char* res = malloc(n + 1);
     if (res) {
-        memcpy(res, s, len);
-        res[len] = '\0';
+        memcpy(res, s, n);
+        res[n] = '\0';
     }
     return res;
 }
 
-const char* token_type_name(TokenType type) {
-    static const char* names[] = {
-        "LET", "FN", "RETURN", "IF", "ELSE", "WHILE", "FOR", "PRINT",
-        "TRUE", "FALSE", "IDENTIFIER", "INT", "STRING",
-        "=", "+", "-", "*", "/", "%", "==", "!=", "<", ">", "<=", ">=",
-        "&&", "||", "!", "+=", "-=", "++", "--",
-        "(", ")", "{", "}", "[", "]", ",", ";", ":",
-        "EOF", "UNKNOWN"
-    };
-    return names[type];
-}
-
 Lexer* lexer_init(char* source) {
-    Lexer* lexer = malloc(sizeof(Lexer));
-    if (!lexer) return NULL;
-    lexer->source = source;
-    lexer->pos = 0;
-    lexer->line = 1;
-    lexer->column = 1;
-    return lexer;
+    Lexer* l = malloc(sizeof(Lexer));
+    l->source = source;
+    l->pos = 0;
+    l->line = 1;
+    l->column = 1;
+    return l;
 }
 
 void lexer_free(Lexer* lexer) {
-    if (lexer) free(lexer);
+    free(lexer);
 }
 
-static Token create_token(TokenType type, char* value, int line, int col) {
-    Token t;
-    t.type = type;
-    t.value = value ? strdup(value) : strdup("");
-    t.line = line;
-    t.column = col;
-    return t;
+static char peek(Lexer* l) {
+    return l->source[l->pos];
 }
 
-void token_free(Token t) {
-    if (t.value) free(t.value);
-}
-
-static char peek(Lexer* lexer) {
-    return lexer->source[lexer->pos];
-}
-
-static char peek_next(Lexer* lexer) {
-    if (lexer->source[lexer->pos] == '\0') return '\0';
-    return lexer->source[lexer->pos + 1];
-}
-
-static char advance(Lexer* lexer) {
-    char c = lexer->source[lexer->pos++];
+static char advance(Lexer* l) {
+    char c = l->source[l->pos++];
     if (c == '\n') {
-        lexer->line++;
-        lexer->column = 1;
+        l->line++;
+        l->column = 1;
     } else {
-        lexer->column++;
+        l->column++;
     }
     return c;
 }
 
-static void skip_whitespace(Lexer* lexer) {
-    while (isspace(peek(lexer))) advance(lexer);
-}
-
-static void skip_line_comment(Lexer* lexer) {
-    while (peek(lexer) != '\n' && peek(lexer) != '\0') advance(lexer);
-}
-
-static void skip_block_comment(Lexer* lexer) {
-    advance(lexer); // *
-    while (!(peek(lexer) == '*' && peek_next(lexer) == '/') && peek(lexer) != '\0') {
-        advance(lexer);
-    }
-    if (peek(lexer) != '\0') {
-        advance(lexer); // *
-        advance(lexer); // /
-    }
-}
-
-static void skip_whitespace_and_comments(Lexer* lexer) {
+static void skip_whitespace(Lexer* l) {
     while (1) {
-        skip_whitespace(lexer);
-        if (peek(lexer) == '/' && peek_next(lexer) == '/') {
-            advance(lexer); advance(lexer);
-            skip_line_comment(lexer);
-        } else if (peek(lexer) == '/' && peek_next(lexer) == '*') {
-            advance(lexer);
-            skip_block_comment(lexer);
+        char c = peek(l);
+        if (isspace(c)) {
+            advance(l);
+        } else if (c == '/' && l->source[l->pos + 1] == '/') {
+            while (peek(l) != '\n' && peek(l) != '\0') advance(l);
+        } else if (c == '/' && l->source[l->pos + 1] == '*') {
+            advance(l); advance(l);
+            while (!(peek(l) == '*' && l->source[l->pos + 1] == '/') && peek(l) != '\0') advance(l);
+            if (peek(l) != '\0') { advance(l); advance(l); }
         } else {
             break;
         }
     }
 }
 
-static Token scan_identifier(Lexer* lexer) {
-    int start = lexer->pos;
-    int line = lexer->line, col = lexer->column;
+Token lexer_next_token(Lexer* l) {
+    skip_whitespace(l);
     
-    while (isalnum(peek(lexer)) || peek(lexer) == '_') advance(lexer);
-    
-    char* buf = lamo_strndup(lexer->source + start, lexer->pos - start);
-    
-    // Keywords
-    struct { const char* kw; TokenType type; } keywords[] = {
-        {"let", TOKEN_LET}, {"fn", TOKEN_FN}, {"return", TOKEN_RETURN},
-        {"if", TOKEN_IF}, {"else", TOKEN_ELSE}, {"while", TOKEN_WHILE},
-        {"for", TOKEN_FOR}, {"print", TOKEN_PRINT},
-        {"true", TOKEN_TRUE}, {"false", TOKEN_FALSE},
-        {NULL, TOKEN_UNKNOWN}
-    };
-    
-    for (int i = 0; keywords[i].kw; i++) {
-        if (strcmp(buf, keywords[i].kw) == 0) {
-            Token t = create_token(keywords[i].type, buf, line, col);
-            free(buf);
-            return t;
-        }
-    }
-    
-    Token t = create_token(TOKEN_IDENTIFIER, buf, line, col);
-    free(buf);
-    return t;
-}
+    Token t;
+    t.line = l->line;
+    t.column = l->column;
+    t.value = NULL;
 
-static Token scan_number(Lexer* lexer) {
-    int start = lexer->pos;
-    int line = lexer->line, col = lexer->column;
-    
-    while (isdigit(peek(lexer))) advance(lexer);
-    
-    char* buf = lamo_strndup(lexer->source + start, lexer->pos - start);
-    Token t = create_token(TOKEN_INT, buf, line, col);
-    free(buf);
-    return t;
-}
-
-static Token scan_string(Lexer* lexer) {
-    int line = lexer->line, col = lexer->column;
-    int start = lexer->pos;
-    
-    while (peek(lexer) != '"' && peek(lexer) != '\0') {
-        if (peek(lexer) == '\\' && peek_next(lexer) != '\0') {
-            advance(lexer); // escape char
-        }
-        advance(lexer);
+    char c = peek(l);
+    if (c == '\0') {
+        t.type = TOKEN_EOF;
+        t.value = strdup("EOF");
+        return t;
     }
-    
-    char* buf = lamo_strndup(lexer->source + start, lexer->pos - start);
-    if (peek(lexer) == '"') advance(lexer);
-    
-    Token t = create_token(TOKEN_STRING, buf, line, col);
-    free(buf);
-    return t;
-}
 
-Token lexer_next_token(Lexer* lexer) {
-    skip_whitespace_and_comments(lexer);
-    
-    if (peek(lexer) == '\0') 
-        return create_token(TOKEN_EOF, "EOF", lexer->line, lexer->column);
-    
-    int line = lexer->line, col = lexer->column;
-    char c = advance(lexer);
-    
-    // Identificadores e palavras-chave
-    if (isalpha(c) || c == '_') {
-        lexer->pos--; lexer->column--;
-        return scan_identifier(lexer);
-    }
-    
-    // Números
     if (isdigit(c)) {
-        lexer->pos--; lexer->column--;
-        return scan_number(lexer);
+        int start = l->pos;
+        while (isdigit(peek(l))) advance(l);
+        t.type = TOKEN_INT;
+        t.value = my_strndup(&l->source[start], l->pos - start);
+        return t;
     }
-    
-    // Strings
-    if (c == '"') return scan_string(lexer);
-    
-    // Operadores e delimitadores
+
+    if (isalpha(c) || c == '_') {
+        int start = l->pos;
+        while (isalnum(peek(l)) || peek(l) == '_') advance(l);
+        t.value = my_strndup(&l->source[start], l->pos - start);
+        
+        if (strcmp(t.value, "let") == 0) t.type = TOKEN_LET;
+        else if (strcmp(t.value, "fn") == 0) t.type = TOKEN_FN;
+        else if (strcmp(t.value, "return") == 0) t.type = TOKEN_RETURN;
+        else if (strcmp(t.value, "if") == 0) t.type = TOKEN_IF;
+        else if (strcmp(t.value, "else") == 0) t.type = TOKEN_ELSE;
+        else if (strcmp(t.value, "while") == 0) t.type = TOKEN_WHILE;
+        else if (strcmp(t.value, "for") == 0) t.type = TOKEN_FOR;
+        else if (strcmp(t.value, "print") == 0) t.type = TOKEN_PRINT;
+        else if (strcmp(t.value, "true") == 0) t.type = TOKEN_TRUE;
+        else if (strcmp(t.value, "false") == 0) t.type = TOKEN_FALSE;
+        else t.type = TOKEN_IDENTIFIER;
+        
+        return t;
+    }
+
+    if (c == '"') {
+        advance(l);
+        int start = l->pos;
+        while (peek(l) != '"' && peek(l) != '\0') advance(l);
+        t.type = TOKEN_STRING;
+        t.value = my_strndup(&l->source[start], l->pos - start);
+        if (peek(l) == '"') advance(l);
+        return t;
+    }
+
+    advance(l);
     switch (c) {
+        case '(': t.type = TOKEN_LPAREN; t.value = strdup("("); break;
+        case ')': t.type = TOKEN_RPAREN; t.value = strdup(")"); break;
+        case '{': t.type = TOKEN_LBRACE; t.value = strdup("{"); break;
+        case '}': t.type = TOKEN_RBRACE; t.value = strdup("}"); break;
+        case '[': t.type = TOKEN_LBRACKET; t.value = strdup("["); break;
+        case ']': t.type = TOKEN_RBRACKET; t.value = strdup("]"); break;
+        case ',': t.type = TOKEN_COMMA; t.value = strdup(","); break;
+        case ';': t.type = TOKEN_SEMICOLON; t.value = strdup(";"); break;
+        case ':': t.type = TOKEN_COLON; t.value = strdup(":"); break;
+        case '+':
+            if (peek(l) == '=') { advance(l); t.type = TOKEN_PLUS_EQ; t.value = strdup("+="); }
+            else if (peek(l) == '+') { advance(l); t.type = TOKEN_PLUS_PLUS; t.value = strdup("++"); }
+            else { t.type = TOKEN_PLUS; t.value = strdup("+"); }
+            break;
+        case '-':
+            if (peek(l) == '=') { advance(l); t.type = TOKEN_MINUS_EQ; t.value = strdup("-="); }
+            else if (peek(l) == '-') { advance(l); t.type = TOKEN_MINUS_MINUS; t.value = strdup("--"); }
+            else { t.type = TOKEN_MINUS; t.value = strdup("-"); }
+            break;
+        case '*': t.type = TOKEN_STAR; t.value = strdup("*"); break;
+        case '/': t.type = TOKEN_SLASH; t.value = strdup("/"); break;
+        case '%': t.type = TOKEN_PERCENT; t.value = strdup("%"); break;
         case '=':
-            if (peek(lexer) == '=') { advance(lexer); return create_token(TOKEN_EQ_EQ, "==", line, col); }
-            return create_token(TOKEN_EQUALS, "=", line, col);
+            if (peek(l) == '=') { advance(l); t.type = TOKEN_EQ_EQ; t.value = strdup("=="); }
+            else { t.type = TOKEN_EQUALS; t.value = strdup("="); }
+            break;
         case '!':
-            if (peek(lexer) == '=') { advance(lexer); return create_token(TOKEN_BANG_EQ, "!=", line, col); }
-            return create_token(TOKEN_BANG, "!", line, col);
+            if (peek(l) == '=') { advance(l); t.type = TOKEN_BANG_EQ; t.value = strdup("!="); }
+            else { t.type = TOKEN_BANG; t.value = strdup("!"); }
+            break;
         case '<':
-            if (peek(lexer) == '=') { advance(lexer); return create_token(TOKEN_LT_EQ, "<=", line, col); }
-            return create_token(TOKEN_LT, "<", line, col);
+            if (peek(l) == '=') { advance(l); t.type = TOKEN_LT_EQ; t.value = strdup("<="); }
+            else { t.type = TOKEN_LT; t.value = strdup("<"); }
+            break;
         case '>':
-            if (peek(lexer) == '=') { advance(lexer); return create_token(TOKEN_GT_EQ, ">=", line, col); }
-            return create_token(TOKEN_GT, ">", line, col);
+            if (peek(l) == '=') { advance(l); t.type = TOKEN_GT_EQ; t.value = strdup(">="); }
+            else { t.type = TOKEN_GT; t.value = strdup(">"); }
+            break;
         case '&':
-            if (peek(lexer) == '&') { advance(lexer); return create_token(TOKEN_AND_AND, "&&", line, col); }
+            if (peek(l) == '&') { advance(l); t.type = TOKEN_AND_AND; t.value = strdup("&&"); }
+            else { t.type = TOKEN_UNKNOWN; t.value = strdup("&"); }
             break;
         case '|':
-            if (peek(lexer) == '|') { advance(lexer); return create_token(TOKEN_OR_OR, "||", line, col); }
+            if (peek(l) == '|') { advance(l); t.type = TOKEN_OR_OR; t.value = strdup("||"); }
+            else { t.type = TOKEN_UNKNOWN; t.value = strdup("|"); }
             break;
-        case '+':
-            if (peek(lexer) == '+') { advance(lexer); return create_token(TOKEN_PLUS_PLUS, "++", line, col); }
-            if (peek(lexer) == '=') { advance(lexer); return create_token(TOKEN_PLUS_EQ, "+=", line, col); }
-            return create_token(TOKEN_PLUS, "+", line, col);
-        case '-':
-            if (peek(lexer) == '-') { advance(lexer); return create_token(TOKEN_MINUS_MINUS, "--", line, col); }
-            if (peek(lexer) == '=') { advance(lexer); return create_token(TOKEN_MINUS_EQ, "-=", line, col); }
-            return create_token(TOKEN_MINUS, "-", line, col);
-        case '*': return create_token(TOKEN_STAR, "*", line, col);
-        case '/': return create_token(TOKEN_SLASH, "/", line, col);
-        case '%': return create_token(TOKEN_PERCENT, "%", line, col);
-        case '(': return create_token(TOKEN_LPAREN, "(", line, col);
-        case ')': return create_token(TOKEN_RPAREN, ")", line, col);
-        case '{': return create_token(TOKEN_LBRACE, "{", line, col);
-        case '}': return create_token(TOKEN_RBRACE, "}", line, col);
-        case '[': return create_token(TOKEN_LBRACKET, "[", line, col);
-        case ']': return create_token(TOKEN_RBRACKET, "]", line, col);
-        case ',': return create_token(TOKEN_COMMA, ",", line, col);
-        case ';': return create_token(TOKEN_SEMICOLON, ";", line, col);
-        case ':': return create_token(TOKEN_COLON, ":", line, col);
+        default:
+            t.type = TOKEN_UNKNOWN;
+            t.value = malloc(2);
+            t.value[0] = c;
+            t.value[1] = '\0';
+            break;
     }
-    
-    char err[2] = {c, '\0'};
-    return create_token(TOKEN_UNKNOWN, err, line, col);
+    return t;
+}
+
+Token lexer_peek_token(Lexer* l) {
+    int pos = l->pos;
+    int line = l->line;
+    int col = l->column;
+    Token t = lexer_next_token(l);
+    l->pos = pos;
+    l->line = line;
+    l->column = col;
+    return t;
+}
+
+void token_free(Token t) {
+    free(t.value);
+}
+
+const char* token_type_name(TokenType type) {
+    switch (type) {
+        case TOKEN_LET: return "let";
+        case TOKEN_FN: return "fn";
+        case TOKEN_RETURN: return "return";
+        case TOKEN_IF: return "if";
+        case TOKEN_ELSE: return "else";
+        case TOKEN_WHILE: return "while";
+        case TOKEN_FOR: return "for";
+        case TOKEN_PRINT: return "print";
+        case TOKEN_TRUE: return "true";
+        case TOKEN_FALSE: return "false";
+        case TOKEN_IDENTIFIER: return "IDENTIFIER";
+        case TOKEN_INT: return "INT";
+        case TOKEN_STRING: return "STRING";
+        case TOKEN_EQUALS: return "=";
+        case TOKEN_PLUS: return "+";
+        case TOKEN_MINUS: return "-";
+        case TOKEN_STAR: return "*";
+        case TOKEN_SLASH: return "/";
+        case TOKEN_PERCENT: return "%";
+        case TOKEN_BANG: return "!";
+        case TOKEN_LT: return "<";
+        case TOKEN_GT: return ">";
+        case TOKEN_LPAREN: return "(";
+        case TOKEN_RPAREN: return ")";
+        case TOKEN_LBRACE: return "{";
+        case TOKEN_RBRACE: return "}";
+        case TOKEN_LBRACKET: return "[";
+        case TOKEN_RBRACKET: return "]";
+        case TOKEN_COMMA: return ",";
+        case TOKEN_SEMICOLON: return ";";
+        case TOKEN_COLON: return ":";
+        case TOKEN_EQ_EQ: return "==";
+        case TOKEN_BANG_EQ: return "!=";
+        case TOKEN_LT_EQ: return "<=";
+        case TOKEN_GT_EQ: return ">=";
+        case TOKEN_AND_AND: return "&&";
+        case TOKEN_OR_OR: return "||";
+        case TOKEN_PLUS_EQ: return "+=";
+        case TOKEN_MINUS_EQ: return "-=";
+        case TOKEN_PLUS_PLUS: return "++";
+        case TOKEN_MINUS_MINUS: return "--";
+        case TOKEN_EOF: return "EOF";
+        default: return "UNKNOWN";
+    }
 }
