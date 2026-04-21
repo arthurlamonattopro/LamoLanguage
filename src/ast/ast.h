@@ -1,7 +1,7 @@
 #ifndef AST_H
 #define AST_H
 
-#include "lexer_v2.h"
+#include "lexer.h"
 #include <stddef.h>
 
 // Enumeração dos tipos de nós da AST
@@ -179,6 +179,7 @@ ASTBoolLiteral* ast_new_bool_literal(int value, int line, int column);
 ASTIdentifier* ast_new_identifier(char* name, int line, int column);
 ASTCallExpr* ast_new_call_expr(char* name, ASTNode** args, int arg_count, int line, int column);
 ASTGroupingExpr* ast_new_grouping_expr(ASTNode* expression, int line, int column);
+void ast_program_append(ASTProgram* destination, ASTProgram* source);
 
 void ast_free(ASTNode* node);
 

@@ -1,7 +1,7 @@
-#ifndef PARSER_V2_H
-#define PARSER_V2_H
+#ifndef PARSER_H
+#define PARSER_H
 
-#include "lexer_v2.h"
+#include "lexer.h"
 #include "ast.h"
 
 typedef struct Parser Parser;
@@ -11,5 +11,6 @@ void parser_free(Parser* p);
 ASTNode* parse_expression(Parser* p);
 ASTNode* parse_statement(Parser* p);
 ASTProgram* parse_program_v2(Parser* p);
+void parser_error(Parser* p, const char* message);
 
 #endif

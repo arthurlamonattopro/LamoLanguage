@@ -1,12 +1,18 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -std=c99
+CFLAGS = -Wall -Wextra -std=c99 -Isrc -Isrc/lexer -Isrc/parser -Isrc/ast -Isrc/codegen -Isrc/semantic
 
-SRCS = lamo_v2.c lexer_v2.c parser_v2.c ast.c codegen.c
+SRCS = src/lamo_v2.c src/lexer/lexer.c src/parser/parser.c src/ast/ast.c src/codegen/codegen.c src/semantic/semantic.c
 OBJS = $(SRCS:.c=.o)
 
-TARGET = lamo
+ifeq ($(OS),Windows_NT)
+EXEEXT = .exe
+else
+EXEEXT =
+endif
 
-.PHONY: all clean
+TARGET = lamo$(EXEEXT)
+
+.PHONY: all clean test
 
 all: $(TARGET)
 
@@ -17,4 +23,7 @@ $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(OBJS) $(TARGET) *.c.output
+	rm -f $(OBJS) $(TARGET) *.c.output lamo_exec.c lamo_exec.exe lamo.exe
+
+test: $(TARGET)
+	powershell -ExecutionPolicy Bypass -File tests/run_tests.ps1

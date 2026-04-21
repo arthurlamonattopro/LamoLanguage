@@ -1,170 +1,152 @@
 # Lamo Language
 
-## Visão Geral
+Lamo is a small experimental programming language implemented in C. Today it has a lexer, parser, AST, a first semantic-analysis pass, and a C backend with `run`, `build`, and `check` commands.
 
-**Lamo** é uma linguagem de programação experimental, desenvolvida do zero, com inspiração direta em **C**, porém adotando uma sintaxe mais moderna e menos verbosa.  
-O projeto tem como objetivo estudar e implementar os principais componentes de uma linguagem de programação, incluindo análise léxica, sintática e semântica, mantendo controle explícito sobre memória e execução.
+## Current Status
 
-A linguagem foi projetada para ser simples, previsível e extensível, servindo tanto como ferramenta educacional quanto como base para experimentação em design de linguagens.
+Implemented now:
 
----
+- lexical analysis
+- parsing into an AST
+- semantic checks for scopes and functions
+- C code generation
+- compile, build, and run CLI flow
+- fixture-based compiler tests
 
-## Filosofia de Design
+Implemented in semantics:
 
-- Sintaxe imperativa inspirada em C  
-- Estruturas de controle explícitas  
-- Blocos delimitados por `{ }`  
-- Sem dependência de runtime complexo  
-- Implementação em C puro  
-- Prioridade em clareza e controle, não em abstrações ocultas  
+- block, function, and global scopes
+- duplicate declaration errors in the same scope
+- undeclared variable errors
+- undeclared function call errors
+- function call arity validation
+- `return` validation outside functions
 
----
+Not implemented yet:
 
-## Características da Linguagem
+- a real type system
+- typed variables or functions
+- per-node file-aware diagnostics across merged multi-file builds
+- a standard runtime/library design
+- richer diagnostics with source snippets
 
-### Estrutura Geral
+## Language Features
 
-- Execução sequencial  
-- Escopo baseado em blocos  
-- Funções definidas com `fn`  
-- Declaração de variáveis com `let`  
-- Tipagem implícita (fase atual do projeto)  
-- Entrada única de execução (script-style)  
+Current syntax supported by the compiler includes:
 
----
+- `let` variable declarations
+- `fn` function declarations
+- `if` / `else`
+- `while`
+- `for`
+- `return`
+- assignment with `=`, `+=`, `-=`, `++`, `--`
+- integer, string, and boolean literals
+- function calls
+- builtins such as `print`, `input`, `isnumber`, `isstring`, `exit`, and `abs`
 
-## Sintaxe Básica
-
-### Declaração de Variáveis
+Example:
 
 ```lamo
 let x = 10;
-let msg = "Olá, mundo";
-```
+let y = 20;
 
-### Funções
-
-```lamo
-fn soma(a, b) {
+fn add(a, b) {
     return a + b;
 }
+
+print(add(x, y));
 ```
 
-### Condicionais
+## Build And Run
+
+Build the compiler:
+
+```sh
+make
+```
+
+Or compile directly with GCC:
+
+```sh
+gcc -Wall -Wextra -std=c99 -Isrc -Isrc/lexer -Isrc/parser -Isrc/ast -Isrc/codegen -Isrc/semantic \
+    src/lamo_v2.c src/lexer/lexer.c src/parser/parser.c src/ast/ast.c src/codegen/codegen.c src/semantic/semantic.c \
+    -o lamo
+```
+
+Run a program:
+
+```sh
+./lamo run examples/test.lamo
+```
+
+Run multiple source files together:
+
+```sh
+./lamo run examples/main.lamo
+```
+
+And inside `examples/main.lamo`:
 
 ```lamo
-if (x > 10) {
-    print("Maior que 10");
-} else {
-    print("Menor ou igual a 10");
-}
+import "math.lamo";
 ```
 
-### Laços de Repetição
+Build a program without running it:
 
-#### While
-
-```lamo
-while (x < 5) {
-    x += 1;
-}
+```sh
+./lamo build examples/test.lamo -o demo
 ```
 
-#### For
+Check parsing and semantics only:
 
-```lamo
-for (let i = 0; i < 10; i++) {
-    print(i);
-}
+```sh
+./lamo check examples/test.lamo
 ```
 
----
+Show help or version:
 
-## Comentários
-
-```lamo
-// Comentário de linha
-
-/*
-   Comentário de bloco
-*/
+```sh
+./lamo help
+./lamo version
 ```
 
----
+## Generated Output
 
-## Componentes da Linguagem
+The current backend emits C code to `lamo_exec.c`, then invokes `gcc` to build the executable. This is still a temporary backend strategy while the language model matures.
 
-1. Lexer (Analisador Léxico)  
-2. Parser (Analisador Sintático)  
-3. AST (Árvore Sintática Abstrata)  
-4. Analisador Semântico  
-5. Backend (interpretação ou geração de código)  
+## Tests
 
-Atualmente, o projeto possui o **lexer totalmente funcional**.
+Run the regression suite with:
 
----
-
-## Tokens Suportados
-
-### Palavras-chave
-
-```
-let, fn, return, if, else, while, for, print, true, false
+```sh
+make test
 ```
 
-### Literais e Identificadores
+The tests cover:
 
-```
-IDENTIFIER
-INT
-STRING
-```
+- valid parse and semantic-check cases
+- invalid syntax cases
+- invalid semantic cases
+- end-to-end compile-and-run behavior
+- CRLF and LF source handling
 
-### Operadores
+## Repository Layout
 
-```
-=  +  -  *  /  %
-== != < > <= >=
-&& || !
-+= -= ++ --
-```
+- [src/lexer/lexer.c](/l:/Codes/LamoLanguage/src/lexer/lexer.c)
+- [src/parser/parser.c](/l:/Codes/LamoLanguage/src/parser/parser.c)
+- [src/ast/ast.c](/l:/Codes/LamoLanguage/src/ast/ast.c)
+- [src/semantic/semantic.c](/l:/Codes/LamoLanguage/src/semantic/semantic.c)
+- [src/codegen/codegen.c](/l:/Codes/LamoLanguage/src/codegen/codegen.c)
+- [src/lamo_v2.c](/l:/Codes/LamoLanguage/src/lamo_v2.c)
+- [tests/run_tests.ps1](/l:/Codes/LamoLanguage/tests/run_tests.ps1)
 
-### Delimitadores
+## Contributor Note
 
-```
-( ) { } [ ]
-, ; :
-```
+The fastest inner loop is:
 
-### Especiais
+1. Build with `make`
+2. Run `./lamo check <file.lamo>` while changing parser or semantics
+3. Run `make test` before finishing changes
 
-```
-EOF
-UNKNOWN
-```
-
----
-
-## Compatibilidade
-
-- Dependência apenas da biblioteca padrão C  
-- Implementação própria de `strndup` para portabilidade  
-- Compatível com GCC e Clang  
-
----
-
-## Estado do Projeto
-
-- [x] Sintaxe base definida  
-- [x] Lexer implementado  
-- [X] Parser  
-- [ ] AST  
-- [ ] Análise semântica  
-- [ ] Interpretador / Transpilador  
-
----
-
-## Licença
-
-Projeto experimental e educacional.  
-Uso livre para estudo e modificação.
+When changing syntax, update the parser, semantic pass, tests, and this README together so the documented language stays aligned with the compiler.

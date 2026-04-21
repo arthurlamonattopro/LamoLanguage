@@ -1,5 +1,5 @@
-#ifndef LEXER_V2_H
-#define LEXER_V2_H
+#ifndef LEXER_H
+#define LEXER_H
 
 #define _POSIX_C_SOURCE 200809L
 

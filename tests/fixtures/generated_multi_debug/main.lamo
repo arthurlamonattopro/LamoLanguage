@@ -1,0 +1,4 @@
+import "math.lamo";
+
+let base = 5;
+print(add(base, 7));

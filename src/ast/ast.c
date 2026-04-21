@@ -181,6 +181,34 @@ ASTGroupingExpr* ast_new_grouping_expr(ASTNode* expression, int line, int column
     return node;
 }
 
+void ast_program_append(ASTProgram* destination, ASTProgram* source) {
+    ASTNode* tail;
+
+    if (!destination || !source || !source->declarations) {
+        if (source) {
+            source->declarations = NULL;
+            free(source);
+        }
+        return;
+    }
+
+    if (!destination->declarations) {
+        destination->declarations = source->declarations;
+        source->declarations = NULL;
+        free(source);
+        return;
+    }
+
+    tail = destination->declarations;
+    while (tail->next) {
+        tail = tail->next;
+    }
+
+    tail->next = source->declarations;
+    source->declarations = NULL;
+    free(source);
+}
+
 void ast_free(ASTNode* node) {
     if (!node) return;
     ASTNode* next = node->next;

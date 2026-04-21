@@ -3,7 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
-#include "lexer_v2.h"
+#include "lexer.h"
 
 static char* my_strndup(const char* s, size_t n) {
     char* res = malloc(n + 1);
@@ -33,7 +33,15 @@ static char peek(Lexer* l) {
 
 static char advance(Lexer* l) {
     char c = l->source[l->pos++];
-    if (c == '\n') {
+    if (c == '\r') {
+        l->line++;
+        l->column = 1;
+        // Skip following \n for CRLF sequences
+        if (l->source[l->pos] == '\n') {
+            l->pos++;
+        }
+    } else if (c == '\n') {
+        // Handle standalone \n (Unix line endings)
         l->line++;
         l->column = 1;
     } else {
@@ -45,10 +53,10 @@ static char advance(Lexer* l) {
 static void skip_whitespace(Lexer* l) {
     while (1) {
         char c = peek(l);
-        if (isspace(c)) {
+        if (isspace(c) || c == '\r') {
             advance(l);
         } else if (c == '/' && l->source[l->pos + 1] == '/') {
-            while (peek(l) != '\n' && peek(l) != '\0') advance(l);
+            while (peek(l) != '\n' && peek(l) != '\r' && peek(l) != '\0') advance(l);
         } else if (c == '/' && l->source[l->pos + 1] == '*') {
             advance(l); advance(l);
             while (!(peek(l) == '*' && l->source[l->pos + 1] == '/') && peek(l) != '\0') advance(l);
@@ -108,7 +116,6 @@ Token lexer_next_token(Lexer* l) {
     }
 
     if (c == '"') {
-printf("DEBUG: Found quote at %d\n", l->pos);
         advance(l);
         int start = l->pos;
         while (peek(l) != '\0') {

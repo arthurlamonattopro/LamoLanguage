@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(make clean:*)",
+      "Bash(make)",
+      "Bash(./lamo examples/test.lamo)",
+      "Bash(./lamo /tmp/simple.lamo)",
+      "Bash(./lamo_exec.exe)",
+      "Bash(xxd examples/test.lamo)",
+      "Bash(./lamo /tmp/test1.lamo)",
+      "Bash(./lamo /tmp/test2.lamo)",
+      "Bash(printf 'for \\(let i = 0; i < 3; i = i + 1\\) { print\\(i\\); }')",
+      "Bash(./lamo /tmp/test3.lamo)",
+      "Bash(printf 'let x = 1;\\\\nfor \\(let i = 0; i < 3; i = i + 1\\) { print\\(i\\); }')",
+      "Bash(./lamo /tmp/test4.lamo)",
+      "Bash(printf 'let x = 1;\\\\r\\\\nfor \\(let i = 0; i < 3; i = i + 1\\) { print\\(i\\); }')",
+      "Bash(./lamo /tmp/test5.lamo)",
+      "Bash(printf 'let x = 1;\\\\r\\\\nlet y = 2;')",
+      "Bash(./lamo /tmp/test6.lamo)",
+      "Bash(printf 'let x = 1;\\\\r\\\\nprint\\(x\\);')",
+      "Bash(./lamo /tmp/test7.lamo)",
+      "Bash(xxd)"
+    ]
+  }
+}

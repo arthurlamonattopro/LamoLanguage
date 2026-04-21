@@ -2,13 +2,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "lexer_v2.h"
-#include "ast.h"
+#include "parser.h"
 
-typedef struct {
+struct Parser {
     Lexer* lexer;
     Token current;
-} Parser;
+};
 
 Parser* parser_init(Lexer* lexer) {
     Parser* p = malloc(sizeof(Parser));
@@ -32,11 +31,12 @@ static void advance_p(Parser* p) {
     p->current = lexer_next_token(p->lexer);
 }
 
-static void error(Parser* p, const char* msg) {
-    fprintf(stderr, "\n[Erro] Linha %d, Coluna %d: %s\n", 
+void parser_error(Parser* p, const char* msg) {
+    fprintf(stderr, "\n[Syntax Error] %d:%d: %s\n",
             p->current.line, p->current.column, msg);
-    fprintf(stderr, "       Token atual: '%s' (%s)\n", 
-            p->current.value, token_type_name(p->current.type));
+    fprintf(stderr, "  found token: %s (%s)\n",
+            token_type_name(p->current.type),
+            p->current.value ? p->current.value : "<null>");
     exit(1);
 }
 
@@ -44,10 +44,10 @@ static void eat_p(Parser* p, TokenType type) {
     if (p->current.type == type) {
         advance_p(p);
     } else {
-        char buf[128];
-        snprintf(buf, sizeof(buf), "Esperado '%s', encontrado '%s'", 
-                 token_type_name(type), p->current.value);
-        error(p, buf);
+        char buf[256];
+        snprintf(buf, sizeof(buf), "expected %s, got %s",
+                 token_type_name(type), token_type_name(p->current.type));
+        parser_error(p, buf);
     }
 }
 
@@ -155,7 +155,7 @@ static ASTNode* parse_primary(Parser* p) {
         return (ASTNode*)ast_new_grouping_expr(expr, p->current.line, p->current.column);
     }
     else {
-        error(p, "Expressão inválida");
+        parser_error(p, "invalid expression");
         return NULL;
     }
 }
@@ -365,7 +365,7 @@ ASTNode* parse_statement(Parser* p) {
             return node;
         }
         else {
-            error(p, "Esperado operador de atribuição ou chamada de função");
+            parser_error(p, "expected assignment operator or function call");
             free(name);
             return NULL;
         }
@@ -492,8 +492,16 @@ ASTNode* parse_statement(Parser* p) {
         eat_p(p, TOKEN_SEMICOLON);
         return (ASTNode*)ast_new_return_stmt(expression, p->current.line, p->current.column);
     }
+    else if (p->current.type == TOKEN_UNKNOWN) {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "unexpected token '%s'", p->current.value);
+        parser_error(p, buf);
+    }
     else if (p->current.type != TOKEN_EOF) {
-        advance_p(p);
+        char buf[256];
+        snprintf(buf, sizeof(buf), "unexpected token %s in statement",
+                 token_type_name(p->current.type));
+        parser_error(p, buf);
     }
     return NULL;
 }

@@ -1,0 +1,19 @@
+fn fib(n) {
+    if (n <= 1) {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+let i = 0;
+let sum = 0;
+while (i < 3) {
+    i++;
+    sum += i;
+}
+
+print("fib");
+print(fib(6));
+print(sum);
+print(isnumber(sum));
+print(isstring("ok"));
