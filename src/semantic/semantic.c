@@ -157,6 +157,9 @@ static int builtin_function_arity(const char* name) {
     if (strcmp(name, "gui_draw_text") == 0) return 6;
     if (strcmp(name, "gui_end_frame") == 0) return 0;
     if (strcmp(name, "gui_close") == 0) return 0;
+    if (strcmp(name, "http_route") == 0) return 2;
+    if (strcmp(name, "http_serve") == 0) return 1;
+    if (strcmp(name, "http_serve_once") == 0) return 1;
     return -1;
 }
 

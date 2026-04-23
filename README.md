@@ -45,6 +45,7 @@ Current syntax supported by the compiler includes:
 - function calls
 - builtins such as `print`, `input`, `isnumber`, `isstring`, `exit`, and `abs`
 - Windows GUI builtins: `gui_open`, `gui_should_close`, `gui_begin_frame`, `gui_draw_rect`, `gui_draw_text`, `gui_end_frame`, and `gui_close`
+- HTTP server builtins: `http_route`, `http_serve`, and `http_serve_once`
 
 Example:
 
@@ -72,6 +73,16 @@ while (gui_should_close() == 0) {
 }
 
 gui_close();
+```
+
+Native HTTP example:
+
+```lamo
+http_route("/", "Lamo HTTP server");
+http_route("/health", "ok");
+
+print("HTTP server on http://127.0.0.1:8080");
+http_serve(8080);
 ```
 
 ## Build And Run

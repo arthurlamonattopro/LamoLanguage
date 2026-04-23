@@ -750,7 +750,7 @@ static int compile_sources(const char** input_files, int input_file_count, LamoC
 
         snprintf(gcc_command, sizeof(gcc_command),
 #ifdef _WIN32
-                 "gcc -Wall -Wextra -std=c99 -o \"%s\" \"%s\" -lgdi32 -luser32",
+                 "gcc -Wall -Wextra -std=c99 -o \"%s\" \"%s\" -lgdi32 -luser32 -lws2_32",
 #else
                  "gcc -Wall -Wextra -std=c99 -o \"%s\" \"%s\"",
 #endif
