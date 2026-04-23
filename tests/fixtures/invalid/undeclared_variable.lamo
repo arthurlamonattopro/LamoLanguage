@@ -1,5 +1,0 @@
-fn read_it() {
-    return missing;
-}
-
-print(read_it());
