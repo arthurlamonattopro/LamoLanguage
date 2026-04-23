@@ -44,6 +44,7 @@ Current syntax supported by the compiler includes:
 - integer, string, and boolean literals
 - function calls
 - builtins such as `print`, `input`, `isnumber`, `isstring`, `exit`, and `abs`
+- Windows GUI builtins: `gui_open`, `gui_should_close`, `gui_begin_frame`, `gui_draw_rect`, `gui_draw_text`, `gui_end_frame`, and `gui_close`
 
 Example:
 
@@ -56,6 +57,21 @@ fn add(a, b) {
 }
 
 print(add(x, y));
+```
+
+Native GUI example:
+
+```lamo
+gui_open(640, 480, "Lamo GUI");
+
+while (gui_should_close() == 0) {
+    gui_begin_frame(245, 245, 245);
+    gui_draw_rect(40, 40, 220, 80, 40, 120, 220);
+    gui_draw_text("Hello from Lamo", 60, 65, 255, 255, 255);
+    gui_end_frame();
+}
+
+gui_close();
 ```
 
 ## Build And Run
@@ -114,6 +130,8 @@ Show help or version:
 ## Generated Output
 
 The current backend emits C code to `lamo_exec.c`, then invokes `gcc` to build the executable. This is still a temporary backend strategy while the language model matures.
+
+On Windows, GUI builtins are lowered to Win32 + GDI in the generated C and can open real native windows. On non-Windows platforms they compile to no-op stubs with a runtime warning for now.
 
 ## Tests
 

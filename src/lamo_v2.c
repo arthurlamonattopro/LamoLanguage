@@ -748,7 +748,12 @@ static int compile_sources(const char** input_files, int input_file_count, LamoC
         generate_c_code((ASTNode*)program_ast, out);
         fclose(out);
 
-        snprintf(gcc_command, sizeof(gcc_command), "gcc -Wall -Wextra -std=c99 -o \"%s\" \"%s\"",
+        snprintf(gcc_command, sizeof(gcc_command),
+#ifdef _WIN32
+                 "gcc -Wall -Wextra -std=c99 -o \"%s\" \"%s\" -lgdi32 -luser32",
+#else
+                 "gcc -Wall -Wextra -std=c99 -o \"%s\" \"%s\"",
+#endif
                  binary_output_path, c_output_path);
         if (run_shell_command(gcc_command) != 0) {
             fprintf(stderr, "backend compilation failed while building %s from %s\n",

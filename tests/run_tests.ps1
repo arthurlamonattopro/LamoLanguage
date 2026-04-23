@@ -73,6 +73,10 @@ New-Item -ItemType Directory -Force -Path (Join-Path $PSScriptRoot "artifacts") 
 $buildResult = Invoke-Lamo -Arguments @("build", (Join-Path $PSScriptRoot "fixtures\\valid\\e2e_run.lamo"), "-o", $buildOutput)
 Assert-Success $buildResult.ExitCode "build e2e_run.lamo"
 
+$guiBuildOutput = Join-Path $PSScriptRoot "artifacts\\lamo_gui_fixture"
+$guiBuildResult = Invoke-Lamo -Arguments @("build", (Join-Path $PSScriptRoot "fixtures\\valid\\gui_window.lamo"), "-o", $guiBuildOutput) -CaptureOutput
+Assert-Success $guiBuildResult.ExitCode "build gui_window.lamo"
+
 $helpResult = Invoke-Lamo -Arguments @("help") -CaptureOutput
 Assert-Success $helpResult.ExitCode "help"
 if ($helpResult.Output -notmatch "run <file.lamo>") {

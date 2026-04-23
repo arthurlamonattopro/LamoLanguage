@@ -30,6 +30,8 @@ typedef struct {
 
 static void semantic_visit_statement(SemanticContext* ctx, ASTNode* node);
 static void semantic_visit_expression(SemanticContext* ctx, ASTNode* node);
+static int builtin_function_arity(const char* name);
+static int semantic_validate_builtin_call(SemanticContext* ctx, const char* name, ASTNode** args, int arg_count, int line, int column);
 
 static Scope* scope_push(Scope* parent) {
     Scope* scope = malloc(sizeof(Scope));
@@ -118,20 +120,60 @@ static void semantic_visit_block(SemanticContext* ctx, ASTBlock* block) {
 
 static void semantic_visit_call(SemanticContext* ctx, const char* name, ASTNode** args, int arg_count, int line, int column) {
     Symbol* symbol = scope_find(ctx->current_scope, name);
-    if (!symbol || symbol->kind != SYMBOL_FN) {
+    int builtin_arity = builtin_function_arity(name);
+
+    if (symbol && symbol->kind == SYMBOL_FN) {
+        if (symbol->arity != arg_count) {
+            char message[256];
+            snprintf(message, sizeof(message), "function '%s' expects %d argument(s), got %d",
+                     name, symbol->arity, arg_count);
+            semantic_error_at(ctx, line, column, message);
+        }
+    } else if (builtin_arity >= 0) {
+        if (builtin_arity != arg_count) {
+            char message[256];
+            snprintf(message, sizeof(message), "builtin '%s' expects %d argument(s), got %d",
+                     name, builtin_arity, arg_count);
+            semantic_error_at(ctx, line, column, message);
+        } else {
+            semantic_validate_builtin_call(ctx, name, args, arg_count, line, column);
+        }
+    } else {
         char message[256];
         snprintf(message, sizeof(message), "call to undeclared function '%s'", name);
-        semantic_error_at(ctx, line, column, message);
-    } else if (symbol->arity != arg_count) {
-        char message[256];
-        snprintf(message, sizeof(message), "function '%s' expects %d argument(s), got %d",
-                 name, symbol->arity, arg_count);
         semantic_error_at(ctx, line, column, message);
     }
 
     for (int i = 0; i < arg_count; i++) {
         semantic_visit_expression(ctx, args[i]);
     }
+}
+
+static int builtin_function_arity(const char* name) {
+    if (strcmp(name, "gui_open") == 0) return 3;
+    if (strcmp(name, "gui_should_close") == 0) return 0;
+    if (strcmp(name, "gui_begin_frame") == 0) return 3;
+    if (strcmp(name, "gui_draw_rect") == 0) return 7;
+    if (strcmp(name, "gui_draw_text") == 0) return 6;
+    if (strcmp(name, "gui_end_frame") == 0) return 0;
+    if (strcmp(name, "gui_close") == 0) return 0;
+    return -1;
+}
+
+static int semantic_validate_builtin_call(SemanticContext* ctx, const char* name, ASTNode** args, int arg_count, int line, int column) {
+    (void)arg_count;
+
+    if (strcmp(name, "gui_open") == 0 && args[2]->type != AST_STRING_LITERAL) {
+        semantic_error_at(ctx, line, column, "gui_open(width, height, title) requires a string literal title");
+        return 0;
+    }
+
+    if (strcmp(name, "gui_draw_text") == 0 && args[0]->type != AST_STRING_LITERAL) {
+        semantic_error_at(ctx, line, column, "gui_draw_text(text, x, y, r, g, b) requires a string literal text");
+        return 0;
+    }
+
+    return 1;
 }
 
 static void semantic_visit_statement(SemanticContext* ctx, ASTNode* node) {
