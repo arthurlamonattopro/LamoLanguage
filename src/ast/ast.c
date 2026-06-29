@@ -4,6 +4,25 @@
 #include <stdio.h>
 #include "ast.h"
 
+// Bug #5 fix: o parser seta esse "current file path" antes de criar nós da
+// AST, e ast_new_node() copia o ponteiro para cada nó. Isso permite que o
+// semântico reporte erros com o arquivo de origem correto, mesmo em
+// compilações multi-arquivo (programa principal + imports). Single-threaded:
+// safe.
+//
+// O ponteiro NÃO é owned pela AST — ele aponta para o `normalized_path` que
+// já vive na CompilationState durante todo o tempo de vida da AST. Não há
+// free aqui.
+static const char* g_default_file_path = NULL;
+
+void ast_set_default_file_path(const char* path) {
+    g_default_file_path = path;
+}
+
+const char* ast_get_default_file_path(void) {
+    return g_default_file_path;
+}
+
 ASTNode* ast_new_node(ASTNodeType type, size_t size, int line, int column) {
     ASTNode* node = (ASTNode*)malloc(size);
     if (!node) {
@@ -15,6 +34,7 @@ ASTNode* ast_new_node(ASTNodeType type, size_t size, int line, int column) {
     node->line = line;
     node->column = column;
     node->next = NULL;
+    node->file_path = g_default_file_path;
     return node;
 }
 
@@ -74,6 +94,14 @@ ASTReturnStmt* ast_new_return_stmt(ASTNode* expression, int line, int column) {
     ASTReturnStmt* node = (ASTReturnStmt*)ast_new_node(AST_RETURN_STMT, sizeof(ASTReturnStmt), line, column);
     node->expression = expression;
     return node;
+}
+
+ASTNode* ast_new_break_stmt(int line, int column) {
+    return ast_new_node(AST_BREAK_STMT, sizeof(ASTNode), line, column);
+}
+
+ASTNode* ast_new_continue_stmt(int line, int column) {
+    return ast_new_node(AST_CONTINUE_STMT, sizeof(ASTNode), line, column);
 }
 
 ASTAssignStmt* ast_new_assign_stmt(char* name, ASTNode* value, TokenType op_type, int line, int column) {
@@ -225,6 +253,10 @@ void ast_free(ASTNode* node) {
             break;
         case AST_RETURN_STMT:
             ast_free(((ASTReturnStmt*)node)->expression);
+            break;
+        case AST_BREAK_STMT:
+        case AST_CONTINUE_STMT:
+            // sem campos extras para liberar
             break;
         case AST_ASSIGN_STMT:
             free(((ASTAssignStmt*)node)->name);

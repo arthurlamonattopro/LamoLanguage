@@ -14,6 +14,8 @@ typedef enum {
     AST_WHILE_STMT,
     AST_FOR_STMT,
     AST_RETURN_STMT,
+    AST_BREAK_STMT,         // break;  (somente válido dentro de while/for)
+    AST_CONTINUE_STMT,      // continue; (somente válido dentro de while/for)
     AST_ASSIGN_STMT,
     AST_CALL_STMT,
     AST_BINARY_EXPR,
@@ -34,6 +36,12 @@ typedef struct ASTNode {
     int line;
     int column;
     struct ASTNode* next;
+    // Bug #5 fix: path do arquivo de origem deste nó. Setado pelo parser no
+    // momento de criação (parser_init_with_file). O semântico usa isso para
+    // reportar erros com o arquivo correto, mesmo em compilações multi-arquivo
+    // (programa principal + imports). Pode ser NULL quando o nó é sintético
+    // (ex.: nó criado pelo codegen sem passar pelo parser).
+    const char* file_path;
 } ASTNode;
 
 typedef struct {
@@ -156,6 +164,13 @@ typedef struct {
 } ASTProgram;
 
 ASTNode* ast_new_node(ASTNodeType type, size_t size, int line, int column);
+// Bug #5 fix: setters/getters para o "file path default" aplicado a cada nó
+// criado pelo parser. O parser chama ast_set_default_file_path() antes de
+// começar a parsear um arquivo; ast_new_node() copia o valor para cada nó.
+// O ponteiro NÃO é owned pela AST — o caller precisa manter a string viva
+// enquanto a AST existir.
+void ast_set_default_file_path(const char* path);
+const char* ast_get_default_file_path(void);
 ASTProgram* ast_new_program();
 ASTVarDecl* ast_new_var_decl(char* name, ASTNode* initializer, int line, int column);
 ASTFnDecl* ast_new_fn_decl(char* name, char** params, int param_count, ASTNode* body, int line, int column);
@@ -164,6 +179,10 @@ ASTIfStmt* ast_new_if_stmt(ASTNode* condition, ASTNode* then_branch, ASTNode* el
 ASTWhileStmt* ast_new_while_stmt(ASTNode* condition, ASTNode* body, int line, int column);
 ASTForStmt* ast_new_for_stmt(ASTNode* initializer, ASTNode* condition, ASTNode* increment, ASTNode* body, int line, int column);
 ASTReturnStmt* ast_new_return_stmt(ASTNode* expression, int line, int column);
+// break; e continue; — sem campos além da base ASTNode. Os construtores
+// retornam ASTNode* direto porque não há struct derivada.
+ASTNode* ast_new_break_stmt(int line, int column);
+ASTNode* ast_new_continue_stmt(int line, int column);
 ASTAssignStmt* ast_new_assign_stmt(char* name, ASTNode* value, TokenType op_type, int line, int column);
 ASTCallStmt* ast_new_call_stmt(char* name, ASTNode** args, int arg_count, int line, int column);
 ASTBinaryExpr* ast_new_binary_expr(ASTNode* left, TokenType operator, ASTNode* right, int line, int column);

@@ -47,8 +47,15 @@ typedef struct Scope {
 
 typedef struct {
     const char* file_path;
+    // Bug #5 fix: file_path do nó sendo visitado no momento. Setado em
+    // semantic_visit_statement() com base no node->file_path da AST. Usado
+    // por semantic_error_at() para reportar erros no arquivo correto.
+    const char* last_node_path;
     Scope* current_scope;
     int inside_function;
+    // Próximo passo 5: break/continue só são válidos dentro de while/for.
+    // Incrementado ao entrar num loop, decrementado ao sair.
+    int inside_loop;
     int errors;
 } SemanticContext;
 
@@ -97,11 +104,20 @@ static void scope_free(Scope* scope) {
 }
 
 static void semantic_error_at(SemanticContext* ctx, int line, int column, const char* message) {
+    // Bug #5 fix: usa o file_path do nó específico que disparou o erro,
+    // não o label global do contexto. Em compilações multi-arquivo (programa
+    // principal + imports), isso significa que o erro aponta para o arquivo
+    // onde o problema realmente está, não para "<multiple inputs>".
+    //
+    // O caller passa o line/column do nó; aqui nós não recebemos o ponteiro
+    // do nó diretamente, mas o ctx->last_node_path é setado por
+    // semantic_visit_statement antes de chamar esta função para nós
+    // específicos. Se last_node_path for NULL (caso legado), cai no
+    // file_path do contexto.
+    const char* label = ctx->last_node_path ? ctx->last_node_path :
+                        (ctx->file_path ? ctx->file_path : "<input>");
     fprintf(stderr, "%s:%d:%d: semantic error: %s\n",
-            ctx->file_path ? ctx->file_path : "<input>",
-            line,
-            column,
-            message);
+            label, line, column, message);
     ctx->errors++;
 }
 
@@ -302,6 +318,12 @@ static void semantic_visit_statement(SemanticContext* ctx, ASTNode* node) {
         return;
     }
 
+    // Bug #5 fix: lembra de qual arquivo veio este nó para que
+    // semantic_error_at() possa reportar a origem correta.
+    if (node->file_path) {
+        ctx->last_node_path = node->file_path;
+    }
+
     switch (node->type) {
         case AST_VAR_DECL: {
             ASTVarDecl* var_decl = (ASTVarDecl*)node;
@@ -344,7 +366,10 @@ static void semantic_visit_statement(SemanticContext* ctx, ASTNode* node) {
         case AST_WHILE_STMT: {
             ASTWhileStmt* while_stmt = (ASTWhileStmt*)node;
             semantic_infer_expression(ctx, while_stmt->condition);
+            int prev_in_loop = ctx->inside_loop;
+            ctx->inside_loop = 1;
             semantic_visit_statement(ctx, while_stmt->body);
+            ctx->inside_loop = prev_in_loop;
             break;
         }
         case AST_FOR_STMT: {
@@ -355,7 +380,10 @@ static void semantic_visit_statement(SemanticContext* ctx, ASTNode* node) {
             semantic_visit_statement(ctx, for_stmt->initializer);
             semantic_infer_expression(ctx, for_stmt->condition);
             semantic_visit_statement(ctx, for_stmt->increment);
+            int prev_in_loop = ctx->inside_loop;
+            ctx->inside_loop = 1;
             semantic_visit_statement(ctx, for_stmt->body);
+            ctx->inside_loop = prev_in_loop;
 
             Scope* finished = ctx->current_scope;
             ctx->current_scope = parent;
@@ -372,6 +400,20 @@ static void semantic_visit_statement(SemanticContext* ctx, ASTNode* node) {
             }
             break;
         }
+        case AST_BREAK_STMT:
+            // Próximo passo 5: break é inválido fora de loops. `if` não conta
+            // como loop — só while e for incrementam ctx->inside_loop.
+            if (!ctx->inside_loop) {
+                semantic_error_at(ctx, node->line, node->column,
+                                  "break is only valid inside a while or for loop");
+            }
+            break;
+        case AST_CONTINUE_STMT:
+            if (!ctx->inside_loop) {
+                semantic_error_at(ctx, node->line, node->column,
+                                  "continue is only valid inside a while or for loop");
+            }
+            break;
         case AST_ASSIGN_STMT: {
             ASTAssignStmt* assign_stmt = (ASTAssignStmt*)node;
             Symbol* symbol = scope_find(ctx->current_scope, assign_stmt->name);
@@ -426,6 +468,13 @@ static void semantic_visit_statement(SemanticContext* ctx, ASTNode* node) {
 static LamoType semantic_infer_expression(SemanticContext* ctx, ASTNode* node) {
     if (!node) {
         return LAMO_TYPE_UNKNOWN;
+    }
+
+    // Bug #5 fix: atualiza o path do nó atual. Expression nodes também podem
+    // disparar erros (ex.: "use of undeclared variable"), e precisamos do
+    // arquivo certo.
+    if (node->file_path) {
+        ctx->last_node_path = node->file_path;
     }
 
     switch (node->type) {
@@ -539,8 +588,10 @@ static LamoType semantic_infer_expression(SemanticContext* ctx, ASTNode* node) {
 int semantic_analyze(ASTProgram* program, const char* file_path) {
     SemanticContext ctx;
     ctx.file_path = file_path;
+    ctx.last_node_path = NULL;  // Bug #5 fix: preenchido por node->file_path
     ctx.current_scope = scope_push(NULL);
     ctx.inside_function = 0;
+    ctx.inside_loop = 0;        // Próximo passo 5: break/continue tracking
     ctx.errors = 0;
 
     for (ASTNode* node = program->declarations; node; node = node->next) {

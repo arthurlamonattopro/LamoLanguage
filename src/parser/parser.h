@@ -7,6 +7,11 @@
 typedef struct Parser Parser;
 
 Parser* parser_init(Lexer* lexer);
+// Bug #4 fix: parser now remembers which file it's parsing so that syntax
+// errors include the file path (matching semantic.c's format). The legacy
+// parser_init() above keeps path = NULL ("<input>") for backwards
+// compatibility; new callers should use parser_init_with_file().
+Parser* parser_init_with_file(Lexer* lexer, const char* file_path);
 void parser_free(Parser* p);
 ASTNode* parse_expression(Parser* p);
 ASTNode* parse_statement(Parser* p);
@@ -22,5 +27,10 @@ int parser_had_error(const Parser* p);
 
 // Número absoluto de erros registrados.
 int parser_error_count(const Parser* p);
+
+// Retorna o path do arquivo que este parser está parseando, ou NULL se
+// parser_init() foi usado (caso legado). O caller não deve liberar o
+// ponteiro.
+const char* parser_file_path(const Parser* p);
 
 #endif

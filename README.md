@@ -24,13 +24,17 @@ Implemented in semantics:
 - function call arity validation
 - `return` validation outside functions
 - compile-time type inference and operator checks (e.g. `"abc" * 3` is rejected at compile time, not at runtime)
+- per-node file-aware diagnostics across merged multi-file builds (errors
+  inside an imported file point to that file, not to `<multiple inputs>`)
 
 Not implemented yet:
 
 - typed variable or function declarations (types are inferred, not annotated)
-- per-node file-aware diagnostics across merged multi-file builds
 - a standard runtime/library design
 - richer diagnostics with source snippets
+- arrays, structs, and maps (only `string` is a composite type today)
+- module system with explicit exports (today all `import`ed declarations are
+  merged into a single global namespace)
 
 ## Language Features
 
@@ -42,12 +46,34 @@ Current syntax supported by the compiler includes:
 - `while`
 - `for`
 - `return`
+- `break` and `continue` inside `while` and `for` loops
 - assignment with `=`, `+=`, `-=`, `++`, `--`
 - integer, string, and boolean literals
 - function calls
 - builtins such as `print`, `input` (int), `input_int`, `input_str`, `isnumber`, `isstring`, `exit`, and `abs`
 - Windows GUI builtins: `gui_open`, `gui_should_close`, `gui_begin_frame`, `gui_draw_rect`, `gui_draw_text`, `gui_end_frame`, and `gui_close`
 - HTTP server builtins: `http_route`, `http_serve`, and `http_serve_once`
+
+### Truthiness
+
+Lamo uses **Python-like truthiness**, not strict-bool. `if (cond)` accepts any
+type and treats it as follows:
+
+| Type     | Truthy when                                  |
+|----------|----------------------------------------------|
+| `int`    | non-zero (`0` is false, `1`, `-5`, `42` are true) |
+| `float`  | non-zero (`0.0` is false, `3.14` is true)    |
+| `bool`   | the value itself (`true` / `false`)          |
+| `string` | non-empty (`""` is false, any other string is true) |
+
+So `if (5) { ... }` and `if ("abc") { ... }` are both valid and execute the
+body. `if (0)`, `if (0.0)`, `if (false)`, and `if ("")` skip the body. The
+logical operators `&&`, `||`, and `!` also use this rule. The same applies to
+`while (cond)` and `for (...; cond; ...)`.
+
+This is a deliberate language decision, not an accident: Lamo does not have a
+distinct "boolean context" type. If you want strict bool, compare explicitly
+(e.g. `if (n > 0)`, `if (s != "")`).
 
 Example:
 

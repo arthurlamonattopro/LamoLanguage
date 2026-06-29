@@ -543,7 +543,11 @@ static int load_program_recursive(CompilationState* state, ASTProgram* aggregate
     // Imports viram tokens TOKEN_IMPORT e nós AST_IMPORT, carregados depois.
     state->sources[slot] = raw_source;
     state->lexers[slot] = lexer_init(raw_source);
-    state->parsers[slot] = parser_init(state->lexers[slot]);
+    // Bug #4 fix: passar o path do arquivo pro parser para que erros sintáticos
+    // incluam a origem. Bug #5 fix: o parser também seta o default file path
+    // para que todos os nós da AST carreguem essa origem, permitindo ao
+    // semântico reportar erros multi-arquivo corretamente.
+    state->parsers[slot] = parser_init_with_file(state->lexers[slot], normalized_path);
     parsed_program = parse_program_v2(state->parsers[slot]);
 
     if (parser_had_error(state->parsers[slot])) {
@@ -577,6 +581,21 @@ cleanup:
 
 // Verifica se a AST usa GUI builtins (para linkar -lX11 no Linux).
 // Caminha a AST procurando call_stmt/call_expr com nomes de builtins GUI.
+//
+// Bug #8 fix: a versão antiga usava strncmp(n->name, "gui_", 4) == 0, o que
+// disparava -lX11 para QUALQUER função que começa com "gui_", incluindo
+// funções definidas pelo usuário (já que builtins são shadowable). Agora
+// comparamos contra a lista exata de builtins GUI que o codegen conhece.
+static int lamo_is_gui_builtin_name(const char* name) {
+    return strcmp(name, "gui_open") == 0 ||
+           strcmp(name, "gui_should_close") == 0 ||
+           strcmp(name, "gui_begin_frame") == 0 ||
+           strcmp(name, "gui_draw_rect") == 0 ||
+           strcmp(name, "gui_draw_text") == 0 ||
+           strcmp(name, "gui_end_frame") == 0 ||
+           strcmp(name, "gui_close") == 0;
+}
+
 static int lamo_program_uses_gui_recursive(ASTNode* node);
 static int lamo_program_uses_gui_recursive(ASTNode* node) {
     if (!node) return 0;
@@ -621,7 +640,7 @@ static int lamo_program_uses_gui_recursive(ASTNode* node) {
             return lamo_program_uses_gui_recursive(((ASTAssignStmt*)node)->value);
         case AST_CALL_STMT: {
             ASTCallStmt* n = (ASTCallStmt*)node;
-            if (strncmp(n->name, "gui_", 4) == 0) return 1;
+            if (lamo_is_gui_builtin_name(n->name)) return 1;
             for (int i = 0; i < n->arg_count; i++) {
                 if (lamo_program_uses_gui_recursive(n->args[i])) return 1;
             }
@@ -629,7 +648,7 @@ static int lamo_program_uses_gui_recursive(ASTNode* node) {
         }
         case AST_CALL_EXPR: {
             ASTCallExpr* n = (ASTCallExpr*)node;
-            if (strncmp(n->name, "gui_", 4) == 0) return 1;
+            if (lamo_is_gui_builtin_name(n->name)) return 1;
             for (int i = 0; i < n->arg_count; i++) {
                 if (lamo_program_uses_gui_recursive(n->args[i])) return 1;
             }
@@ -662,6 +681,12 @@ static int compile_sources(const char** input_files, int input_file_count, LamoC
 
     memset(&state, 0, sizeof(state));
 
+    // Bug #5 fix: o label aqui é só fallback. O semântico agora usa
+    // node->file_path de cada nó da AST (setado pelo parser) para reportar
+    // erros no arquivo correto. Em compilações multi-arquivo (programa
+    // principal + imports), isso significa que o erro aponta para o arquivo
+    // onde o problema realmente está. O label abaixo só aparece em nós
+    // sintéticos ou se algum caminho não foi setado.
     semantic_label = input_file_count == 1 ? input_files[0] : "<multiple inputs>";
 
     for (i = 0; i < input_file_count; i++) {

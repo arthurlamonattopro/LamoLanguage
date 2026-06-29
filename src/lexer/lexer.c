@@ -247,6 +247,8 @@ Token lexer_next_token(Lexer* l) {
         else if (strcmp(t.value, "true") == 0) t.type = TOKEN_TRUE;
         else if (strcmp(t.value, "false") == 0) t.type = TOKEN_FALSE;
         else if (strcmp(t.value, "import") == 0) t.type = TOKEN_IMPORT;
+        else if (strcmp(t.value, "break") == 0) t.type = TOKEN_BREAK;
+        else if (strcmp(t.value, "continue") == 0) t.type = TOKEN_CONTINUE;
         // print, input, isnumber, isstring, exit, abs são identificadores comuns:
         // resolvidos como builtins na tabela de símbolos e no codegen.
         else t.type = TOKEN_IDENTIFIER;
@@ -372,6 +374,8 @@ const char* token_type_name(TokenType type) {
         case TOKEN_TRUE: return "true";
         case TOKEN_FALSE: return "false";
         case TOKEN_IMPORT: return "import";
+        case TOKEN_BREAK: return "break";
+        case TOKEN_CONTINUE: return "continue";
         case TOKEN_IDENTIFIER: return "IDENTIFIER";
         case TOKEN_INT: return "INT";
         case TOKEN_FLOAT: return "FLOAT";

@@ -11,9 +11,14 @@ struct Parser {
     Token current;
     int error_count;
     int panic_mode;   // se 1, suprime próximos erros até sincronizar
+    const char* file_path;  // Bug #4 fix: path exibido nas mensagens de erro
 };
 
 Parser* parser_init(Lexer* lexer) {
+    return parser_init_with_file(lexer, NULL);
+}
+
+Parser* parser_init_with_file(Lexer* lexer, const char* file_path) {
     Parser* p = malloc(sizeof(Parser));
     if (!p) {
         perror("Failed to allocate Parser");
@@ -23,6 +28,12 @@ Parser* parser_init(Lexer* lexer) {
     p->current = lexer_next_token(lexer);
     p->error_count = 0;
     p->panic_mode = 0;
+    p->file_path = file_path;
+    // Bug #5 fix: todos os nós da AST criados a partir deste momento até o
+    // fim deste parse vão receber file_path como origem. O caller é dono do
+    // string e deve mantê-lo vivo enquanto a AST existir (lamo_v2.c usa
+    // normalized_path que vive na CompilationState até o fim).
+    ast_set_default_file_path(file_path);
     return p;
 }
 
@@ -30,6 +41,10 @@ void parser_free(Parser* p) {
     if (!p) return;
     token_free(p->current);
     free(p);
+}
+
+const char* parser_file_path(const Parser* p) {
+    return p ? p->file_path : NULL;
 }
 
 static void advance_p(Parser* p) {
@@ -57,6 +72,8 @@ static void parser_synchronize(Parser* p) {
             case TOKEN_FOR:
             case TOKEN_RETURN:
             case TOKEN_IMPORT:
+            case TOKEN_BREAK:
+            case TOKEN_CONTINUE:
                 return;
             default:
                 advance_p(p);
@@ -66,13 +83,18 @@ static void parser_synchronize(Parser* p) {
 }
 
 void parser_error(Parser* p, const char* msg) {
+    const char* label;
     if (p->panic_mode) {
         return; // já estamos em recuperação, ignora erros derivados
     }
     p->panic_mode = 1;
     p->error_count++;
-    fprintf(stderr, "\n[Syntax Error] %d:%d: %s\n",
-            p->current.line, p->current.column, msg);
+    // Bug #4 fix: inclui o path do arquivo na mensagem de erro, igual ao
+    // semantic.c. Caso o parser tenha sido criado sem file_path (caso legado
+    // de parser_init()), usa "<input>".
+    label = p->file_path ? p->file_path : "<input>";
+    fprintf(stderr, "\n%s:%d:%d: [Syntax Error] %s\n",
+            label, p->current.line, p->current.column, msg);
     fprintf(stderr, "  found token: %s (%s)\n",
             token_type_name(p->current.type),
             p->current.value ? p->current.value : "<null>");
@@ -577,6 +599,20 @@ ASTNode* parse_statement(Parser* p) {
         }
         eat_p(p, TOKEN_SEMICOLON);
         return (ASTNode*)ast_new_return_stmt(expression, line, column);
+    }
+    else if (p->current.type == TOKEN_BREAK) {
+        int line = p->current.line;
+        int column = p->current.column;
+        eat_p(p, TOKEN_BREAK);
+        eat_p(p, TOKEN_SEMICOLON);
+        return ast_new_break_stmt(line, column);
+    }
+    else if (p->current.type == TOKEN_CONTINUE) {
+        int line = p->current.line;
+        int column = p->current.column;
+        eat_p(p, TOKEN_CONTINUE);
+        eat_p(p, TOKEN_SEMICOLON);
+        return ast_new_continue_stmt(line, column);
     }
     else if (p->current.type == TOKEN_UNKNOWN) {
         char buf[256];
