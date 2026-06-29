@@ -6,6 +6,19 @@
 #include <stdlib.h>
 #include <string.h>
 #ifdef _WIN32
+/* Sprint 1 fix (Windows): the Lamo TokenType (in lexer.h) used to collide
+ * with the Windows SDK TokenType (an enumerator in winnt.h's
+ * _TOKEN_INFORMATION_CLASS enum, exposed via <windows.h>). We renamed
+ * ours to LamoTokenType to avoid the collision, so the include order
+ * no longer matters. We still define WIN32_LEAN_AND_MEAN and NOGDI to
+ * keep the <windows.h> surface small (smaller object files, faster
+ * compiles). */
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOGDI
+#define NOGDI
+#endif
 #include <direct.h>
 #include <windows.h>
 #else

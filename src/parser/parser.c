@@ -123,7 +123,7 @@ int parser_error_count(const Parser* p) {
     return p->error_count;
 }
 
-static void eat_p(Parser* p, TokenType type) {
+static void eat_p(Parser* p, LamoTokenType type) {
     if (p->current.type == type) {
         advance_p(p);
     } else {
@@ -320,7 +320,7 @@ static ASTNode* parse_primary(Parser* p) {
 
 static ASTNode* parse_unary(Parser* p) {
     if (p->current.type == TOKEN_BANG || p->current.type == TOKEN_MINUS) {
-        TokenType op_type = p->current.type;
+        LamoTokenType op_type = p->current.type;
         int line = p->current.line;
         int column = p->current.column;
         advance_p(p);
@@ -337,7 +337,7 @@ static ASTNode* parse_factor(Parser* p) {
     ASTNode* left = parse_unary(p);
     while (p->current.type == TOKEN_STAR || p->current.type == TOKEN_SLASH ||
            p->current.type == TOKEN_PERCENT) {
-        TokenType op_type = p->current.type;
+        LamoTokenType op_type = p->current.type;
         int line = p->current.line;
         int column = p->current.column;
         advance_p(p);
@@ -350,7 +350,7 @@ static ASTNode* parse_factor(Parser* p) {
 static ASTNode* parse_term(Parser* p) {
     ASTNode* left = parse_factor(p);
     while (p->current.type == TOKEN_PLUS || p->current.type == TOKEN_MINUS) {
-        TokenType op_type = p->current.type;
+        LamoTokenType op_type = p->current.type;
         int line = p->current.line;
         int column = p->current.column;
         advance_p(p);
@@ -364,7 +364,7 @@ static ASTNode* parse_comparison(Parser* p) {
     ASTNode* left = parse_term(p);
     while (p->current.type == TOKEN_LT || p->current.type == TOKEN_GT ||
            p->current.type == TOKEN_LT_EQ || p->current.type == TOKEN_GT_EQ) {
-        TokenType op_type = p->current.type;
+        LamoTokenType op_type = p->current.type;
         int line = p->current.line;
         int column = p->current.column;
         advance_p(p);
@@ -377,7 +377,7 @@ static ASTNode* parse_comparison(Parser* p) {
 static ASTNode* parse_equality(Parser* p) {
     ASTNode* left = parse_comparison(p);
     while (p->current.type == TOKEN_EQ_EQ || p->current.type == TOKEN_BANG_EQ) {
-        TokenType op_type = p->current.type;
+        LamoTokenType op_type = p->current.type;
         int line = p->current.line;
         int column = p->current.column;
         advance_p(p);
@@ -390,7 +390,7 @@ static ASTNode* parse_equality(Parser* p) {
 static ASTNode* parse_and(Parser* p) {
     ASTNode* left = parse_equality(p);
     while (p->current.type == TOKEN_AND_AND) {
-        TokenType op_type = p->current.type;
+        LamoTokenType op_type = p->current.type;
         int line = p->current.line;
         int column = p->current.column;
         advance_p(p);
@@ -403,7 +403,7 @@ static ASTNode* parse_and(Parser* p) {
 ASTNode* parse_expression(Parser* p) {
     ASTNode* left = parse_and(p);
     while (p->current.type == TOKEN_OR_OR) {
-        TokenType op_type = p->current.type;
+        LamoTokenType op_type = p->current.type;
         int line = p->current.line;
         int column = p->current.column;
         advance_p(p);
@@ -652,7 +652,7 @@ ASTNode* parse_statement(Parser* p) {
         }
         else if (p->current.type == TOKEN_EQUALS || p->current.type == TOKEN_PLUS_EQ ||
                  p->current.type == TOKEN_MINUS_EQ) {
-            TokenType op_type = p->current.type;
+            LamoTokenType op_type = p->current.type;
             advance_p(p);
             ASTNode* value = parse_expression(p);
             eat_p(p, TOKEN_SEMICOLON);
@@ -763,7 +763,7 @@ ASTNode* parse_statement(Parser* p) {
             int assign_column = p->current.column;
             advance_p(p);
             if (p->current.type == TOKEN_EQUALS || p->current.type == TOKEN_PLUS_EQ || p->current.type == TOKEN_MINUS_EQ) {
-                TokenType op_type = p->current.type;
+                LamoTokenType op_type = p->current.type;
                 advance_p(p);
                 ASTNode* value = parse_expression(p);
                 initializer = (ASTNode*)ast_new_assign_stmt(v_name, value, op_type, assign_line, assign_column);
@@ -806,7 +806,7 @@ ASTNode* parse_statement(Parser* p) {
                 ASTNode* expr = (ASTNode*)ast_new_binary_expr(ident, TOKEN_MINUS, one, inc_line, inc_column);
                 increment = (ASTNode*)ast_new_assign_stmt(v_name, expr, TOKEN_EQUALS, inc_line, inc_column);
             } else if (p->current.type == TOKEN_PLUS_EQ || p->current.type == TOKEN_MINUS_EQ || p->current.type == TOKEN_EQUALS) {
-                TokenType op_type = p->current.type;
+                LamoTokenType op_type = p->current.type;
                 advance_p(p);
                 ASTNode* value = parse_expression(p);
                 increment = (ASTNode*)ast_new_assign_stmt(v_name, value, op_type, inc_line, inc_column);

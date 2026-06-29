@@ -520,7 +520,7 @@ void generate_c_code(ASTNode* node, FILE* out) {
     fprintf(out, "    return 0;\n}\n");
 }
 
-static void generate_assignment_code(const char* name, ASTNode* value, TokenType op_type, FILE* out) {
+static void generate_assignment_code(const char* name, ASTNode* value, LamoTokenType op_type, FILE* out) {
     // Bug #3 fix: each user_name1() call uses a different slot in a 4-entry
     // ring buffer, so multiple calls in the same statement (e.g. the += case
     // below, which references `name` twice) cannot clobber each other.

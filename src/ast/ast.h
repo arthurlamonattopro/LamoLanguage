@@ -115,7 +115,7 @@ typedef struct {
     ASTNode base;
     char* name;
     struct ASTNode* value;
-    TokenType op_type;
+    LamoTokenType op_type;
 } ASTAssignStmt;
 
 typedef struct {
@@ -128,13 +128,13 @@ typedef struct {
 typedef struct {
     ASTNode base;
     struct ASTNode* left;
-    TokenType operator;
+    LamoTokenType operator;
     struct ASTNode* right;
 } ASTBinaryExpr;
 
 typedef struct {
     ASTNode base;
-    TokenType operator;
+    LamoTokenType operator;
     struct ASTNode* right;
 } ASTUnaryExpr;
 
@@ -231,10 +231,10 @@ ASTReturnStmt* ast_new_return_stmt(ASTNode* expression, int line, int column);
 // retornam ASTNode* direto porque não há struct derivada.
 ASTNode* ast_new_break_stmt(int line, int column);
 ASTNode* ast_new_continue_stmt(int line, int column);
-ASTAssignStmt* ast_new_assign_stmt(char* name, ASTNode* value, TokenType op_type, int line, int column);
+ASTAssignStmt* ast_new_assign_stmt(char* name, ASTNode* value, LamoTokenType op_type, int line, int column);
 ASTCallStmt* ast_new_call_stmt(char* name, ASTNode** args, int arg_count, int line, int column);
-ASTBinaryExpr* ast_new_binary_expr(ASTNode* left, TokenType operator, ASTNode* right, int line, int column);
-ASTUnaryExpr* ast_new_unary_expr(TokenType operator, ASTNode* right, int line, int column);
+ASTBinaryExpr* ast_new_binary_expr(ASTNode* left, LamoTokenType operator, ASTNode* right, int line, int column);
+ASTUnaryExpr* ast_new_unary_expr(LamoTokenType operator, ASTNode* right, int line, int column);
 ASTIntLiteral* ast_new_int_literal(long long value, int line, int column);
 ASTFloatLiteral* ast_new_float_literal(double value, int line, int column);
 ASTStringLiteral* ast_new_string_literal(char* value, int line, int column);

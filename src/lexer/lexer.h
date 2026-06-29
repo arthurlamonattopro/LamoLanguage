@@ -26,10 +26,10 @@ typedef enum {
 
     // System
     TOKEN_EOF, TOKEN_UNKNOWN
-} TokenType;
+} LamoTokenType;
 
 typedef struct {
-    TokenType type;
+    LamoTokenType type;
     char* value;
     int line;
     int column;
@@ -47,7 +47,7 @@ Lexer* lexer_init(char* source);
 void lexer_free(Lexer* lexer);
 Token lexer_next_token(Lexer* lexer);
 void token_free(Token t);
-const char* token_type_name(TokenType type);
+const char* token_type_name(LamoTokenType type);
 
 // Retorna 1 se o nome corresponde a uma builtin da linguagem (print, input, ...).
 // Estes nomes são tratados como identificadores comuns no lexer, mas o codegen

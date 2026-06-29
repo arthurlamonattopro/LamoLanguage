@@ -359,7 +359,7 @@ int lexer_is_builtin_name(const char* name) {
     return lamo_builtin_is_lang(name);
 }
 
-const char* token_type_name(TokenType type) {
+const char* token_type_name(LamoTokenType type) {
     switch (type) {
         case TOKEN_LET: return "let";
         case TOKEN_FN: return "fn";

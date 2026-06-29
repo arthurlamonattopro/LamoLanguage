@@ -121,7 +121,7 @@ ASTNode* ast_new_continue_stmt(int line, int column) {
     return ast_new_node(AST_CONTINUE_STMT, sizeof(ASTNode), line, column);
 }
 
-ASTAssignStmt* ast_new_assign_stmt(char* name, ASTNode* value, TokenType op_type, int line, int column) {
+ASTAssignStmt* ast_new_assign_stmt(char* name, ASTNode* value, LamoTokenType op_type, int line, int column) {
     ASTAssignStmt* node = (ASTAssignStmt*)ast_new_node(AST_ASSIGN_STMT, sizeof(ASTAssignStmt), line, column);
     node->name = strdup(name);
     node->value = value;
@@ -137,7 +137,7 @@ ASTCallStmt* ast_new_call_stmt(char* name, ASTNode** args, int arg_count, int li
     return node;
 }
 
-ASTBinaryExpr* ast_new_binary_expr(ASTNode* left, TokenType operator, ASTNode* right, int line, int column) {
+ASTBinaryExpr* ast_new_binary_expr(ASTNode* left, LamoTokenType operator, ASTNode* right, int line, int column) {
     ASTBinaryExpr* node = (ASTBinaryExpr*)ast_new_node(AST_BINARY_EXPR, sizeof(ASTBinaryExpr), line, column);
     node->left = left;
     node->operator = operator;
@@ -145,7 +145,7 @@ ASTBinaryExpr* ast_new_binary_expr(ASTNode* left, TokenType operator, ASTNode* r
     return node;
 }
 
-ASTUnaryExpr* ast_new_unary_expr(TokenType operator, ASTNode* right, int line, int column) {
+ASTUnaryExpr* ast_new_unary_expr(LamoTokenType operator, ASTNode* right, int line, int column) {
     ASTUnaryExpr* node = (ASTUnaryExpr*)ast_new_node(AST_UNARY_EXPR, sizeof(ASTUnaryExpr), line, column);
     node->operator = operator;
     node->right = right;
