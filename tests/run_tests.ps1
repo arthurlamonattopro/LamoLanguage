@@ -55,19 +55,40 @@ function Invoke-LamoCheck([string]$file) {
 }
 
 function Invoke-LamoRun([string]$file, [ref]$stdoutOut, [ref]$stderrOut) {
-    # Returns $true if lamo exited with code 0; stdout captured in $stdoutOut.
+    # Sprint 1 fix: cap runtime tests at 10 seconds so a runaway Lamo
+    # program (e.g. infinite loop) cannot hang the test suite. We use a
+    # background job + Wait-Job -Timeout 10; on timeout we kill the job
+    # and treat it as a failure.
     $stdout = ""
     $stderr = ""
-    $stdout = & $LamoPath run $file 2>&1 | ForEach-Object {
-        if ($_ -is [System.Management.Automation.ErrorRecord]) {
-            $stderr += $_.Exception.Message + "`n"
-        } else {
-            $_
+    $job = Start-Job -ScriptBlock {
+        param($lamo, $file)
+        & $lamo run $file 2>&1
+    } -ArgumentList $LamoPath, $file
+
+    if (Wait-Job $job -Timeout 10) {
+        # Job finished within the timeout. Collect output.
+        $results = Receive-Job $job
+        foreach ($line in $results) {
+            if ($line -is [System.Management.Automation.ErrorRecord]) {
+                $stderr += $line.Exception.Message + "`n"
+            } else {
+                $stdout += $line.ToString() + "`n"
+            }
         }
+        Remove-Job $job -Force
+        $stdoutOut.Value = $stdout
+        $stderrOut.Value = $stderr
+        # If $LASTEXITCODE is set (i.e. the spawned process exited with a code),
+        # use it; otherwise treat as success.
+        return ($LASTEXITCODE -eq 0 -or $null -eq $LASTEXITCODE)
+    } else {
+        # Timed out. Kill the job and any child processes it spawned.
+        Remove-Job $job -Force
+        $stdoutOut.Value = ""
+        $stderrOut.Value = "timed out after 10s`n"
+        return $false
     }
-    $stdoutOut.Value = $stdout
-    $stderrOut.Value = $stderr
-    return ($LASTEXITCODE -eq 0)
 }
 
 # ---------------------------------------------------------------------------

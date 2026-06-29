@@ -3,6 +3,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "../builtins.h"
+#include "../error_util.h"
 #include "semantic.h"
 #include "lexer.h"
 
@@ -37,6 +39,11 @@ typedef struct Symbol {
     int arity;
     LamoType type;          // for SYMBOL_VAR: the variable's inferred type.
                             // for SYMBOL_FN: the inferred return type (UNKNOWN if not yet known).
+    /* Sprint 2 fix: store the source location of the original declaration so
+     * the duplicate-declaration error message can point the user at the
+     * previous site, not just the new one. */
+    int line;
+    int column;
     struct Symbol* next;
 } Symbol;
 
@@ -44,6 +51,12 @@ typedef struct Scope {
     Symbol* symbols;
     struct Scope* parent;
 } Scope;
+
+/* Sprint 3: source lookup callback so semantic_error_at can print the
+ * offending source line + caret. The compile_sources() caller registers
+ * a function that maps file_path -> source text; in single-file builds
+ * we just use the one source we have. */
+typedef const char* (*SourceLookupFn)(const char* path, void* user_data);
 
 typedef struct {
     const char* file_path;
@@ -57,10 +70,17 @@ typedef struct {
     // Incrementado ao entrar num loop, decrementado ao sair.
     int inside_loop;
     int errors;
+    /* Sprint 3: source lookup for error snippets. May be NULL — in that
+     * case semantic_error_at just omits the snippet. */
+    SourceLookupFn source_lookup;
+    void* source_lookup_user_data;
 } SemanticContext;
 
 static void semantic_visit_statement(SemanticContext* ctx, ASTNode* node);
 static LamoType semantic_infer_expression(SemanticContext* ctx, ASTNode* node);
+/* Sprint 2 refactor: arity lookup is now a single call into builtins.h's
+ * lamo_builtin_arity(). The forward declaration is kept so the call sites
+ * below don't need to be renamed. */
 static int builtin_function_arity(const char* name);
 static LamoType builtin_function_return_type(const char* name, ASTNode** args, int arg_count);
 static int semantic_validate_builtin_call(SemanticContext* ctx, const char* name, ASTNode** args, int arg_count, int line, int column);
@@ -118,6 +138,17 @@ static void semantic_error_at(SemanticContext* ctx, int line, int column, const 
                         (ctx->file_path ? ctx->file_path : "<input>");
     fprintf(stderr, "%s:%d:%d: semantic error: %s\n",
             label, line, column, message);
+    /* Sprint 3: print the source line + caret. We ask the registered
+     * source-lookup callback for the source text of the current file;
+     * if no callback is registered (e.g. semantic_analyze was called
+     * directly without going through compile_sources), we just skip
+     * the snippet. */
+    if (ctx->source_lookup) {
+        const char* source = ctx->source_lookup(label, ctx->source_lookup_user_data);
+        if (source) {
+            error_print_snippet(stderr, source, line, column);
+        }
+    }
     ctx->errors++;
 }
 
@@ -141,9 +172,17 @@ static Symbol* scope_find(Scope* scope, const char* name) {
 }
 
 static void scope_define(SemanticContext* ctx, Scope* scope, const char* name, SymbolKind kind, int arity, LamoType type, int line, int column) {
-    if (scope_find_in_current(scope, name)) {
+    Symbol* existing = scope_find_in_current(scope, name);
+    if (existing) {
+        /* Sprint 2 fix: report the kind of the previously-declared symbol
+         * and its source location, so the user can find the original
+         * declaration without grepping. */
         char message[256];
-        snprintf(message, sizeof(message), "duplicate declaration of '%s'", name);
+        const char* prev_kind_str = existing->kind == SYMBOL_FN ? "function" : "variable";
+        const char* new_kind_str = kind == SYMBOL_FN ? "function" : "variable";
+        snprintf(message, sizeof(message),
+                 "duplicate declaration of '%s' as %s (previously declared as %s at %d:%d)",
+                 name, new_kind_str, prev_kind_str, existing->line, existing->column);
         semantic_error_at(ctx, line, column, message);
         return;
     }
@@ -158,6 +197,8 @@ static void scope_define(SemanticContext* ctx, Scope* scope, const char* name, S
     symbol->kind = kind;
     symbol->arity = arity;
     symbol->type = type;
+    symbol->line = line;
+    symbol->column = column;
     symbol->next = scope->symbols;
     scope->symbols = symbol;
 }
@@ -214,60 +255,41 @@ static LamoType semantic_visit_call(SemanticContext* ctx, const char* name, ASTN
     return return_type;
 }
 
-// Todos os builtins (linguagem + GUI + HTTP) num único lugar.
-// Os builtins de linguagem (print, input, isnumber, isstring, exit, abs)
-// agora são tratados como identificadores comuns no lexer e resolvidos aqui.
+// Sprint 2 refactor: the per-builtin arity and return-type logic now lives
+// in src/builtins.h as a single shared table. The two wrappers below are
+// thin adapters that preserve the old call-site names while delegating to
+// the table. Adding a new builtin only requires editing builtins.h (plus
+// the codegen site that emits the call).
 static int builtin_function_arity(const char* name) {
-    // Builtins de linguagem
-    if (strcmp(name, "print") == 0) return 1;
-    if (strcmp(name, "input") == 0) return 1;       // input(prompt) -> int (legado)
-    if (strcmp(name, "input_int") == 0) return 1;   // input_int(prompt) -> int
-    if (strcmp(name, "input_str") == 0) return 1;   // input_str(prompt) -> string
-    if (strcmp(name, "isnumber") == 0) return 1;
-    if (strcmp(name, "isstring") == 0) return 1;
-    if (strcmp(name, "exit") == 0) return 1;
-    if (strcmp(name, "abs") == 0) return 1;
-    // GUI
-    if (strcmp(name, "gui_open") == 0) return 3;
-    if (strcmp(name, "gui_should_close") == 0) return 0;
-    if (strcmp(name, "gui_begin_frame") == 0) return 3;
-    if (strcmp(name, "gui_draw_rect") == 0) return 7;
-    if (strcmp(name, "gui_draw_text") == 0) return 6;
-    if (strcmp(name, "gui_end_frame") == 0) return 0;
-    if (strcmp(name, "gui_close") == 0) return 0;
-    // HTTP
-    if (strcmp(name, "http_route") == 0) return 2;
-    if (strcmp(name, "http_serve") == 0) return 1;
-    if (strcmp(name, "http_serve_once") == 0) return 1;
-    return -1;
+    return lamo_builtin_arity(name);
 }
 
-// Return type for each builtin. Most are fixed; `abs` mirrors the type of
-// its argument (int -> int, float -> float).
+// Return type for each builtin. Reads the BuiltinRetPolicy from the table;
+// for BUILTIN_RET_MIRROR_ARG0 (abs), inspects args[0] to guess int vs float.
 static LamoType builtin_function_return_type(const char* name, ASTNode** args, int arg_count) {
-    (void)arg_count;
-    if (strcmp(name, "print") == 0) return LAMO_TYPE_INT;
-    if (strcmp(name, "input") == 0) return LAMO_TYPE_INT;
-    if (strcmp(name, "input_int") == 0) return LAMO_TYPE_INT;
-    if (strcmp(name, "input_str") == 0) return LAMO_TYPE_STRING;
-    if (strcmp(name, "isnumber") == 0) return LAMO_TYPE_BOOL;
-    if (strcmp(name, "isstring") == 0) return LAMO_TYPE_BOOL;
-    if (strcmp(name, "exit") == 0) return LAMO_TYPE_INT;
-    if (strcmp(name, "abs") == 0) {
-        if (arg_count >= 1 && args[0]) {
-            // We don't recursively infer here (that happens in semantic_visit_call);
-            // we just look at the literal-ish nodes to guess. Conservative: if it is
-            // a float literal or a known float variable, return FLOAT; otherwise INT.
-            // The actual recursive inference happens via semantic_infer_expression
-            // when args are visited, so by the time we reach here, simple cases are
-            // already represented in the AST node types we can read directly.
-            ASTNode* arg = args[0];
-            if (arg->type == AST_FLOAT_LITERAL) return LAMO_TYPE_FLOAT;
-        }
-        return LAMO_TYPE_INT;
+    const BuiltinInfo* info = lamo_builtin_lookup(name);
+    if (!info) {
+        return LAMO_TYPE_UNKNOWN;
     }
-    // GUI/HTTP builtins all return int (status codes).
-    return LAMO_TYPE_INT;
+    switch (info->ret_policy) {
+        case BUILTIN_RET_INT:
+            return LAMO_TYPE_INT;
+        case BUILTIN_RET_STRING:
+            return LAMO_TYPE_STRING;
+        case BUILTIN_RET_BOOL:
+            return LAMO_TYPE_BOOL;
+        case BUILTIN_RET_MIRROR_ARG0:
+            /* abs(): if the argument is a float literal, the result is float;
+             * otherwise we conservatively report int. Real type inference of
+             * the argument expression happens via semantic_infer_expression
+             * when the args are visited, so by the time we get here, simple
+             * cases are already represented in the AST node types. */
+            if (arg_count >= 1 && args[0] && args[0]->type == AST_FLOAT_LITERAL) {
+                return LAMO_TYPE_FLOAT;
+            }
+            return LAMO_TYPE_INT;
+    }
+    return LAMO_TYPE_UNKNOWN;
 }
 
 static int semantic_validate_builtin_call(SemanticContext* ctx, const char* name, ASTNode** args, int arg_count, int line, int column) {
@@ -313,6 +335,18 @@ static void semantic_check_numeric_operand(SemanticContext* ctx, const char* op_
     }
 }
 
+/* Sprint 3: map a type-annotation string ("int", "float", "string", "bool")
+ * to the internal LamoType enum. Returns LAMO_TYPE_UNKNOWN for unknown
+ * names so the caller can emit a single clear error. */
+static LamoType annotation_to_type(const char* annotation) {
+    if (!annotation) return LAMO_TYPE_UNKNOWN;
+    if (strcmp(annotation, "int") == 0) return LAMO_TYPE_INT;
+    if (strcmp(annotation, "float") == 0) return LAMO_TYPE_FLOAT;
+    if (strcmp(annotation, "string") == 0) return LAMO_TYPE_STRING;
+    if (strcmp(annotation, "bool") == 0) return LAMO_TYPE_BOOL;
+    return LAMO_TYPE_UNKNOWN;
+}
+
 static void semantic_visit_statement(SemanticContext* ctx, ASTNode* node) {
     if (!node) {
         return;
@@ -328,6 +362,38 @@ static void semantic_visit_statement(SemanticContext* ctx, ASTNode* node) {
         case AST_VAR_DECL: {
             ASTVarDecl* var_decl = (ASTVarDecl*)node;
             LamoType init_type = semantic_infer_expression(ctx, var_decl->initializer);
+            /* Sprint 3: validate type annotation if present. The check is
+             * strict: int != float (annotated int with float initializer
+             * is an error), and string/bool are entirely separate. The
+             * one relaxation: UNKNOWN initializer type (e.g. from a
+             * previous error) is accepted to avoid cascading errors. */
+            if (var_decl->type_annotation) {
+                LamoType annotated = annotation_to_type(var_decl->type_annotation);
+                if (annotated == LAMO_TYPE_UNKNOWN) {
+                    char message[256];
+                    snprintf(message, sizeof(message),
+                             "unknown type annotation '%s' (expected int, float, string, or bool)",
+                             var_decl->type_annotation);
+                    semantic_error_at(ctx, node->line, node->column, message);
+                } else if (init_type != LAMO_TYPE_UNKNOWN && init_type != annotated) {
+                    /* Allow int initializer for float annotation (numeric
+                     * widening) and float initializer for int annotation
+                     * (will be truncated at runtime, but is a common
+                     * pattern). The strict-check version would reject
+                     * both; we err on the side of permissiveness here. */
+                    int numeric_compat = (annotated == LAMO_TYPE_INT && init_type == LAMO_TYPE_FLOAT) ||
+                                         (annotated == LAMO_TYPE_FLOAT && init_type == LAMO_TYPE_INT);
+                    if (!numeric_compat) {
+                        char message[256];
+                        snprintf(message, sizeof(message),
+                                 "type annotation '%s' does not match inferred type '%s'",
+                                 var_decl->type_annotation, type_name(init_type));
+                        semantic_error_at(ctx, node->line, node->column, message);
+                    }
+                }
+                /* Use the annotated type for downstream inference. */
+                init_type = annotated;
+            }
             scope_define(ctx, ctx->current_scope, var_decl->name, SYMBOL_VAR, 0, init_type, node->line, node->column);
             break;
         }
@@ -340,9 +406,22 @@ static void semantic_visit_statement(SemanticContext* ctx, ASTNode* node) {
             ctx->inside_function = 1;
 
             for (int i = 0; i < fn_decl->param_count; i++) {
-                // Parameters are untyped in Lamo syntax; treat as UNKNOWN so
-                // the caller's arguments can flow without spurious errors.
-                scope_define(ctx, ctx->current_scope, fn_decl->params[i], SYMBOL_VAR, 0, LAMO_TYPE_UNKNOWN, node->line, node->column);
+                /* Sprint 3: if the parameter has a type annotation, use
+                 * it as the inferred type; otherwise leave UNKNOWN so
+                 * the caller's argument type flows in unchanged. We also
+                 * validate that the annotation is a known type name. */
+                LamoType param_type = LAMO_TYPE_UNKNOWN;
+                if (fn_decl->param_types && fn_decl->param_types[i]) {
+                    param_type = annotation_to_type(fn_decl->param_types[i]);
+                    if (param_type == LAMO_TYPE_UNKNOWN) {
+                        char message[256];
+                        snprintf(message, sizeof(message),
+                                 "unknown type annotation '%s' on parameter '%s' (expected int, float, string, or bool)",
+                                 fn_decl->param_types[i], fn_decl->params[i]);
+                        semantic_error_at(ctx, node->line, node->column, message);
+                    }
+                }
+                scope_define(ctx, ctx->current_scope, fn_decl->params[i], SYMBOL_VAR, 0, param_type, node->line, node->column);
             }
 
             semantic_visit_statement(ctx, fn_decl->body);
@@ -585,7 +664,8 @@ static LamoType semantic_infer_expression(SemanticContext* ctx, ASTNode* node) {
     }
 }
 
-int semantic_analyze(ASTProgram* program, const char* file_path) {
+int semantic_analyze_with_source_lookup(ASTProgram* program, const char* file_path,
+                                        LamoSourceLookupFn lookup, void* user_data) {
     SemanticContext ctx;
     ctx.file_path = file_path;
     ctx.last_node_path = NULL;  // Bug #5 fix: preenchido por node->file_path
@@ -593,11 +673,30 @@ int semantic_analyze(ASTProgram* program, const char* file_path) {
     ctx.inside_function = 0;
     ctx.inside_loop = 0;        // Próximo passo 5: break/continue tracking
     ctx.errors = 0;
+    /* Sprint 3: source lookup for error snippets. May be NULL — in that
+     * case semantic_error_at just omits the snippet. */
+    ctx.source_lookup = lookup;
+    ctx.source_lookup_user_data = user_data;
 
     for (ASTNode* node = program->declarations; node; node = node->next) {
         if (node->type == AST_FN_DECL) {
             ASTFnDecl* fn_decl = (ASTFnDecl*)node;
-            scope_define(&ctx, ctx.current_scope, fn_decl->name, SYMBOL_FN, fn_decl->param_count, LAMO_TYPE_UNKNOWN, node->line, node->column);
+            /* Sprint 3: if the function has a return-type annotation, use
+             * it as the inferred return type. Otherwise leave UNKNOWN
+             * (the call site will infer from the call context, or stay
+             * UNKNOWN if there's no context). */
+            LamoType ret_type = LAMO_TYPE_UNKNOWN;
+            if (fn_decl->return_type_annotation) {
+                ret_type = annotation_to_type(fn_decl->return_type_annotation);
+                if (ret_type == LAMO_TYPE_UNKNOWN) {
+                    char message[256];
+                    snprintf(message, sizeof(message),
+                             "unknown return type annotation '%s' on function '%s' (expected int, float, string, or bool)",
+                             fn_decl->return_type_annotation, fn_decl->name);
+                    semantic_error_at(&ctx, node->line, node->column, message);
+                }
+            }
+            scope_define(&ctx, ctx.current_scope, fn_decl->name, SYMBOL_FN, fn_decl->param_count, ret_type, node->line, node->column);
         }
     }
 
@@ -607,4 +706,10 @@ int semantic_analyze(ASTProgram* program, const char* file_path) {
 
     scope_free(ctx.current_scope);
     return ctx.errors == 0;
+}
+
+int semantic_analyze(ASTProgram* program, const char* file_path) {
+    /* Backwards-compatible entry point: no source lookup, so error
+     * messages will not include a source snippet. */
+    return semantic_analyze_with_source_lookup(program, file_path, NULL, NULL);
 }

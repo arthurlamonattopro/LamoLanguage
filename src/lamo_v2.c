@@ -7,14 +7,17 @@
 #include <string.h>
 #ifdef _WIN32
 #include <direct.h>
+#include <windows.h>
 #else
 #include <limits.h>
 #include <unistd.h>
+#include <sys/wait.h>
 #endif
 #include "lexer.h"
 #include "parser.h"
 #include "ast.h"
 #include "semantic.h"
+#include "builtins.h"
 
 #define VERSION "2.0"
 
@@ -51,7 +54,7 @@ typedef struct {
 
 static void print_usage(const char* prog);
 static char* read_file(const char* path);
-static int run_shell_command(const char* command);
+static int run_argv(char* const argv[]);
 static int compile_sources(const char** input_files, int input_file_count, LamoCommand command, const char* output_path);
 static const char* executable_suffix(void);
 static int load_program_recursive(CompilationState* state, ASTProgram* aggregate_program, const char* path);
@@ -580,22 +583,13 @@ cleanup:
 }
 
 // Verifica se a AST usa GUI builtins (para linkar -lX11 no Linux).
-// Caminha a AST procurando call_stmt/call_expr com nomes de builtins GUI.
+// Sprint 2 refactor: the name check now delegates to the shared table in
+// builtins.h (lamo_builtin_is_gui), so adding a new GUI builtin only
+// requires editing builtins.h — this code path picks it up automatically.
 //
-// Bug #8 fix: a versão antiga usava strncmp(n->name, "gui_", 4) == 0, o que
-// disparava -lX11 para QUALQUER função que começa com "gui_", incluindo
-// funções definidas pelo usuário (já que builtins são shadowable). Agora
-// comparamos contra a lista exata de builtins GUI que o codegen conhece.
-static int lamo_is_gui_builtin_name(const char* name) {
-    return strcmp(name, "gui_open") == 0 ||
-           strcmp(name, "gui_should_close") == 0 ||
-           strcmp(name, "gui_begin_frame") == 0 ||
-           strcmp(name, "gui_draw_rect") == 0 ||
-           strcmp(name, "gui_draw_text") == 0 ||
-           strcmp(name, "gui_end_frame") == 0 ||
-           strcmp(name, "gui_close") == 0;
-}
-
+// Bug #8 fix (preserved): we compare against the exact builtin list rather
+// than using strncmp(name, "gui_", 4) == 0, which would have incorrectly
+// linked -lX11 for any user-defined function starting with "gui_".
 static int lamo_program_uses_gui_recursive(ASTNode* node);
 static int lamo_program_uses_gui_recursive(ASTNode* node) {
     if (!node) return 0;
@@ -640,7 +634,7 @@ static int lamo_program_uses_gui_recursive(ASTNode* node) {
             return lamo_program_uses_gui_recursive(((ASTAssignStmt*)node)->value);
         case AST_CALL_STMT: {
             ASTCallStmt* n = (ASTCallStmt*)node;
-            if (lamo_is_gui_builtin_name(n->name)) return 1;
+            if (lamo_builtin_is_gui(n->name)) return 1;
             for (int i = 0; i < n->arg_count; i++) {
                 if (lamo_program_uses_gui_recursive(n->args[i])) return 1;
             }
@@ -648,7 +642,7 @@ static int lamo_program_uses_gui_recursive(ASTNode* node) {
         }
         case AST_CALL_EXPR: {
             ASTCallExpr* n = (ASTCallExpr*)node;
-            if (lamo_is_gui_builtin_name(n->name)) return 1;
+            if (lamo_builtin_is_gui(n->name)) return 1;
             for (int i = 0; i < n->arg_count; i++) {
                 if (lamo_program_uses_gui_recursive(n->args[i])) return 1;
             }
@@ -663,6 +657,22 @@ static int lamo_program_uses_gui_recursive(ASTNode* node) {
             return lamo_program_uses_gui_recursive(((ASTUnaryExpr*)node)->right);
         case AST_GROUPING_EXPR:
             return lamo_program_uses_gui_recursive(((ASTGroupingExpr*)node)->expression);
+        case AST_ARRAY_LITERAL: {
+            /* Sprint 3: walk array literal elements for GUI builtin usage. */
+            ASTArrayLiteral* arr = (ASTArrayLiteral*)node;
+            int i;
+            for (i = 0; i < arr->element_count; i++) {
+                if (lamo_program_uses_gui_recursive(arr->elements[i])) return 1;
+            }
+            return 0;
+        }
+        case AST_INDEX_EXPR: {
+            ASTIndexExpr* idx = (ASTIndexExpr*)node;
+            return lamo_program_uses_gui_recursive(idx->array) ||
+                   lamo_program_uses_gui_recursive(idx->index);
+        }
+        case AST_PROP_EXPR:
+            return lamo_program_uses_gui_recursive(((ASTPropExpr*)node)->object);
         default:
             return 0;
     }
@@ -670,6 +680,30 @@ static int lamo_program_uses_gui_recursive(ASTNode* node) {
 
 static int program_uses_gui(ASTProgram* program) {
     return lamo_program_uses_gui_recursive((ASTNode*)program);
+}
+
+/* Sprint 3: source-lookup callback for the semantic analyzer.
+ *
+ * Given a file path, returns the source text that was loaded for it
+ * (stored in CompilationState.sources[]). Returns NULL if the path is
+ * not known to the compilation state — in that case the semantic
+ * analyzer just omits the source snippet for that error.
+ *
+ * This is what threads the source text from the loader (lamo_v2.c) into
+ * the semantic analyzer (semantic.c) without leaking the CompilationState
+ * type into semantic.h. */
+static const char* lamo_source_lookup(const char* file_path, void* user_data) {
+    CompilationState* state = (CompilationState*)user_data;
+    int i;
+    if (!state || !file_path) {
+        return NULL;
+    }
+    for (i = 0; i < state->count; i++) {
+        if (state->file_paths[i] && strcmp(state->file_paths[i], file_path) == 0) {
+            return state->sources[i];
+        }
+    }
+    return NULL;
 }
 
 static int compile_sources(const char** input_files, int input_file_count, LamoCommand command, const char* output_path) {
@@ -696,7 +730,7 @@ static int compile_sources(const char** input_files, int input_file_count, LamoC
         }
     }
 
-    if (!semantic_analyze(program_ast, semantic_label)) {
+    if (!semantic_analyze_with_source_lookup(program_ast, semantic_label, lamo_source_lookup, &state)) {
         exit_code = EXIT_COMPILE_ERROR;
         goto cleanup;
     }
@@ -714,9 +748,9 @@ static int compile_sources(const char** input_files, int input_file_count, LamoC
         const char* c_output_path = "lamo_exec.c";
         const char* binary_output_path = output_path ? output_path : "lamo_exec";
         FILE* out = fopen(c_output_path, "w");
-        char gcc_command[2048];
-        char exec_command[1024];
         int needs_gui;
+        int exit_status;
+        char binary_with_suffix[1024];
 
         if (!out) {
             fprintf(stderr, "failed to open %s for writing: %s\n", c_output_path, strerror(errno));
@@ -729,39 +763,78 @@ static int compile_sources(const char** input_files, int input_file_count, LamoC
 
         needs_gui = program_uses_gui(program_ast);
 
-        snprintf(gcc_command, sizeof(gcc_command),
+        /* Build argv for the C compiler. Using execvp/CreateProcess instead of
+         * system() means user-controlled paths (which only the compiler itself
+         * supplies here, but the binary name is also derived from -o output_path
+         * that the user can pass) are passed verbatim to the OS — no shell
+         * metacharacters can ever be interpreted. */
+        snprintf(binary_with_suffix, sizeof(binary_with_suffix),
+                 "%s%s", binary_output_path, executable_suffix());
+
+        {
+            char c_output_local[256];
+            snprintf(c_output_local, sizeof(c_output_local), "%s", c_output_path);
 #ifdef _WIN32
-                 "gcc -Wall -Wextra -std=c99 -o \"%s\" \"%s\" -lgdi32 -luser32 -lws2_32",
+            (void)needs_gui;
+            /* On Windows the GUI runtime is always linked (GDI32 is always
+             * present), so we don't gate on needs_gui. */
+            char* argv[] = {
+                "gcc", "-Wall", "-Wextra", "-std=c99",
+                "-o", binary_with_suffix, c_output_local,
+                "-lgdi32", "-luser32", "-lws2_32", "-lm",
+                NULL
+            };
+            exit_status = run_argv(argv);
 #else
-                 needs_gui ?
-                     "gcc -Wall -Wextra -std=c99 -o \"%s\" \"%s\" -lX11" :
-                     "gcc -Wall -Wextra -std=c99 -o \"%s\" \"%s\"",
+            if (needs_gui) {
+                char* argv[] = {
+                    "gcc", "-Wall", "-Wextra", "-std=c99",
+                    "-o", binary_with_suffix, c_output_local,
+                    "-lX11", "-lm",
+                    NULL
+                };
+                exit_status = run_argv(argv);
+            } else {
+                char* argv[] = {
+                    "gcc", "-Wall", "-Wextra", "-std=c99",
+                    "-o", binary_with_suffix, c_output_local,
+                    "-lm",
+                    NULL
+                };
+                exit_status = run_argv(argv);
+            }
 #endif
-                 binary_output_path, c_output_path);
-        if (run_shell_command(gcc_command) != 0) {
+        }
+
+        if (exit_status != 0) {
             fprintf(stderr, "backend compilation failed while building %s from %s\n",
-                    binary_output_path, c_output_path);
+                    binary_with_suffix, c_output_path);
             exit_code = EXIT_BACKEND_ERROR;
             goto cleanup;
         }
 
         if (command == COMMAND_BUILD) {
-            printf("build succeeded: %s%s\n", binary_output_path, executable_suffix());
+            printf("build succeeded: %s\n", binary_with_suffix);
             goto cleanup;
         }
 
-        // Em shells POSIX, `system("\"lamo_exec\"")` falha porque o diretório
-        // corrente tipicamente não está no PATH. Prefixamos com `./` em
-        // plataformas Unix e mantemos o path entre aspas no Windows (cmd.exe
-        // procura no diretório corrente por padrão).
+        /* Execute the compiled binary. Again, run via argv rather than
+         * system() so that user-supplied -o paths cannot inject shell
+         * metacharacters. On POSIX, prefix with "./" because PATH lookup
+         * would not find a file in the current directory. */
+        {
 #ifdef _WIN32
-        snprintf(exec_command, sizeof(exec_command), "\"%s%s\"", binary_output_path, executable_suffix());
+            char* argv[] = { binary_with_suffix, NULL };
 #else
-        snprintf(exec_command, sizeof(exec_command), "./\"%s%s\"", binary_output_path, executable_suffix());
+            char dot_slash[2048];
+            snprintf(dot_slash, sizeof(dot_slash), "./%s", binary_with_suffix);
+            char* argv[] = { dot_slash, NULL };
 #endif
-        if (run_shell_command(exec_command) != 0) {
-            fprintf(stderr, "program exited with a non-zero status: %s%s\n",
-                    binary_output_path, executable_suffix());
+            exit_status = run_argv(argv);
+        }
+        if (exit_status != 0) {
+            fprintf(stderr, "program exited with a non-zero status: %s\n",
+                    binary_with_suffix);
             exit_code = EXIT_BACKEND_ERROR;
             goto cleanup;
         }
@@ -773,8 +846,109 @@ cleanup:
     return exit_code;
 }
 
-static int run_shell_command(const char* command) {
-    return system(command);
+/* run_argv: execute a program with the given argv without going through a
+ * shell. This eliminates the entire class of shell-injection bugs that
+ * system() would expose on user-controlled paths (e.g. the -o argument).
+ *
+ * POSIX: fork() + execvp(), wait for child, return its exit status
+ *        (0-255). If the child was killed by a signal, return 128 + signum.
+ * Windows: CreateProcessA() with the first argv element as the program
+ *        path. Returns the child's exit code, or -1 on failure to spawn.
+ *
+ * argv MUST be NULL-terminated. argv[0] is the program name (sent to
+ * execvp() as the file to search PATH for; on Windows it is the full
+ * command line token). */
+static int run_argv(char* const argv[]) {
+    if (!argv || !argv[0]) {
+        return -1;
+    }
+
+#ifdef _WIN32
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    DWORD exit_code = 0;
+    char command_line[8192];
+    size_t pos = 0;
+    int i;
+
+    /* Build a quoted command line. We don't shell-interpret it (we use
+     * CreateProcess, not cmd.exe), but Windows still parses the command
+     * line string itself, so we must quote each argument. */
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    ZeroMemory(&pi, sizeof(pi));
+
+    for (i = 0; argv[i] != NULL; i++) {
+        const char* arg = argv[i];
+        size_t arg_len = strlen(arg);
+        /* Each arg gets surrounded by quotes; inner quotes are doubled.
+         * This follows the standard CommandLineToArgvW rules. */
+        if (pos + arg_len * 2 + 4 >= sizeof(command_line)) {
+            fprintf(stderr, "internal error: command line too long\n");
+            return -1;
+        }
+        if (i > 0) command_line[pos++] = ' ';
+        command_line[pos++] = '"';
+        for (size_t j = 0; j < arg_len; j++) {
+            char c = arg[j];
+            if (c == '"') {
+                command_line[pos++] = '"';
+                command_line[pos++] = '"';
+            } else {
+                command_line[pos++] = c;
+            }
+        }
+        command_line[pos++] = '"';
+    }
+    command_line[pos] = '\0';
+
+    if (!CreateProcessA(NULL, command_line, NULL, NULL, TRUE, 0,
+                        NULL, NULL, &si, &pi)) {
+        DWORD err = GetLastError();
+        fprintf(stderr, "failed to spawn '%s' (error %lu)\n", argv[0], (unsigned long)err);
+        return -1;
+    }
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    if (!GetExitCodeProcess(pi.hProcess, &exit_code)) {
+        exit_code = (DWORD)-1;
+    }
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return (int)exit_code;
+#else
+    pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "fork failed: %s\n", strerror(errno));
+        return -1;
+    }
+    if (pid == 0) {
+        /* Child: execvp() searches PATH. */
+        execvp(argv[0], argv);
+        /* If we got here, execvp() failed. */
+        fprintf(stderr, "exec '%s' failed: %s\n", argv[0], strerror(errno));
+        _exit(127);
+    }
+
+    /* Parent: wait for the child to finish. */
+    for (;;) {
+        int status = 0;
+        pid_t waited = waitpid(pid, &status, 0);
+        if (waited < 0) {
+            if (errno == EINTR) continue;
+            fprintf(stderr, "waitpid failed: %s\n", strerror(errno));
+            return -1;
+        }
+        if (WIFEXITED(status)) {
+            return WEXITSTATUS(status);
+        }
+        if (WIFSIGNALED(status)) {
+            return 128 + WTERMSIG(status);
+        }
+        /* Should not happen, but be safe. */
+        return -1;
+    }
+#endif
 }
 
 static const char* executable_suffix(void) {

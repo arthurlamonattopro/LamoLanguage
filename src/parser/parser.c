@@ -5,6 +5,7 @@
 #include <string.h>
 #include <errno.h>
 #include "parser.h"
+#include "../error_util.h"
 
 struct Parser {
     Lexer* lexer;
@@ -98,6 +99,19 @@ void parser_error(Parser* p, const char* msg) {
     fprintf(stderr, "  found token: %s (%s)\n",
             token_type_name(p->current.type),
             p->current.value ? p->current.value : "<null>");
+    /* Sprint 3 fix: print the source line + a caret pointing at the
+     * column. The lexer owns the source string, so we ask it for the
+     * raw pointer. If the parser was constructed without a lexer
+     * (defensive), no snippet is printed. */
+    if (p->lexer) {
+        const char* source = NULL;
+        /* lexer_source() is not in the public API but the Lexer struct
+         * is defined in lexer.h with a `source` field, so we can read
+         * it directly. We go through the struct because there's no
+         * getter. */
+        source = ((Lexer*)p->lexer)->source;
+        error_print_snippet(stderr, source, p->current.line, p->current.column);
+    }
     // NÃO chama exit(1) — deixa o caller tentar sincronizar e continuar.
 }
 
@@ -121,6 +135,44 @@ static void eat_p(Parser* p, TokenType type) {
 }
 
 ASTNode* parse_expression(Parser* p);
+static ASTNode* parse_primary(Parser* p);
+
+/* Sprint 3: parse_postfix — handles `expr[index]` and `expr.prop` after
+ * a primary expression. We treat both as left-associative postfix
+ * operators, so `a[0][1].len` parses as `((a[0])[1]).len`.
+ *
+ * The implementation is a loop that keeps wrapping the current node
+ * in an index or prop expr as long as we see `[` or `.`. */
+static ASTNode* parse_postfix(Parser* p);
+
+static ASTNode* parse_postfix(Parser* p) {
+    ASTNode* node = parse_primary(p);
+    while (1) {
+        if (p->current.type == TOKEN_LBRACKET) {
+            int line = p->current.line;
+            int column = p->current.column;
+            advance_p(p);  /* consume '[' */
+            ASTNode* index = parse_expression(p);
+            eat_p(p, TOKEN_RBRACKET);
+            node = (ASTNode*)ast_new_index_expr(node, index, line, column);
+        } else if (p->current.type == TOKEN_DOT) {
+            int line = p->current.line;
+            int column = p->current.column;
+            advance_p(p);  /* consume '.' */
+            if (p->current.type != TOKEN_IDENTIFIER) {
+                parser_error(p, "expected property name after '.'");
+                return node;  /* return what we have so far; caller may recover */
+            }
+            char* prop_name = strdup(p->current.value);
+            advance_p(p);
+            node = (ASTNode*)ast_new_prop_expr(node, prop_name, line, column);
+            free(prop_name);
+        } else {
+            break;
+        }
+    }
+    return node;
+}
 
 // Tenta sincronizar e retornar NULL. Usado quando um erro impede de construir
 // um nó válido: o caller recebe NULL e o parser continua a partir do próximo
@@ -199,7 +251,15 @@ static ASTNode* parse_primary(Parser* p) {
             while (p->current.type != TOKEN_RPAREN && p->current.type != TOKEN_EOF) {
                 ASTNode* arg = parse_expression(p);
                 if (arg) {
-                    args = realloc(args, sizeof(ASTNode*) * (arg_count + 1));
+                    ASTNode** resized = realloc(args, sizeof(ASTNode*) * (size_t)(arg_count + 1));
+                    if (!resized) {
+                        parser_error(p, "out of memory while growing argument list");
+                        ast_free(arg);
+                        free(args);
+                        free(name);
+                        return parser_recover(p);
+                    }
+                    args = resized;
                     args[arg_count++] = arg;
                 }
                 if (p->current.type == TOKEN_COMMA) advance_p(p);
@@ -222,6 +282,33 @@ static ASTNode* parse_primary(Parser* p) {
         eat_p(p, TOKEN_RPAREN);
         return (ASTNode*)ast_new_grouping_expr(expr, line, column);
     }
+    else if (p->current.type == TOKEN_LBRACKET) {
+        /* Sprint 3: array literal — `[expr, expr, ...]`. The empty
+         * array `[]` is allowed and produces a zero-length array. */
+        int line = p->current.line;
+        int column = p->current.column;
+        ASTNode** elements = NULL;
+        int element_count = 0;
+        eat_p(p, TOKEN_LBRACKET);
+        while (p->current.type != TOKEN_RBRACKET && p->current.type != TOKEN_EOF) {
+            ASTNode* elem = parse_expression(p);
+            if (elem) {
+                ASTNode** resized = realloc(elements, sizeof(ASTNode*) * (size_t)(element_count + 1));
+                if (!resized) {
+                    parser_error(p, "out of memory while growing array literal");
+                    ast_free(elem);
+                    for (int i = 0; i < element_count; i++) ast_free(elements[i]);
+                    free(elements);
+                    return parser_recover(p);
+                }
+                elements = resized;
+                elements[element_count++] = elem;
+            }
+            if (p->current.type == TOKEN_COMMA) advance_p(p);
+        }
+        eat_p(p, TOKEN_RBRACKET);
+        return (ASTNode*)ast_new_array_literal(elements, element_count, line, column);
+    }
     else {
         char buf[256];
         snprintf(buf, sizeof(buf), "invalid expression, found %s",
@@ -240,7 +327,9 @@ static ASTNode* parse_unary(Parser* p) {
         ASTNode* right = parse_unary(p);
         return (ASTNode*)ast_new_unary_expr(op_type, right, line, column);
     } else {
-        return parse_primary(p);
+        /* Sprint 3: parse_postfix handles `expr[idx]` and `expr.prop`
+         * on top of parse_primary. */
+        return parse_postfix(p);
     }
 }
 
@@ -363,11 +452,37 @@ ASTNode* parse_statement(Parser* p) {
         int line = p->current.line;
         int column = p->current.column;
         eat_p(p, TOKEN_IDENTIFIER);
+        /* Sprint 3: optional type annotation `: int | float | string | bool`.
+         * We accept any identifier here — the semantic pass will reject
+         * unknown type names with a clearer message than the parser could. */
+        char* type_annotation = NULL;
+        if (p->current.type == TOKEN_COLON) {
+            eat_p(p, TOKEN_COLON);
+            if (p->current.type != TOKEN_IDENTIFIER) {
+                parser_error(p, "expected type name after ':' in let declaration");
+                free(name);
+                return parser_recover(p);
+            }
+            type_annotation = strdup(p->current.value);
+            eat_p(p, TOKEN_IDENTIFIER);
+        }
         eat_p(p, TOKEN_EQUALS);
+        /* Sprint 1 fix: explicit "missing initializer" error for `let x = ;`.
+         * Without this, parse_expression() would fall through to parse_primary()
+         * and emit a generic "invalid expression, found ;" — which technically
+         * reports the error but is unhelpful to a beginner writing Lamo.
+         * The explicit message tells them exactly what is wrong. */
+        if (p->current.type == TOKEN_SEMICOLON) {
+            parser_error(p, "missing initializer after '=' in let declaration");
+            free(name);
+            free(type_annotation);
+            return parser_recover(p);
+        }
         ASTNode* initializer = parse_expression(p);
         eat_p(p, TOKEN_SEMICOLON);
-        ASTNode* node = (ASTNode*)ast_new_var_decl(name, initializer, line, column);
+        ASTNode* node = (ASTNode*)ast_new_var_decl_typed(name, initializer, type_annotation, line, column);
         free(name);
+        free(type_annotation);
         return node;
     }
     else if (p->current.type == TOKEN_FN) {
@@ -383,24 +498,109 @@ ASTNode* parse_statement(Parser* p) {
         eat_p(p, TOKEN_LPAREN);
 
         char** params = NULL;
+        char** param_types = NULL;  /* Sprint 3: per-param type annotations */
         int param_count = 0;
+        int has_any_type_annotation = 0;
 
         while (p->current.type != TOKEN_RPAREN && p->current.type != TOKEN_EOF) {
             if (p->current.type != TOKEN_IDENTIFIER) {
                 parser_error(p, "expected parameter name");
                 break;
             }
-            params = realloc(params, sizeof(char*) * (param_count + 1));
+            char** resized = realloc(params, sizeof(char*) * (size_t)(param_count + 1));
+            if (!resized) {
+                parser_error(p, "out of memory while growing parameter list");
+                for (int i = 0; i < param_count; i++) free(params[i]);
+                free(params);
+                if (param_types) {
+                    for (int i = 0; i < param_count; i++) free(param_types[i]);
+                    free(param_types);
+                }
+                free(name);
+                return parser_recover(p);
+            }
+            params = resized;
             params[param_count] = strdup(p->current.value);
-            param_count++;
             eat_p(p, TOKEN_IDENTIFIER);
+
+            /* Sprint 3: optional `: type` per parameter. We allocate the
+             * param_types array lazily — only if at least one parameter
+             * has an annotation. This keeps the common case (no
+             * annotations) allocation-free. */
+            if (p->current.type == TOKEN_COLON) {
+                if (!param_types) {
+                    param_types = calloc((size_t)param_count, sizeof(char*));
+                    if (!param_types) {
+                        parser_error(p, "out of memory while allocating param_types array");
+                        for (int i = 0; i < param_count; i++) free(params[i]);
+                        free(params);
+                        free(name);
+                        return parser_recover(p);
+                    }
+                }
+                /* Grow param_types to match params. */
+                {
+                    char** pt_resized = realloc(param_types, sizeof(char*) * (size_t)(param_count + 1));
+                    if (!pt_resized) {
+                        parser_error(p, "out of memory while growing param_types array");
+                        for (int i = 0; i < param_count; i++) free(params[i]);
+                        free(params);
+                        for (int i = 0; i < param_count; i++) free(param_types[i]);
+                        free(param_types);
+                        free(name);
+                        return parser_recover(p);
+                    }
+                    param_types = pt_resized;
+                    param_types[param_count] = NULL;
+                }
+                eat_p(p, TOKEN_COLON);
+                if (p->current.type != TOKEN_IDENTIFIER) {
+                    parser_error(p, "expected type name after ':' in parameter list");
+                    for (int i = 0; i <= param_count; i++) free(params[i]);
+                    free(params);
+                    for (int i = 0; i < param_count; i++) free(param_types[i]);
+                    free(param_types);
+                    free(name);
+                    return parser_recover(p);
+                }
+                param_types[param_count] = strdup(p->current.value);
+                eat_p(p, TOKEN_IDENTIFIER);
+                has_any_type_annotation = 1;
+            } else if (param_types) {
+                /* Need to grow param_types even when this param has no
+                 * annotation, to keep the arrays in sync. */
+                char** pt_resized = realloc(param_types, sizeof(char*) * (size_t)(param_count + 1));
+                if (!pt_resized) {
+                    parser_error(p, "out of memory while growing param_types array");
+                    free(name);
+                    return parser_recover(p);
+                }
+                param_types = pt_resized;
+                param_types[param_count] = NULL;
+            }
+            param_count++;
             if (p->current.type == TOKEN_COMMA) advance_p(p);
         }
         eat_p(p, TOKEN_RPAREN);
 
+        /* Sprint 3: optional `-> type` return-type annotation. */
+        char* return_type_annotation = NULL;
+        if (p->current.type == TOKEN_ARROW) {
+            eat_p(p, TOKEN_ARROW);
+            if (p->current.type != TOKEN_IDENTIFIER) {
+                parser_error(p, "expected type name after '->' in function signature");
+                free(name);
+                return parser_recover(p);
+            }
+            return_type_annotation = strdup(p->current.value);
+            eat_p(p, TOKEN_IDENTIFIER);
+            (void)has_any_type_annotation;
+        }
+
         ASTNode* body = parse_block(p);
-        ASTNode* node = (ASTNode*)ast_new_fn_decl(name, params, param_count, body, line, column);
+        ASTNode* node = (ASTNode*)ast_new_fn_decl_typed(name, params, param_types, param_count, return_type_annotation, body, line, column);
         free(name);
+        free(return_type_annotation);
         return node;
     }
     else if (p->current.type == TOKEN_IMPORT) {
@@ -431,7 +631,15 @@ ASTNode* parse_statement(Parser* p) {
             while (p->current.type != TOKEN_RPAREN && p->current.type != TOKEN_EOF) {
                 ASTNode* arg = parse_expression(p);
                 if (arg) {
-                    args = realloc(args, sizeof(ASTNode*) * (arg_count + 1));
+                    ASTNode** resized = realloc(args, sizeof(ASTNode*) * (size_t)(arg_count + 1));
+                    if (!resized) {
+                        parser_error(p, "out of memory while growing argument list");
+                        ast_free(arg);
+                        free(args);
+                        free(name);
+                        return parser_recover(p);
+                    }
+                    args = resized;
                     args[arg_count++] = arg;
                 }
                 if (p->current.type == TOKEN_COMMA) advance_p(p);
@@ -524,10 +732,31 @@ ASTNode* parse_statement(Parser* p) {
             int v_line = p->current.line;
             int v_column = p->current.column;
             eat_p(p, TOKEN_IDENTIFIER);
+            /* Sprint 3: optional `: type` annotation in for-let. */
+            char* v_type_annotation = NULL;
+            if (p->current.type == TOKEN_COLON) {
+                eat_p(p, TOKEN_COLON);
+                if (p->current.type != TOKEN_IDENTIFIER) {
+                    parser_error(p, "expected type name after ':' in for-let declaration");
+                    free(v_name);
+                    return parser_recover(p);
+                }
+                v_type_annotation = strdup(p->current.value);
+                eat_p(p, TOKEN_IDENTIFIER);
+            }
             eat_p(p, TOKEN_EQUALS);
+            /* Sprint 1 fix: same "missing initializer" check as the standalone
+             * `let` case — applies to `for (let i = ; ...)` as well. */
+            if (p->current.type == TOKEN_SEMICOLON) {
+                parser_error(p, "missing initializer after '=' in for-let declaration");
+                free(v_name);
+                free(v_type_annotation);
+                return parser_recover(p);
+            }
             ASTNode* init_expr = parse_expression(p);
-            initializer = (ASTNode*)ast_new_var_decl(v_name, init_expr, v_line, v_column);
+            initializer = (ASTNode*)ast_new_var_decl_typed(v_name, init_expr, v_type_annotation, v_line, v_column);
             free(v_name);
+            free(v_type_annotation);
         } else if (p->current.type == TOKEN_IDENTIFIER) {
             char* v_name = strdup(p->current.value);
             int assign_line = p->current.line;

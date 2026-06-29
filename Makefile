@@ -1,5 +1,14 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -std=c99 -Isrc -Isrc/lexer -Isrc/parser -Isrc/ast -Isrc/codegen -Isrc/semantic
+# Sprint 2 fix: -O2 for performance, -g for debuggability (gdb, addr2line).
+# Both flags are harmless in combination; -O2 lets the compiler inline the
+# many static helpers in lamo_runtime.h, and -g preserves source-level
+# debugging through the AST/codegen pipeline.
+CFLAGS = -Wall -Wextra -std=c99 -O2 -g -Isrc -Isrc/lexer -Isrc/parser -Isrc/ast -Isrc/codegen -Isrc/semantic
+
+# Sprint 3 fix: link the compiler itself with -lm, because codegen.c now
+# uses fmod() directly for constant folding of float % expressions. The
+# generated programs are also linked with -lm (see src/lamo_v2.c).
+LDFLAGS = -lm
 
 # Lamo runtime is maintained as a real .h file (src/codegen/lamo_runtime.h)
 # and embedded into the compiler binary as a C string. The string file is
@@ -32,7 +41,7 @@ $(RUNTIME_DATA): $(RUNTIME_HEADER) scripts/embed_runtime.py
 	 echo "warning: python not found; using stale $(RUNTIME_DATA)"
 
 $(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) $(OBJS) -o $@
+	$(CC) $(CFLAGS) $(OBJS) -o $@ $(LDFLAGS)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@

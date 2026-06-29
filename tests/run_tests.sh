@@ -53,6 +53,29 @@ record_fail() {
   - $1"
 }
 
+# Sprint 1 fix: prevent runaway runtime tests from hanging the suite.
+# Try GNU coreutils `timeout`, then the BusyBox `timeout` (same syntax),
+# then `gtimeout` (macOS Homebrew coreutils), then fall back to bare
+# execution if none is available (we still run the test, just without
+# protection — same as before this fix).
+TIMEOUT_BIN=""
+if command -v timeout >/dev/null 2>&1; then
+    TIMEOUT_BIN="timeout"
+elif command -v gtimeout >/dev/null 2>&1; then
+    TIMEOUT_BIN="gtimeout"
+fi
+
+# Wraps a command with a 10s timeout if a timeout binary is available.
+# Usage: run_with_timeout <cmd> <args...>
+# Returns the exit status of the wrapped command (or 124 on timeout).
+run_with_timeout() {
+    if [ -n "$TIMEOUT_BIN" ]; then
+        "$TIMEOUT_BIN" 10 "$@"
+    else
+        "$@"
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # 1. Valid cases: must pass `lamo check` with exit 0.
 # ---------------------------------------------------------------------------
@@ -108,7 +131,7 @@ if [ -d "$RUNTIME_DIR" ]; then
             printf "  FAIL  %s (missing .expected file)\n" "$name"
             continue
         fi
-        if "$LAMO" run "$src" >"$TMP_DIR/actual" 2>"$TMP_DIR/err" <"${stdin_file:-/dev/null}"; then
+        if run_with_timeout "$LAMO" run "$src" >"$TMP_DIR/actual" 2>"$TMP_DIR/err" <"${stdin_file:-/dev/null}"; then
             # Strip trailing whitespace differences by trimming both files.
             # `lamo run` may emit trailing spaces depending on backend; we
             # compare ignoring them.
@@ -123,9 +146,15 @@ if [ -d "$RUNTIME_DIR" ]; then
                 sed 's/^/        | /' "$TMP_DIR/diff" >&2
             fi
         else
-            record_fail "runtime/$name (run failed)"
-            printf "  FAIL  %s (run failed)\n" "$name"
-            sed 's/^/        | /' "$TMP_DIR/err" >&2
+            rc=$?
+            if [ "$rc" = 124 ]; then
+                record_fail "runtime/$name (timed out after 10s)"
+                printf "  FAIL  %s (timed out after 10s)\n" "$name"
+            else
+                record_fail "runtime/$name (run failed)"
+                printf "  FAIL  %s (run failed)\n" "$name"
+                sed 's/^/        | /' "$TMP_DIR/err" >&2
+            fi
         fi
     done
 fi

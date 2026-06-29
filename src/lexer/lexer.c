@@ -4,6 +4,7 @@
 #include <string.h>
 #include <ctype.h>
 #include "lexer.h"
+#include "../builtins.h"
 
 static char* my_strndup(const char* s, size_t n) {
     char* res = malloc(n + 1);
@@ -298,6 +299,7 @@ Token lexer_next_token(Lexer* l) {
         case ',': t.type = TOKEN_COMMA; t.value = strdup(","); break;
         case ';': t.type = TOKEN_SEMICOLON; t.value = strdup(";"); break;
         case ':': t.type = TOKEN_COLON; t.value = strdup(":"); break;
+        case '.': t.type = TOKEN_DOT; t.value = strdup("."); break;
         case '+':
             if (peek(l) == '=') { advance(l); t.type = TOKEN_PLUS_EQ; t.value = strdup("+="); }
             else if (peek(l) == '+') { advance(l); t.type = TOKEN_PLUS_PLUS; t.value = strdup("++"); }
@@ -306,6 +308,7 @@ Token lexer_next_token(Lexer* l) {
         case '-':
             if (peek(l) == '=') { advance(l); t.type = TOKEN_MINUS_EQ; t.value = strdup("-="); }
             else if (peek(l) == '-') { advance(l); t.type = TOKEN_MINUS_MINUS; t.value = strdup("--"); }
+            else if (peek(l) == '>') { advance(l); t.type = TOKEN_ARROW; t.value = strdup("->"); }
             else { t.type = TOKEN_MINUS; t.value = strdup("-"); }
             break;
         case '*': t.type = TOKEN_STAR; t.value = strdup("*"); break;
@@ -350,16 +353,10 @@ void token_free(Token t) {
 }
 
 int lexer_is_builtin_name(const char* name) {
-    if (!name) return 0;
-    if (strcmp(name, "print") == 0) return 1;
-    if (strcmp(name, "input") == 0) return 1;
-    if (strcmp(name, "input_int") == 0) return 1;
-    if (strcmp(name, "input_str") == 0) return 1;
-    if (strcmp(name, "isnumber") == 0) return 1;
-    if (strcmp(name, "isstring") == 0) return 1;
-    if (strcmp(name, "exit") == 0) return 1;
-    if (strcmp(name, "abs") == 0) return 1;
-    return 0;
+    /* Sprint 2 refactor: delegates to the shared table in builtins.h.
+     * Note that this only reports LANG builtins (print, input, ...), not
+     * GUI/HTTP builtins — that matches the previous behavior. */
+    return lamo_builtin_is_lang(name);
 }
 
 const char* token_type_name(TokenType type) {
@@ -398,6 +395,7 @@ const char* token_type_name(TokenType type) {
         case TOKEN_COMMA: return ",";
         case TOKEN_SEMICOLON: return ";";
         case TOKEN_COLON: return ":";
+        case TOKEN_DOT: return ".";
         case TOKEN_EQ_EQ: return "==";
         case TOKEN_BANG_EQ: return "!=";
         case TOKEN_LT_EQ: return "<=";
@@ -408,6 +406,7 @@ const char* token_type_name(TokenType type) {
         case TOKEN_MINUS_EQ: return "-=";
         case TOKEN_PLUS_PLUS: return "++";
         case TOKEN_MINUS_MINUS: return "--";
+        case TOKEN_ARROW: return "->";
         case TOKEN_EOF: return "EOF";
         default: return "UNKNOWN";
     }

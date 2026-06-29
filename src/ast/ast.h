@@ -27,7 +27,14 @@ typedef enum {
     AST_IDENTIFIER,
     AST_CALL_EXPR,
     AST_GROUPING_EXPR,
-    AST_IMPORT              // import "path";  (carregado por lamo_v2.c)
+    AST_IMPORT,             // import "path";  (carregado por lamo_v2.c)
+    /* Sprint 3: arrays. AST_ARRAY_LITERAL is `[1, 2, 3]`; AST_INDEX_EXPR
+     * is `arr[i]`; AST_PROP_EXPR is `arr.len` (the only supported
+     * property today, but the node is generic so we can add .push()
+     * etc. later without changing the AST shape). */
+    AST_ARRAY_LITERAL,
+    AST_INDEX_EXPR,
+    AST_PROP_EXPR
 } ASTNodeType;
 
 // Estrutura base para todos os nós da AST
@@ -48,6 +55,13 @@ typedef struct {
     ASTNode base;
     char* name;
     struct ASTNode* initializer;
+    /* Sprint 3: optional type annotation (e.g. `let x: int = 5;`).
+     * NULL when no annotation was given. The string is owned by the
+     * AST and freed in ast_free(). Possible values: "int", "float",
+     * "string", "bool". The semantic pass validates that the
+     * initializer's inferred type matches; the codegen ignores it
+     * (all Lamo values are LamoValue at runtime). */
+    char* type_annotation;
 } ASTVarDecl;
 
 typedef struct {
@@ -55,6 +69,14 @@ typedef struct {
     char* name;
     char** params;
     int param_count;
+    /* Sprint 3: optional per-parameter type annotations. NULL when
+     * no annotations were given. params_types[i] is the annotation
+     * for params[i], or NULL if that parameter had no annotation.
+     * The array is owned by the AST and freed in ast_free(). */
+    char** param_types;
+    /* Sprint 3: optional return-type annotation (e.g. `fn f() -> int`).
+     * NULL when no annotation was given. */
+    char* return_type_annotation;
     struct ASTNode* body;
 } ASTFnDecl;
 
@@ -158,6 +180,30 @@ typedef struct {
     char* path;            // caminho bruto exatamente como apareceu entre aspas
 } ASTImport;
 
+/* Sprint 3: array literal — `[expr, expr, ...]`. elements is owned by
+ * the AST (heap-allocated array of ASTNode*). */
+typedef struct {
+    ASTNode base;
+    struct ASTNode** elements;
+    int element_count;
+} ASTArrayLiteral;
+
+/* Sprint 3: index expression — `array[index]`. Both `array` and `index`
+ * are owned by the AST. */
+typedef struct {
+    ASTNode base;
+    struct ASTNode* array;
+    struct ASTNode* index;
+} ASTIndexExpr;
+
+/* Sprint 3: property access — `obj.prop_name`. Currently prop_name is
+ * restricted to "len" by the semantic pass, but the AST is generic. */
+typedef struct {
+    ASTNode base;
+    struct ASTNode* object;
+    char* prop_name;
+} ASTPropExpr;
+
 typedef struct {
     ASTNode base;
     struct ASTNode* declarations;
@@ -173,7 +219,9 @@ void ast_set_default_file_path(const char* path);
 const char* ast_get_default_file_path(void);
 ASTProgram* ast_new_program();
 ASTVarDecl* ast_new_var_decl(char* name, ASTNode* initializer, int line, int column);
+ASTVarDecl* ast_new_var_decl_typed(char* name, ASTNode* initializer, char* type_annotation, int line, int column);
 ASTFnDecl* ast_new_fn_decl(char* name, char** params, int param_count, ASTNode* body, int line, int column);
+ASTFnDecl* ast_new_fn_decl_typed(char* name, char** params, char** param_types, int param_count, char* return_type_annotation, ASTNode* body, int line, int column);
 ASTBlock* ast_new_block(ASTNode* statements, int line, int column);
 ASTIfStmt* ast_new_if_stmt(ASTNode* condition, ASTNode* then_branch, ASTNode* else_branch, int line, int column);
 ASTWhileStmt* ast_new_while_stmt(ASTNode* condition, ASTNode* body, int line, int column);
@@ -195,6 +243,9 @@ ASTIdentifier* ast_new_identifier(char* name, int line, int column);
 ASTCallExpr* ast_new_call_expr(char* name, ASTNode** args, int arg_count, int line, int column);
 ASTGroupingExpr* ast_new_grouping_expr(ASTNode* expression, int line, int column);
 ASTImport* ast_new_import_decl(char* path, int line, int column);
+ASTArrayLiteral* ast_new_array_literal(ASTNode** elements, int element_count, int line, int column);
+ASTIndexExpr* ast_new_index_expr(ASTNode* array, ASTNode* index, int line, int column);
+ASTPropExpr* ast_new_prop_expr(ASTNode* object, char* prop_name, int line, int column);
 void ast_program_append(ASTProgram* destination, ASTProgram* source);
 
 void ast_free(ASTNode* node);

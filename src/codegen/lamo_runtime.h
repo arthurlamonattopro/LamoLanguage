@@ -31,6 +31,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>   /* fmod() — usado por lamo_mod() para operandos float */
 
 #if defined(__GNUC__) || defined(__clang__)
 #define LAMO_UNUSED __attribute__((unused))
@@ -46,15 +47,43 @@ typedef enum {
     LAMO_VALUE_INT,
     LAMO_VALUE_FLOAT,
     LAMO_VALUE_STRING,
-    LAMO_VALUE_BOOL
+    LAMO_VALUE_BOOL,
+    LAMO_VALUE_ARRAY   /* Sprint 3: [1, 2, 3] — array of LamoValues */
 } LamoValueType;
+
+/* Sprint 3: forward-declare LamoArray so we can reference it from inside
+ * the LamoValue struct. The full definition appears after LamoValue. */
+struct LamoArray;
 
 typedef struct {
     LamoValueType type;
     long long int_value;
     double float_value;
     const char* string_value;
+    /* Sprint 3: only set when type == LAMO_VALUE_ARRAY. Pointer to a
+     * heap-allocated LamoArray; the array is owned by the arena. */
+    struct LamoArray* array_value;
 } LamoValue;
+
+/* Sprint 3: LamoArray — a growable array of LamoValues.
+ *
+ * Memory model: arrays are heap-allocated and tracked in the string
+ * arena (lamo_string_arena). They're freed at program exit via the
+ * atexit handler. We reuse the arena rather than introducing a
+ * separate arena because:
+ *   - the arena already exists and works
+ *   - arrays and strings have the same lifetime (program exit)
+ *   - long-running programs already have a documented arena-growth
+ *     limitation; arrays inherit that same limitation
+ *
+ * Each LamoArray owns its `items` buffer. Pushing may realloc the
+ * buffer; the array struct itself is fixed-location once allocated
+ * (so LamoValue.array_value pointers stay valid). */
+typedef struct LamoArray {
+    LamoValue* items;
+    long long count;
+    long long capacity;
+} LamoArray;
 
 static LAMO_UNUSED LamoValue lamo_make_int(long long value) {
     LamoValue result;
@@ -62,6 +91,7 @@ static LAMO_UNUSED LamoValue lamo_make_int(long long value) {
     result.int_value = value;
     result.float_value = 0.0;
     result.string_value = NULL;
+    result.array_value = NULL;
     return result;
 }
 
@@ -71,6 +101,7 @@ static LAMO_UNUSED LamoValue lamo_make_float(double value) {
     result.int_value = 0;
     result.float_value = value;
     result.string_value = NULL;
+    result.array_value = NULL;
     return result;
 }
 
@@ -80,6 +111,7 @@ static LAMO_UNUSED LamoValue lamo_make_bool(int value) {
     result.int_value = value ? 1 : 0;
     result.float_value = 0.0;
     result.string_value = NULL;
+    result.array_value = NULL;
     return result;
 }
 
@@ -89,6 +121,21 @@ static LAMO_UNUSED LamoValue lamo_make_string(const char* value) {
     result.int_value = 0;
     result.float_value = 0.0;
     result.string_value = value ? value : "";
+    result.array_value = NULL;
+    return result;
+}
+
+/* Sprint 3: make an array value from an existing LamoArray pointer.
+ * The LamoArray must already be heap-allocated (lamo_array_alloc).
+ * The LamoValue does NOT take ownership — the arena tracks the array
+ * and frees it at exit. */
+static LAMO_UNUSED LamoValue lamo_make_array(LamoArray* array) {
+    LamoValue result;
+    result.type = LAMO_VALUE_ARRAY;
+    result.int_value = 0;
+    result.float_value = 0.0;
+    result.string_value = NULL;
+    result.array_value = array;
     return result;
 }
 
@@ -100,19 +147,24 @@ static LAMO_UNUSED LamoValue lamo_make_string(const char* value) {
  * before, each `s = s + "x"` leaked the previous buffer; now every
  * buffer is tracked and freed on shutdown.
  *
+ * Sprint 3: the arena now holds void* (not just char*) so it can also
+ * track LamoArray structs and their internal `items` buffers. All
+ * allocations share the same lifetime (program exit), so one arena is
+ * enough.
+ *
  * Known limitation: long-running programs (e.g. HTTP servers) see the
  * arena grow while they run. This is acceptable for an educational
  * prototype and is documented in the README.
  */
-static char** lamo_string_arena = NULL;
+static void** lamo_string_arena = NULL;
 static size_t lamo_string_arena_count = 0;
 static size_t lamo_string_arena_capacity = 0;
 
-static LAMO_UNUSED char* lamo_arena_alloc(size_t length) {
-    char* block;
+static LAMO_UNUSED void* lamo_arena_alloc(size_t length) {
+    void* block;
     if (lamo_string_arena_count == lamo_string_arena_capacity) {
         size_t new_cap = lamo_string_arena_capacity ? lamo_string_arena_capacity * 2 : 16;
-        char** new_arena = realloc(lamo_string_arena, sizeof(char*) * new_cap);
+        void** new_arena = realloc(lamo_string_arena, sizeof(void*) * new_cap);
         if (!new_arena) { fprintf(stderr, "runtime error: string arena exhausted\n"); exit(1); }
         lamo_string_arena = new_arena;
         lamo_string_arena_capacity = new_cap;
@@ -128,7 +180,7 @@ static LAMO_UNUSED char* lamo_arena_strdup(const char* value) {
     char* copy;
     if (!value) { value = ""; }
     length = strlen(value);
-    copy = lamo_arena_alloc(length + 1);
+    copy = (char*)lamo_arena_alloc(length + 1);
     memcpy(copy, value, length + 1);
     return copy;
 }
@@ -136,6 +188,9 @@ static LAMO_UNUSED char* lamo_arena_strdup(const char* value) {
 static LAMO_UNUSED void lamo_arena_free_all(void) {
     size_t i;
     for (i = 0; i < lamo_string_arena_count; i++) {
+        /* Sprint 3: arena entries may be char* (string buffers), LamoArray*
+         * (array structs), or LamoValue* (array items buffers). We can't
+         * tell them apart at free time, but free() works on all of them. */
         free(lamo_string_arena[i]);
     }
     free(lamo_string_arena);
@@ -209,7 +264,7 @@ static LAMO_UNUSED LamoValue lamo_concat_values(LamoValue left, LamoValue right)
     char* right_text = lamo_value_to_owned_string(right);
     size_t left_length = strlen(left_text);
     size_t right_length = strlen(right_text);
-    char* combined = lamo_arena_alloc(left_length + right_length + 1);
+    char* combined = (char*)lamo_arena_alloc(left_length + right_length + 1);
     memcpy(combined, left_text, left_length);
     memcpy(combined + left_length, right_text, right_length + 1);
     free(left_text);
@@ -235,6 +290,10 @@ static LAMO_UNUSED int lamo_is_truthy(LamoValue value) {
     if (value.type == LAMO_VALUE_FLOAT) {
         return value.float_value != 0.0;
     }
+    if (value.type == LAMO_VALUE_ARRAY) {
+        /* Sprint 3: arrays are truthy if non-empty. */
+        return value.array_value != NULL && value.array_value->count > 0;
+    }
     return value.int_value != 0;
 }
 
@@ -243,9 +302,127 @@ static LAMO_UNUSED void lamo_print_value(LamoValue value) {
         printf("%s\n", value.string_value ? value.string_value : "");
     } else if (value.type == LAMO_VALUE_FLOAT) {
         printf("%g\n", value.float_value);
+    } else if (value.type == LAMO_VALUE_ARRAY) {
+        /* Sprint 3: print arrays in Python-like [a, b, c] form. Each
+         * element is printed via its own lamo_value_to_owned_string
+         * representation so strings show without quotes (matching
+         * the existing `print` semantics for top-level values). */
+        long long i;
+        printf("[");
+        if (value.array_value) {
+            for (i = 0; i < value.array_value->count; i++) {
+                if (i > 0) printf(", ");
+                /* Reuse lamo_value_to_owned_string to format each element. */
+                char* text = lamo_value_to_owned_string(value.array_value->items[i]);
+                printf("%s", text);
+                free(text);
+            }
+        }
+        printf("]\n");
     } else {
         printf("%lld\n", value.int_value);
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* Sprint 3: Array runtime                                            */
+/* ------------------------------------------------------------------ */
+
+/* Allocate a new LamoArray with the given initial capacity. The struct
+ * is registered in the arena; its `items` buffer is also arena-tracked
+ * (so it survives until program exit). */
+static LAMO_UNUSED LamoArray* lamo_array_alloc(long long initial_capacity) {
+    LamoArray* array;
+    if (initial_capacity < 4) initial_capacity = 4;
+    array = (LamoArray*)lamo_arena_alloc(sizeof(LamoArray));
+    array->items = (LamoValue*)lamo_arena_alloc(sizeof(LamoValue) * (size_t)initial_capacity);
+    array->count = 0;
+    array->capacity = initial_capacity;
+    return array;
+}
+
+/* Build an array value from a list of LamoValues. Used by the codegen
+ * for array literals. The values are copied into a new buffer. */
+static LAMO_UNUSED LamoValue lamo_array_from_values(LamoValue* values, long long count) {
+    long long i;
+    LamoArray* array = lamo_array_alloc(count > 0 ? count : 4);
+    for (i = 0; i < count; i++) {
+        array->items[i] = values[i];
+    }
+    array->count = count;
+    return lamo_make_array(array);
+}
+
+/* Get element at index. Negative indices count from the end (-1 is the
+ * last element). Out-of-range indices abort with a clear runtime error. */
+static LAMO_UNUSED LamoValue lamo_array_get(LamoValue array_val, long long index) {
+    LamoArray* array;
+    if (array_val.type != LAMO_VALUE_ARRAY) {
+        lamo_runtime_type_error("expected array value for indexing");
+    }
+    array = array_val.array_value;
+    if (!array) {
+        lamo_runtime_type_error("indexed array is NULL (internal error)");
+    }
+    if (index < 0) index += array->count;  /* Python-like negative index */
+    if (index < 0 || index >= array->count) {
+        fprintf(stderr, "runtime error: array index %lld out of bounds (array length %lld)\n",
+                index, array->count);
+        exit(1);
+    }
+    return array->items[index];
+}
+
+/* Returns the length of an array. */
+static LAMO_UNUSED LamoValue lamo_array_len(LamoValue array_val) {
+    if (array_val.type != LAMO_VALUE_ARRAY) {
+        lamo_runtime_type_error("expected array value for len()");
+    }
+    if (!array_val.array_value) {
+        return lamo_make_int(0);
+    }
+    return lamo_make_int(array_val.array_value->count);
+}
+
+/* Push a value onto the end of the array. Grows the internal buffer if
+ * needed via realloc (the new buffer is registered in the arena; the old
+ * one is leaked until program exit, same as the existing string-arena
+ * policy). Returns 0 on success. */
+static LAMO_UNUSED LamoValue lamo_array_push(LamoValue array_val, LamoValue value) {
+    LamoArray* array;
+    if (array_val.type != LAMO_VALUE_ARRAY) {
+        lamo_runtime_type_error("expected array value for push()");
+    }
+    array = array_val.array_value;
+    if (!array) {
+        lamo_runtime_type_error("push() target array is NULL (internal error)");
+    }
+    if (array->count == array->capacity) {
+        long long new_cap = array->capacity * 2;
+        LamoValue* new_items = (LamoValue*)lamo_arena_alloc(sizeof(LamoValue) * (size_t)new_cap);
+        memcpy(new_items, array->items, sizeof(LamoValue) * (size_t)array->count);
+        array->items = new_items;
+        array->capacity = new_cap;
+    }
+    array->items[array->count++] = value;
+    return lamo_make_int(0);
+}
+
+/* Pop the last element from the array and return it. Aborts if the
+ * array is empty. */
+static LAMO_UNUSED LamoValue lamo_array_pop(LamoValue array_val) {
+    LamoArray* array;
+    LamoValue popped;
+    if (array_val.type != LAMO_VALUE_ARRAY) {
+        lamo_runtime_type_error("expected array value for pop()");
+    }
+    array = array_val.array_value;
+    if (!array || array->count == 0) {
+        fprintf(stderr, "runtime error: pop() on empty array\n");
+        exit(1);
+    }
+    popped = array->items[--array->count];
+    return popped;
 }
 
 /* Operações aritméticas: se qualquer operando for float, resultado é float. */
@@ -275,16 +452,44 @@ static LAMO_UNUSED LamoValue lamo_mul(LamoValue left, LamoValue right) {
 
 static LAMO_UNUSED LamoValue lamo_div(LamoValue left, LamoValue right) {
     if (left.type == LAMO_VALUE_FLOAT || right.type == LAMO_VALUE_FLOAT) {
-        return lamo_make_float(lamo_as_float(left) / lamo_as_float(right));
+        double lhs = lamo_as_float(left);
+        double rhs = lamo_as_float(right);
+        if (rhs == 0.0) {
+            fprintf(stderr, "runtime error: division by zero\n");
+            exit(1);
+        }
+        return lamo_make_float(lhs / rhs);
     }
-    return lamo_make_int(lamo_as_int(left) / lamo_as_int(right));
+    {
+        long long lhs = lamo_as_int(left);
+        long long rhs = lamo_as_int(right);
+        if (rhs == 0) {
+            fprintf(stderr, "runtime error: division by zero\n");
+            exit(1);
+        }
+        return lamo_make_int(lhs / rhs);
+    }
 }
 
 static LAMO_UNUSED LamoValue lamo_mod(LamoValue left, LamoValue right) {
     if (left.type == LAMO_VALUE_FLOAT || right.type == LAMO_VALUE_FLOAT) {
-        return lamo_make_float((double)((long long)lamo_as_float(left) % (long long)lamo_as_float(right)));
+        double lhs = lamo_as_float(left);
+        double rhs = lamo_as_float(right);
+        if (rhs == 0.0) {
+            fprintf(stderr, "runtime error: modulo by zero\n");
+            exit(1);
+        }
+        return lamo_make_float(fmod(lhs, rhs));
     }
-    return lamo_make_int(lamo_as_int(left) % lamo_as_int(right));
+    {
+        long long lhs = lamo_as_int(left);
+        long long rhs = lamo_as_int(right);
+        if (rhs == 0) {
+            fprintf(stderr, "runtime error: modulo by zero\n");
+            exit(1);
+        }
+        return lamo_make_int(lhs % rhs);
+    }
 }
 
 static LAMO_UNUSED LamoValue lamo_negate(LamoValue value) {

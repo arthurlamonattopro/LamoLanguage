@@ -45,17 +45,34 @@ ASTProgram* ast_new_program() {
 }
 
 ASTVarDecl* ast_new_var_decl(char* name, ASTNode* initializer, int line, int column) {
+    return ast_new_var_decl_typed(name, initializer, NULL, line, column);
+}
+
+/* Sprint 3: typed var decl. type_annotation is owned by the AST (it's
+ * strdup'd here). NULL means no annotation. */
+ASTVarDecl* ast_new_var_decl_typed(char* name, ASTNode* initializer, char* type_annotation, int line, int column) {
     ASTVarDecl* node = (ASTVarDecl*)ast_new_node(AST_VAR_DECL, sizeof(ASTVarDecl), line, column);
     node->name = strdup(name);
     node->initializer = initializer;
+    node->type_annotation = type_annotation ? strdup(type_annotation) : NULL;
     return node;
 }
 
 ASTFnDecl* ast_new_fn_decl(char* name, char** params, int param_count, ASTNode* body, int line, int column) {
+    return ast_new_fn_decl_typed(name, params, NULL, param_count, NULL, body, line, column);
+}
+
+/* Sprint 3: typed fn decl. param_types may be NULL (no annotations) or
+ * an array of param_count entries, each either NULL or a heap-allocated
+ * string. The array is taken ownership of (caller should NOT free it).
+ * return_type_annotation is owned by the AST (strdup'd here). */
+ASTFnDecl* ast_new_fn_decl_typed(char* name, char** params, char** param_types, int param_count, char* return_type_annotation, ASTNode* body, int line, int column) {
     ASTFnDecl* node = (ASTFnDecl*)ast_new_node(AST_FN_DECL, sizeof(ASTFnDecl), line, column);
     node->name = strdup(name);
     node->params = params;
+    node->param_types = param_types;
     node->param_count = param_count;
+    node->return_type_annotation = return_type_annotation ? strdup(return_type_annotation) : NULL;
     node->body = body;
     return node;
 }
@@ -185,6 +202,30 @@ ASTImport* ast_new_import_decl(char* path, int line, int column) {
     return node;
 }
 
+/* Sprint 3: array literal. Takes ownership of the elements array (caller
+ * must NOT free it). element_count is the number of valid entries in
+ * elements. */
+ASTArrayLiteral* ast_new_array_literal(ASTNode** elements, int element_count, int line, int column) {
+    ASTArrayLiteral* node = (ASTArrayLiteral*)ast_new_node(AST_ARRAY_LITERAL, sizeof(ASTArrayLiteral), line, column);
+    node->elements = elements;
+    node->element_count = element_count;
+    return node;
+}
+
+ASTIndexExpr* ast_new_index_expr(ASTNode* array, ASTNode* index, int line, int column) {
+    ASTIndexExpr* node = (ASTIndexExpr*)ast_new_node(AST_INDEX_EXPR, sizeof(ASTIndexExpr), line, column);
+    node->array = array;
+    node->index = index;
+    return node;
+}
+
+ASTPropExpr* ast_new_prop_expr(ASTNode* object, char* prop_name, int line, int column) {
+    ASTPropExpr* node = (ASTPropExpr*)ast_new_node(AST_PROP_EXPR, sizeof(ASTPropExpr), line, column);
+    node->object = object;
+    node->prop_name = strdup(prop_name);
+    return node;
+}
+
 void ast_program_append(ASTProgram* destination, ASTProgram* source) {
     ASTNode* tail;
 
@@ -213,90 +254,138 @@ void ast_program_append(ASTProgram* destination, ASTProgram* source) {
     free(source);
 }
 
+/* Sprint 2 refactor: the `next` list traversal is now iterative. The
+ * previous version recursed on `next` at the tail of the function:
+ *
+ *     free(node);
+ *     if (next) ast_free(next);
+ *
+ * That consumed O(N) stack frames for a list of N sibling nodes — fine
+ * for small programs, but a Lamo file with tens of thousands of
+ * top-level statements would blow the C stack. The recursive descent
+ * into CHILDREN (initializer, body, args, left/right, ...) is left
+ * alone because that depth is bounded by expression nesting, not by
+ * the number of statements in the program.
+ *
+ * The new shape is a loop that walks `next` siblings while recursing
+ * into children exactly as before. */
 void ast_free(ASTNode* node) {
-    if (!node) return;
-    ASTNode* next = node->next;
+    while (node) {
+        ASTNode* next = node->next;
 
-    switch (node->type) {
-        case AST_PROGRAM:
-            ast_free(((ASTProgram*)node)->declarations);
-            break;
-        case AST_VAR_DECL:
-            free(((ASTVarDecl*)node)->name);
-            ast_free(((ASTVarDecl*)node)->initializer);
-            break;
-        case AST_FN_DECL:
-            free(((ASTFnDecl*)node)->name);
-            for (int i = 0; i < ((ASTFnDecl*)node)->param_count; i++) {
-                free(((ASTFnDecl*)node)->params[i]);
+        switch (node->type) {
+            case AST_PROGRAM:
+                ast_free(((ASTProgram*)node)->declarations);
+                break;
+            case AST_VAR_DECL:
+                free(((ASTVarDecl*)node)->name);
+                free(((ASTVarDecl*)node)->type_annotation);
+                ast_free(((ASTVarDecl*)node)->initializer);
+                break;
+            case AST_FN_DECL:
+                free(((ASTFnDecl*)node)->name);
+                for (int i = 0; i < ((ASTFnDecl*)node)->param_count; i++) {
+                    free(((ASTFnDecl*)node)->params[i]);
+                }
+                free(((ASTFnDecl*)node)->params);
+                /* Sprint 3: free param type annotations. param_types may
+                 * be NULL (no annotations on any parameter). */
+                if (((ASTFnDecl*)node)->param_types) {
+                    for (int i = 0; i < ((ASTFnDecl*)node)->param_count; i++) {
+                        free(((ASTFnDecl*)node)->param_types[i]);
+                    }
+                    free(((ASTFnDecl*)node)->param_types);
+                }
+                free(((ASTFnDecl*)node)->return_type_annotation);
+                ast_free(((ASTFnDecl*)node)->body);
+                break;
+            case AST_BLOCK:
+                ast_free(((ASTBlock*)node)->statements);
+                break;
+            case AST_IF_STMT:
+                ast_free(((ASTIfStmt*)node)->condition);
+                ast_free(((ASTIfStmt*)node)->then_branch);
+                ast_free(((ASTIfStmt*)node)->else_branch);
+                break;
+            case AST_WHILE_STMT:
+                ast_free(((ASTWhileStmt*)node)->condition);
+                ast_free(((ASTWhileStmt*)node)->body);
+                break;
+            case AST_FOR_STMT:
+                ast_free(((ASTForStmt*)node)->initializer);
+                ast_free(((ASTForStmt*)node)->condition);
+                ast_free(((ASTForStmt*)node)->increment);
+                ast_free(((ASTForStmt*)node)->body);
+                break;
+            case AST_RETURN_STMT:
+                ast_free(((ASTReturnStmt*)node)->expression);
+                break;
+            case AST_BREAK_STMT:
+            case AST_CONTINUE_STMT:
+                /* leaf nodes — no extra fields to free. */
+                break;
+            case AST_ASSIGN_STMT:
+                free(((ASTAssignStmt*)node)->name);
+                ast_free(((ASTAssignStmt*)node)->value);
+                break;
+            case AST_CALL_STMT:
+            case AST_CALL_EXPR:
+                free(((ASTCallStmt*)node)->name);
+                for (int i = 0; i < ((ASTCallStmt*)node)->arg_count; i++) {
+                    ast_free(((ASTCallStmt*)node)->args[i]);
+                }
+                free(((ASTCallStmt*)node)->args);
+                break;
+            case AST_BINARY_EXPR:
+                ast_free(((ASTBinaryExpr*)node)->left);
+                ast_free(((ASTBinaryExpr*)node)->right);
+                break;
+            case AST_UNARY_EXPR:
+                ast_free(((ASTUnaryExpr*)node)->right);
+                break;
+            case AST_INT_LITERAL:
+            case AST_FLOAT_LITERAL:
+                break;
+            case AST_STRING_LITERAL:
+                free(((ASTStringLiteral*)node)->value);
+                break;
+            case AST_BOOL_LITERAL:
+                break;
+            case AST_IDENTIFIER:
+                free(((ASTIdentifier*)node)->name);
+                break;
+            case AST_GROUPING_EXPR:
+                ast_free(((ASTGroupingExpr*)node)->expression);
+                break;
+            case AST_IMPORT:
+                free(((ASTImport*)node)->path);
+                break;
+            case AST_ARRAY_LITERAL: {
+                /* Sprint 3: array literal. Free each element expression,
+                 * then the elements array itself. */
+                ASTArrayLiteral* arr = (ASTArrayLiteral*)node;
+                int i;
+                for (i = 0; i < arr->element_count; i++) {
+                    ast_free(arr->elements[i]);
+                }
+                free(arr->elements);
+                break;
             }
-            free(((ASTFnDecl*)node)->params);
-            ast_free(((ASTFnDecl*)node)->body);
-            break;
-        case AST_BLOCK:
-            ast_free(((ASTBlock*)node)->statements);
-            break;
-        case AST_IF_STMT:
-            ast_free(((ASTIfStmt*)node)->condition);
-            ast_free(((ASTIfStmt*)node)->then_branch);
-            ast_free(((ASTIfStmt*)node)->else_branch);
-            break;
-        case AST_WHILE_STMT:
-            ast_free(((ASTWhileStmt*)node)->condition);
-            ast_free(((ASTWhileStmt*)node)->body);
-            break;
-        case AST_FOR_STMT:
-            ast_free(((ASTForStmt*)node)->initializer);
-            ast_free(((ASTForStmt*)node)->condition);
-            ast_free(((ASTForStmt*)node)->increment);
-            ast_free(((ASTForStmt*)node)->body);
-            break;
-        case AST_RETURN_STMT:
-            ast_free(((ASTReturnStmt*)node)->expression);
-            break;
-        case AST_BREAK_STMT:
-        case AST_CONTINUE_STMT:
-            // sem campos extras para liberar
-            break;
-        case AST_ASSIGN_STMT:
-            free(((ASTAssignStmt*)node)->name);
-            ast_free(((ASTAssignStmt*)node)->value);
-            break;
-        case AST_CALL_STMT:
-        case AST_CALL_EXPR:
-            free(((ASTCallStmt*)node)->name);
-            for (int i = 0; i < ((ASTCallStmt*)node)->arg_count; i++) {
-                ast_free(((ASTCallStmt*)node)->args[i]);
+            case AST_INDEX_EXPR: {
+                ASTIndexExpr* idx = (ASTIndexExpr*)node;
+                ast_free(idx->array);
+                ast_free(idx->index);
+                break;
             }
-            free(((ASTCallStmt*)node)->args);
-            break;
-        case AST_BINARY_EXPR:
-            ast_free(((ASTBinaryExpr*)node)->left);
-            ast_free(((ASTBinaryExpr*)node)->right);
-            break;
-        case AST_UNARY_EXPR:
-            ast_free(((ASTUnaryExpr*)node)->right);
-            break;
-        case AST_INT_LITERAL:
-            break;
-        case AST_FLOAT_LITERAL:
-            break;
-        case AST_STRING_LITERAL:
-            free(((ASTStringLiteral*)node)->value);
-            break;
-        case AST_BOOL_LITERAL:
-            break;
-        case AST_IDENTIFIER:
-            free(((ASTIdentifier*)node)->name);
-            break;
-        case AST_GROUPING_EXPR:
-            ast_free(((ASTGroupingExpr*)node)->expression);
-            break;
-        case AST_IMPORT:
-            free(((ASTImport*)node)->path);
-            break;
+            case AST_PROP_EXPR: {
+                ASTPropExpr* prop = (ASTPropExpr*)node;
+                ast_free(prop->object);
+                free(prop->prop_name);
+                break;
+            }
+        }
+
+        free(node);
+        node = next;
     }
-
-    free(node);
-    if (next) ast_free(next);
 }

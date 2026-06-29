@@ -1,8 +1,10 @@
 #include "codegen.h"
 #include "lamo_runtime_data.h"
+#include "../builtins.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>   /* fmod() — used by constant folding for float % */
 
 static int indent_level = 0;
 
@@ -61,9 +63,13 @@ static const char* user_name1(const char* name) {
 static void generate_statement_code(ASTNode* node, FILE* out);
 static void generate_expression_code(ASTNode* node, FILE* out);
 static void generate_call_arguments(ASTNode** args, int arg_count, FILE* out);
-static int is_gui_builtin(const char* name);
-static int is_http_builtin(const char* name);
-static int is_lang_builtin(const char* name);
+/* Sprint 2 refactor: is_gui_builtin / is_http_builtin / is_lang_builtin are
+ * now inline functions in builtins.h, so we just use lamo_builtin_is_*()
+ * directly. The forward declarations below are kept for the code paths that
+ * still call them by the old names. */
+#define is_gui_builtin(name)    lamo_builtin_is_gui(name)
+#define is_http_builtin(name)   lamo_builtin_is_http(name)
+#define is_lang_builtin(name)   lamo_builtin_is_lang(name)
 static void generate_lang_builtin_call_expr(const char* name, ASTNode** args, int arg_count, FILE* out);
 static void generate_gui_call_expr(const char* name, ASTNode** args, int arg_count, FILE* out);
 static void generate_http_call_expr(const char* name, ASTNode** args, int arg_count, FILE* out);
@@ -83,32 +89,9 @@ static void generate_call_arguments(ASTNode** args, int arg_count, FILE* out) {
     }
 }
 
-static int is_gui_builtin(const char* name) {
-    return strcmp(name, "gui_open") == 0 ||
-           strcmp(name, "gui_should_close") == 0 ||
-           strcmp(name, "gui_begin_frame") == 0 ||
-           strcmp(name, "gui_draw_rect") == 0 ||
-           strcmp(name, "gui_draw_text") == 0 ||
-           strcmp(name, "gui_end_frame") == 0 ||
-           strcmp(name, "gui_close") == 0;
-}
-
-static int is_http_builtin(const char* name) {
-    return strcmp(name, "http_route") == 0 ||
-           strcmp(name, "http_serve") == 0 ||
-           strcmp(name, "http_serve_once") == 0;
-}
-
-static int is_lang_builtin(const char* name) {
-    return strcmp(name, "print") == 0 ||
-           strcmp(name, "input") == 0 ||
-           strcmp(name, "input_int") == 0 ||
-           strcmp(name, "input_str") == 0 ||
-           strcmp(name, "isnumber") == 0 ||
-           strcmp(name, "isstring") == 0 ||
-           strcmp(name, "exit") == 0 ||
-           strcmp(name, "abs") == 0;
-}
+/* Sprint 2 refactor: is_gui_builtin / is_http_builtin / is_lang_builtin
+ * were inlined into lamo_builtin_is_*() in builtins.h. The macros above
+ * rewire the old call sites to the new shared table. */
 
 
 
@@ -159,6 +142,27 @@ static void generate_lang_builtin_call_expr(const char* name, ASTNode** args, in
     }
     if (strcmp(name, "abs") == 0) {
         fprintf(out, "lamo_abs_value(");
+        generate_expression_code(args[0], out);
+        fprintf(out, ")");
+        return;
+    }
+    /* Sprint 3: array builtins. */
+    if (strcmp(name, "len") == 0) {
+        fprintf(out, "lamo_array_len(");
+        generate_expression_code(args[0], out);
+        fprintf(out, ")");
+        return;
+    }
+    if (strcmp(name, "push") == 0) {
+        fprintf(out, "lamo_array_push(");
+        generate_expression_code(args[0], out);
+        fprintf(out, ", ");
+        generate_expression_code(args[1], out);
+        fprintf(out, ")");
+        return;
+    }
+    if (strcmp(name, "pop") == 0) {
+        fprintf(out, "lamo_array_pop(");
         generate_expression_code(args[0], out);
         fprintf(out, ")");
         return;
@@ -291,7 +295,16 @@ static void emit_runtime(FILE* out, int needs_gui, int needs_http) {
     fputs("\n", out);
 }
 
-static int ast_uses_gui(ASTNode* node) {
+/* Sprint 2 refactor: ast_uses_gui() and ast_uses_http() were ~95% copy-paste
+ * of the same AST walk. Now we have a single recursive walker that takes a
+ * predicate ("does this call name match the builtin family we're looking
+ * for?") and returns 1 if any call in the AST matches. The two old entry
+ * points become one-line wrappers around ast_uses_builtin().
+ *
+ * The predicate is a function pointer rather than a category enum so that
+ * future call sites (e.g. "does this AST call any shadowable builtin?")
+ * can use the same walker without extending the table. */
+static int ast_uses_builtin(ASTNode* node, int (*predicate)(const char*)) {
     int i;
 
     if (!node) {
@@ -302,7 +315,7 @@ static int ast_uses_gui(ASTNode* node) {
         case AST_PROGRAM: {
             ASTNode* current = ((ASTProgram*)node)->declarations;
             while (current) {
-                if (ast_uses_gui(current)) {
+                if (ast_uses_builtin(current, predicate)) {
                     return 1;
                 }
                 current = current->next;
@@ -310,13 +323,13 @@ static int ast_uses_gui(ASTNode* node) {
             return 0;
         }
         case AST_VAR_DECL:
-            return ast_uses_gui(((ASTVarDecl*)node)->initializer);
+            return ast_uses_builtin(((ASTVarDecl*)node)->initializer, predicate);
         case AST_FN_DECL:
-            return ast_uses_gui(((ASTFnDecl*)node)->body);
+            return ast_uses_builtin(((ASTFnDecl*)node)->body, predicate);
         case AST_BLOCK: {
             ASTNode* current = ((ASTBlock*)node)->statements;
             while (current) {
-                if (ast_uses_gui(current)) {
+                if (ast_uses_builtin(current, predicate)) {
                     return 1;
                 }
                 current = current->next;
@@ -325,33 +338,33 @@ static int ast_uses_gui(ASTNode* node) {
         }
         case AST_IF_STMT: {
             ASTIfStmt* if_stmt = (ASTIfStmt*)node;
-            return ast_uses_gui(if_stmt->condition) ||
-                   ast_uses_gui(if_stmt->then_branch) ||
-                   ast_uses_gui(if_stmt->else_branch);
+            return ast_uses_builtin(if_stmt->condition, predicate) ||
+                   ast_uses_builtin(if_stmt->then_branch, predicate) ||
+                   ast_uses_builtin(if_stmt->else_branch, predicate);
         }
         case AST_WHILE_STMT: {
             ASTWhileStmt* while_stmt = (ASTWhileStmt*)node;
-            return ast_uses_gui(while_stmt->condition) ||
-                   ast_uses_gui(while_stmt->body);
+            return ast_uses_builtin(while_stmt->condition, predicate) ||
+                   ast_uses_builtin(while_stmt->body, predicate);
         }
         case AST_FOR_STMT: {
             ASTForStmt* for_stmt = (ASTForStmt*)node;
-            return ast_uses_gui(for_stmt->initializer) ||
-                   ast_uses_gui(for_stmt->condition) ||
-                   ast_uses_gui(for_stmt->increment) ||
-                   ast_uses_gui(for_stmt->body);
+            return ast_uses_builtin(for_stmt->initializer, predicate) ||
+                   ast_uses_builtin(for_stmt->condition, predicate) ||
+                   ast_uses_builtin(for_stmt->increment, predicate) ||
+                   ast_uses_builtin(for_stmt->body, predicate);
         }
         case AST_RETURN_STMT:
-            return ast_uses_gui(((ASTReturnStmt*)node)->expression);
+            return ast_uses_builtin(((ASTReturnStmt*)node)->expression, predicate);
         case AST_ASSIGN_STMT:
-            return ast_uses_gui(((ASTAssignStmt*)node)->value);
+            return ast_uses_builtin(((ASTAssignStmt*)node)->value, predicate);
         case AST_CALL_STMT: {
             ASTCallStmt* call_stmt = (ASTCallStmt*)node;
-            if (is_gui_builtin(call_stmt->name)) {
+            if (predicate(call_stmt->name)) {
                 return 1;
             }
             for (i = 0; i < call_stmt->arg_count; i++) {
-                if (ast_uses_gui(call_stmt->args[i])) {
+                if (ast_uses_builtin(call_stmt->args[i], predicate)) {
                     return 1;
                 }
             }
@@ -359,11 +372,11 @@ static int ast_uses_gui(ASTNode* node) {
         }
         case AST_CALL_EXPR: {
             ASTCallExpr* call_expr = (ASTCallExpr*)node;
-            if (is_gui_builtin(call_expr->name)) {
+            if (predicate(call_expr->name)) {
                 return 1;
             }
             for (i = 0; i < call_expr->arg_count; i++) {
-                if (ast_uses_gui(call_expr->args[i])) {
+                if (ast_uses_builtin(call_expr->args[i], predicate)) {
                     return 1;
                 }
             }
@@ -371,12 +384,31 @@ static int ast_uses_gui(ASTNode* node) {
         }
         case AST_BINARY_EXPR: {
             ASTBinaryExpr* expr = (ASTBinaryExpr*)node;
-            return ast_uses_gui(expr->left) || ast_uses_gui(expr->right);
+            return ast_uses_builtin(expr->left, predicate) ||
+                   ast_uses_builtin(expr->right, predicate);
         }
         case AST_UNARY_EXPR:
-            return ast_uses_gui(((ASTUnaryExpr*)node)->right);
+            return ast_uses_builtin(((ASTUnaryExpr*)node)->right, predicate);
         case AST_GROUPING_EXPR:
-            return ast_uses_gui(((ASTGroupingExpr*)node)->expression);
+            return ast_uses_builtin(((ASTGroupingExpr*)node)->expression, predicate);
+        case AST_ARRAY_LITERAL: {
+            /* Sprint 3: array literal — walk each element expression. */
+            ASTArrayLiteral* arr = (ASTArrayLiteral*)node;
+            int i;
+            for (i = 0; i < arr->element_count; i++) {
+                if (ast_uses_builtin(arr->elements[i], predicate)) {
+                    return 1;
+                }
+            }
+            return 0;
+        }
+        case AST_INDEX_EXPR: {
+            ASTIndexExpr* idx = (ASTIndexExpr*)node;
+            return ast_uses_builtin(idx->array, predicate) ||
+                   ast_uses_builtin(idx->index, predicate);
+        }
+        case AST_PROP_EXPR:
+            return ast_uses_builtin(((ASTPropExpr*)node)->object, predicate);
         case AST_INT_LITERAL:
         case AST_FLOAT_LITERAL:
         case AST_STRING_LITERAL:
@@ -389,102 +421,12 @@ static int ast_uses_gui(ASTNode* node) {
     }
 }
 
+static int ast_uses_gui(ASTNode* node) {
+    return ast_uses_builtin(node, lamo_builtin_is_gui);
+}
+
 static int ast_uses_http(ASTNode* node) {
-    int i;
-
-    if (!node) {
-        return 0;
-    }
-
-    switch (node->type) {
-        case AST_PROGRAM: {
-            ASTNode* current = ((ASTProgram*)node)->declarations;
-            while (current) {
-                if (ast_uses_http(current)) {
-                    return 1;
-                }
-                current = current->next;
-            }
-            return 0;
-        }
-        case AST_VAR_DECL:
-            return ast_uses_http(((ASTVarDecl*)node)->initializer);
-        case AST_FN_DECL:
-            return ast_uses_http(((ASTFnDecl*)node)->body);
-        case AST_BLOCK: {
-            ASTNode* current = ((ASTBlock*)node)->statements;
-            while (current) {
-                if (ast_uses_http(current)) {
-                    return 1;
-                }
-                current = current->next;
-            }
-            return 0;
-        }
-        case AST_IF_STMT: {
-            ASTIfStmt* if_stmt = (ASTIfStmt*)node;
-            return ast_uses_http(if_stmt->condition) ||
-                   ast_uses_http(if_stmt->then_branch) ||
-                   ast_uses_http(if_stmt->else_branch);
-        }
-        case AST_WHILE_STMT: {
-            ASTWhileStmt* while_stmt = (ASTWhileStmt*)node;
-            return ast_uses_http(while_stmt->condition) ||
-                   ast_uses_http(while_stmt->body);
-        }
-        case AST_FOR_STMT: {
-            ASTForStmt* for_stmt = (ASTForStmt*)node;
-            return ast_uses_http(for_stmt->initializer) ||
-                   ast_uses_http(for_stmt->condition) ||
-                   ast_uses_http(for_stmt->increment) ||
-                   ast_uses_http(for_stmt->body);
-        }
-        case AST_RETURN_STMT:
-            return ast_uses_http(((ASTReturnStmt*)node)->expression);
-        case AST_ASSIGN_STMT:
-            return ast_uses_http(((ASTAssignStmt*)node)->value);
-        case AST_CALL_STMT: {
-            ASTCallStmt* call_stmt = (ASTCallStmt*)node;
-            if (is_http_builtin(call_stmt->name)) {
-                return 1;
-            }
-            for (i = 0; i < call_stmt->arg_count; i++) {
-                if (ast_uses_http(call_stmt->args[i])) {
-                    return 1;
-                }
-            }
-            return 0;
-        }
-        case AST_CALL_EXPR: {
-            ASTCallExpr* call_expr = (ASTCallExpr*)node;
-            if (is_http_builtin(call_expr->name)) {
-                return 1;
-            }
-            for (i = 0; i < call_expr->arg_count; i++) {
-                if (ast_uses_http(call_expr->args[i])) {
-                    return 1;
-                }
-            }
-            return 0;
-        }
-        case AST_BINARY_EXPR: {
-            ASTBinaryExpr* expr = (ASTBinaryExpr*)node;
-            return ast_uses_http(expr->left) || ast_uses_http(expr->right);
-        }
-        case AST_UNARY_EXPR:
-            return ast_uses_http(((ASTUnaryExpr*)node)->right);
-        case AST_GROUPING_EXPR:
-            return ast_uses_http(((ASTGroupingExpr*)node)->expression);
-        case AST_INT_LITERAL:
-        case AST_FLOAT_LITERAL:
-        case AST_STRING_LITERAL:
-        case AST_BOOL_LITERAL:
-        case AST_IDENTIFIER:
-        case AST_IMPORT:
-            return 0;
-        default:
-            return 0;
-    }
+    return ast_uses_builtin(node, lamo_builtin_is_http);
 }
 
 void generate_c_code(ASTNode* node, FILE* out) {
@@ -745,6 +687,86 @@ static void generate_statement_code(ASTNode* node, FILE* out) {
 }
 
 static void generate_binary_expr(ASTBinaryExpr* expr, FILE* out) {
+    /* Sprint 3: constant folding for arithmetic on literal operands.
+     *
+     * If both sides are numeric literals, we evaluate the expression at
+     * compile time and emit a single literal instead of a runtime call.
+     * This is a small but real performance win for code that does
+     * arithmetic on constants (e.g. `let buf_size = 1024 * 4;`), and it
+     * also shrinks the generated C.
+     *
+     * We deliberately fold only when BOTH operands are literals — this
+     * avoids needing a full constant-propagation pass. Foldable cases:
+     *   int + int   -> int
+     *   int + float -> float
+     *   float + int -> float
+     *   float + float -> float
+     * Same for -, *, /, %.
+     *
+     * Division/modulo by zero is a runtime error in Lamo; we don't fold
+     * those (let the runtime emit the proper error message). */
+    if (expr->left->type == AST_INT_LITERAL || expr->left->type == AST_FLOAT_LITERAL) {
+        if (expr->right->type == AST_INT_LITERAL || expr->right->type == AST_FLOAT_LITERAL) {
+            int left_is_float  = expr->left->type  == AST_FLOAT_LITERAL;
+            int right_is_float = expr->right->type == AST_FLOAT_LITERAL;
+            long long li = left_is_float  ? 0 : ((ASTIntLiteral*)expr->left)->value;
+            double     lf = left_is_float  ? ((ASTFloatLiteral*)expr->left)->value  : 0.0;
+            long long ri = right_is_float ? 0 : ((ASTIntLiteral*)expr->right)->value;
+            double     rf = right_is_float ? ((ASTFloatLiteral*)expr->right)->value : 0.0;
+
+            switch (expr->operator) {
+                case TOKEN_PLUS:
+                    if (left_is_float || right_is_float) {
+                        fprintf(out, "lamo_make_float(%#.17g)", (double)(left_is_float ? lf : (double)li) + (right_is_float ? rf : (double)ri));
+                    } else {
+                        fprintf(out, "lamo_make_int(%lldLL)", li + ri);
+                    }
+                    return;
+                case TOKEN_MINUS:
+                    if (left_is_float || right_is_float) {
+                        fprintf(out, "lamo_make_float(%#.17g)", (double)(left_is_float ? lf : (double)li) - (right_is_float ? rf : (double)ri));
+                    } else {
+                        fprintf(out, "lamo_make_int(%lldLL)", li - ri);
+                    }
+                    return;
+                case TOKEN_STAR:
+                    if (left_is_float || right_is_float) {
+                        fprintf(out, "lamo_make_float(%#.17g)", (double)(left_is_float ? lf : (double)li) * (right_is_float ? rf : (double)ri));
+                    } else {
+                        fprintf(out, "lamo_make_int(%lldLL)", li * ri);
+                    }
+                    return;
+                case TOKEN_SLASH:
+                    /* Don't fold if the divisor is zero — let the runtime
+                     * emit its "division by zero" error. */
+                    if ((right_is_float && rf != 0.0) || (!right_is_float && ri != 0)) {
+                        if (left_is_float || right_is_float) {
+                            fprintf(out, "lamo_make_float(%#.17g)", (left_is_float ? lf : (double)li) / (right_is_float ? rf : (double)ri));
+                        } else {
+                            fprintf(out, "lamo_make_int(%lldLL)", li / ri);
+                        }
+                        return;
+                    }
+                    break;  /* fall through to runtime call */
+                case TOKEN_PERCENT:
+                    if ((right_is_float && rf != 0.0) || (!right_is_float && ri != 0)) {
+                        if (left_is_float || right_is_float) {
+                            fprintf(out, "lamo_make_float(%#.17g)", fmod(left_is_float ? lf : (double)li, right_is_float ? rf : (double)ri));
+                        } else {
+                            fprintf(out, "lamo_make_int(%lldLL)", li % ri);
+                        }
+                        return;
+                    }
+                    break;  /* fall through to runtime call */
+                default:
+                    /* Comparison/logical operators: not folded here.
+                     * They could be, but the win is smaller and the
+                     * boolean semantics need careful handling. */
+                    break;
+            }
+        }
+    }
+
     switch (expr->operator) {
         case TOKEN_PLUS:      fprintf(out, "lamo_add("); break;
         case TOKEN_MINUS:     fprintf(out, "lamo_sub("); break;
@@ -856,6 +878,54 @@ static void generate_expression_code(ASTNode* node, FILE* out) {
             generate_expression_code(((ASTGroupingExpr*)node)->expression, out);
             fprintf(out, ")");
             break;
+        case AST_ARRAY_LITERAL: {
+            /* Sprint 3: array literal. We emit a sequence of LamoValue
+             * initializers inside a compound literal, then call
+             * lamo_array_from_values. The compound literal has its
+             * address taken, so it lives on the stack for the duration
+             * of the call. */
+            ASTArrayLiteral* arr = (ASTArrayLiteral*)node;
+            int i;
+            if (arr->element_count == 0) {
+                fprintf(out, "lamo_array_from_values((LamoValue*)0, 0)");
+            } else {
+                fprintf(out, "lamo_array_from_values((LamoValue[]){");
+                for (i = 0; i < arr->element_count; i++) {
+                    if (i > 0) fprintf(out, ", ");
+                    generate_expression_code(arr->elements[i], out);
+                }
+                fprintf(out, "}, %d)", arr->element_count);
+            }
+            break;
+        }
+        case AST_INDEX_EXPR: {
+            /* Sprint 3: array index access. We coerce the index to int
+             * (Lamo indexing is int-only for now) and call lamo_array_get. */
+            ASTIndexExpr* idx = (ASTIndexExpr*)node;
+            fprintf(out, "lamo_array_get(");
+            generate_expression_code(idx->array, out);
+            fprintf(out, ", lamo_as_int(");
+            generate_expression_code(idx->index, out);
+            fprintf(out, "))");
+            break;
+        }
+        case AST_PROP_EXPR: {
+            /* Sprint 3: property access. Currently only `.len` is
+             * supported; the semantic pass rejects other property
+             * names. We emit a direct call to lamo_array_len. */
+            ASTPropExpr* prop = (ASTPropExpr*)node;
+            if (strcmp(prop->prop_name, "len") == 0) {
+                fprintf(out, "lamo_array_len(");
+                generate_expression_code(prop->object, out);
+                fprintf(out, ")");
+            } else {
+                /* Defensive: should be unreachable if the semantic pass
+                 * is correct, but generate lamo_make_int(0) to avoid
+                 * emitting broken C. */
+                fprintf(out, "lamo_make_int(0)");
+            }
+            break;
+        }
         default:
             fprintf(out, "lamo_make_int(0)");
             break;
