@@ -1,0 +1,6 @@
+http_route("/", "Lamo HTTP server");
+http_route("/health", "ok");
+http_route("/about", "experimental builtin server");
+
+print("HTTP server on http://127.0.0.1:8080");
+http_serve(8080);
