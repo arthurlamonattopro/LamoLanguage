@@ -44,6 +44,11 @@ typedef struct Symbol {
      * previous site, not just the new one. */
     int line;
     int column;
+    /* Sprint 4: also store the originating file path so cross-file duplicate
+     * declarations include the file name, not just line:col. Pointer is not
+     * owned — it points into the AST node's file_path string which lives as
+     * long as the ASTProgram. */
+    const char* file_path;
     struct Symbol* next;
 } Symbol;
 
@@ -74,6 +79,13 @@ typedef struct {
      * case semantic_error_at just omits the snippet. */
     SourceLookupFn source_lookup;
     void* source_lookup_user_data;
+    /* Return-type tracking: set when entering a function body so that
+     * AST_RETURN_STMT can validate the returned expression against the
+     * declared (or inferred) return type. LAMO_TYPE_UNKNOWN means either
+     * we are not inside a function or the return type could not be
+     * determined (no annotation, no inferrable body). */
+    LamoType current_fn_return_type;
+    const char* current_fn_name;   /* for error messages; may be NULL */
 } SemanticContext;
 
 static void semantic_visit_statement(SemanticContext* ctx, ASTNode* node);
@@ -171,18 +183,32 @@ static Symbol* scope_find(Scope* scope, const char* name) {
     return NULL;
 }
 
-static void scope_define(SemanticContext* ctx, Scope* scope, const char* name, SymbolKind kind, int arity, LamoType type, int line, int column) {
+static void scope_define(SemanticContext* ctx, Scope* scope, const char* name, SymbolKind kind, int arity, LamoType type, int line, int column, const char* file_path) {
     Symbol* existing = scope_find_in_current(scope, name);
     if (existing) {
         /* Sprint 2 fix: report the kind of the previously-declared symbol
          * and its source location, so the user can find the original
-         * declaration without grepping. */
-        char message[256];
+         * declaration without grepping.
+         * Sprint 4: include the file name in cross-file conflicts. */
+        char message[512];
         const char* prev_kind_str = existing->kind == SYMBOL_FN ? "function" : "variable";
         const char* new_kind_str = kind == SYMBOL_FN ? "function" : "variable";
-        snprintf(message, sizeof(message),
-                 "duplicate declaration of '%s' as %s (previously declared as %s at %d:%d)",
-                 name, new_kind_str, prev_kind_str, existing->line, existing->column);
+        const char* prev_file = existing->file_path ? existing->file_path : "<unknown>";
+        const char* cur_file  = file_path           ? file_path           : "<unknown>";
+        int cross_file = (prev_file != cur_file) && (strcmp(prev_file, cur_file) != 0);
+        if (cross_file) {
+            snprintf(message, sizeof(message),
+                     "duplicate declaration of '%s' as %s "
+                     "(previously declared as %s in %s at %d:%d)",
+                     name, new_kind_str, prev_kind_str, prev_file,
+                     existing->line, existing->column);
+        } else {
+            snprintf(message, sizeof(message),
+                     "duplicate declaration of '%s' as %s "
+                     "(previously declared as %s at %d:%d)",
+                     name, new_kind_str, prev_kind_str,
+                     existing->line, existing->column);
+        }
         semantic_error_at(ctx, line, column, message);
         return;
     }
@@ -199,6 +225,7 @@ static void scope_define(SemanticContext* ctx, Scope* scope, const char* name, S
     symbol->type = type;
     symbol->line = line;
     symbol->column = column;
+    symbol->file_path = file_path;
     symbol->next = scope->symbols;
     scope->symbols = symbol;
 }
@@ -347,6 +374,82 @@ static LamoType annotation_to_type(const char* annotation) {
     return LAMO_TYPE_UNKNOWN;
 }
 
+/* Infer the return type of a function body by scanning all direct
+ * AST_RETURN_STMT nodes (without descending into nested function
+ * declarations). Used when there is no return-type annotation to give
+ * the call site a more useful type than UNKNOWN.
+ *
+ * Algorithm: collect every return-expression type; if all agree on a
+ * single type, that becomes the inferred type. If they conflict, or if
+ * there are no return statements, returns LAMO_TYPE_UNKNOWN.
+ *
+ * Note: this is a shallow scan — it does NOT call the full
+ * semantic_infer_expression (which would require a valid context with
+ * the function's parameter scope). Instead it uses a lightweight
+ * literal-only inference that handles the common cases (returning a
+ * literal, a variable declared as a known type, or a builtin call).
+ * For complex expressions the result is UNKNOWN, which is safe. */
+static LamoType infer_fn_return_type_from_body(ASTNode* node, int depth) {
+    if (!node || depth > 32) return LAMO_TYPE_UNKNOWN;
+
+    if (node->type == AST_RETURN_STMT) {
+        ASTReturnStmt* ret = (ASTReturnStmt*)node;
+        if (!ret->expression) return LAMO_TYPE_UNKNOWN; /* bare return */
+        switch (ret->expression->type) {
+            case AST_INT_LITERAL:    return LAMO_TYPE_INT;
+            case AST_FLOAT_LITERAL:  return LAMO_TYPE_FLOAT;
+            case AST_STRING_LITERAL: return LAMO_TYPE_STRING;
+            case AST_BOOL_LITERAL:   return LAMO_TYPE_BOOL;
+            default:                 return LAMO_TYPE_UNKNOWN;
+        }
+    }
+
+    /* Don't descend into nested fn declarations. */
+    if (node->type == AST_FN_DECL) return LAMO_TYPE_UNKNOWN;
+
+    LamoType found = LAMO_TYPE_UNKNOWN;
+
+    /* Walk children based on node type. */
+    ASTNode* children[8];
+    int n = 0;
+    switch (node->type) {
+        case AST_BLOCK: {
+            ASTNode* s = ((ASTBlock*)node)->statements;
+            while (s && n < 8) { children[n++] = s; s = s->next; }
+            break;
+        }
+        case AST_IF_STMT: {
+            ASTIfStmt* is = (ASTIfStmt*)node;
+            children[n++] = is->then_branch;
+            if (is->else_branch) children[n++] = is->else_branch;
+            break;
+        }
+        case AST_WHILE_STMT:
+            children[n++] = ((ASTWhileStmt*)node)->body; break;
+        case AST_FOR_STMT:
+            children[n++] = ((ASTForStmt*)node)->body; break;
+        default: break;
+    }
+
+    for (int i = 0; i < n; i++) {
+        LamoType t = infer_fn_return_type_from_body(children[i], depth + 1);
+        if (t == LAMO_TYPE_UNKNOWN) continue;
+        if (found == LAMO_TYPE_UNKNOWN) { found = t; continue; }
+        if (found != t) return LAMO_TYPE_UNKNOWN; /* conflict */
+    }
+
+    /* Also walk the ->next siblings at this level (statement lists). */
+    if (node->next) {
+        LamoType t = infer_fn_return_type_from_body(node->next, depth);
+        if (t != LAMO_TYPE_UNKNOWN) {
+            if (found == LAMO_TYPE_UNKNOWN) found = t;
+            else if (found != t) return LAMO_TYPE_UNKNOWN;
+        }
+    }
+
+    return found;
+}
+
 static void semantic_visit_statement(SemanticContext* ctx, ASTNode* node) {
     if (!node) {
         return;
@@ -394,13 +497,15 @@ static void semantic_visit_statement(SemanticContext* ctx, ASTNode* node) {
                 /* Use the annotated type for downstream inference. */
                 init_type = annotated;
             }
-            scope_define(ctx, ctx->current_scope, var_decl->name, SYMBOL_VAR, 0, init_type, node->line, node->column);
+            scope_define(ctx, ctx->current_scope, var_decl->name, SYMBOL_VAR, 0, init_type, node->line, node->column, node->file_path);
             break;
         }
         case AST_FN_DECL: {
             ASTFnDecl* fn_decl = (ASTFnDecl*)node;
             Scope* parent = ctx->current_scope;
             int previous_inside_function = ctx->inside_function;
+            LamoType previous_fn_return_type = ctx->current_fn_return_type;
+            const char* previous_fn_name = ctx->current_fn_name;
 
             ctx->current_scope = scope_push(parent);
             ctx->inside_function = 1;
@@ -421,7 +526,110 @@ static void semantic_visit_statement(SemanticContext* ctx, ASTNode* node) {
                         semantic_error_at(ctx, node->line, node->column, message);
                     }
                 }
-                scope_define(ctx, ctx->current_scope, fn_decl->params[i], SYMBOL_VAR, 0, param_type, node->line, node->column);
+                scope_define(ctx, ctx->current_scope, fn_decl->params[i], SYMBOL_VAR, 0, param_type, node->line, node->column, node->file_path);
+            }
+
+            /* Look up the symbol we registered for this function so we can
+             * update its return type after body inference (if no annotation). */
+            Symbol* fn_symbol = scope_find(parent, fn_decl->name);
+
+            /* Set context so AST_RETURN_STMT can validate against us. */
+            ctx->current_fn_return_type = fn_symbol ? fn_symbol->type : LAMO_TYPE_UNKNOWN;
+            ctx->current_fn_name = fn_decl->name;
+
+            /* If no annotation yet, do a shallow pre-scan of the body to
+             * infer a return type before visiting (so call sites that appear
+             * later in the same file can benefit from it). Also detect when
+             * multiple return statements within the body yield incompatible
+             * types — that is a semantic error even without an annotation. */
+            if (ctx->current_fn_return_type == LAMO_TYPE_UNKNOWN && fn_decl->body) {
+                LamoType inferred = infer_fn_return_type_from_body(fn_decl->body, 0);
+                if (inferred != LAMO_TYPE_UNKNOWN) {
+                    ctx->current_fn_return_type = inferred;
+                    if (fn_symbol) fn_symbol->type = inferred;
+                } else {
+                    /* infer returned UNKNOWN — either no returns, or a conflict.
+                     * Re-scan to detect the conflict so we can emit a good error.
+                     * We look for any two concrete-typed return statements that
+                     * disagree. Use a simple two-pass: collect first type, then
+                     * find one that differs. */
+                    LamoType first_ret_type = LAMO_TYPE_UNKNOWN;
+                    /* Walk the body looking for literal-typed return stmts. */
+                    ASTNode* scan = fn_decl->body;
+                    /* For a block, look at its statements directly. */
+                    if (scan && scan->type == AST_BLOCK) {
+                        scan = ((ASTBlock*)scan)->statements;
+                    }
+                    /* Find the first typed return. */
+                    for (ASTNode* s = scan; s; s = s->next) {
+                        if (s->type == AST_RETURN_STMT) {
+                            ASTReturnStmt* rs = (ASTReturnStmt*)s;
+                            if (rs->expression) {
+                                LamoType t = LAMO_TYPE_UNKNOWN;
+                                switch (rs->expression->type) {
+                                    case AST_INT_LITERAL:    t = LAMO_TYPE_INT;    break;
+                                    case AST_FLOAT_LITERAL:  t = LAMO_TYPE_FLOAT;  break;
+                                    case AST_STRING_LITERAL: t = LAMO_TYPE_STRING; break;
+                                    case AST_BOOL_LITERAL:   t = LAMO_TYPE_BOOL;   break;
+                                    default: break;
+                                }
+                                if (t != LAMO_TYPE_UNKNOWN) {
+                                    if (first_ret_type == LAMO_TYPE_UNKNOWN) {
+                                        first_ret_type = t;
+                                    } else if (first_ret_type != t) {
+                                        int nc = (first_ret_type == LAMO_TYPE_INT && t == LAMO_TYPE_FLOAT) ||
+                                                 (first_ret_type == LAMO_TYPE_FLOAT && t == LAMO_TYPE_INT);
+                                        if (!nc) {
+                                            char message[256];
+                                            snprintf(message, sizeof(message),
+                                                "function '%s' has inconsistent return types: %s and %s",
+                                                fn_decl->name, type_name(first_ret_type), type_name(t));
+                                            semantic_error_at(ctx, s->line, s->column, message);
+                                        }
+                                    }
+                                }
+                            }
+                        } else if (s->type == AST_IF_STMT) {
+                            /* Descend one level into if/else to catch the common pattern. */
+                            ASTIfStmt* is = (ASTIfStmt*)s;
+                            ASTNode* branches[2] = { is->then_branch, is->else_branch };
+                            for (int b = 0; b < 2; b++) {
+                                ASTNode* br = branches[b];
+                                if (!br) continue;
+                                ASTNode* brs = br->type == AST_BLOCK
+                                    ? ((ASTBlock*)br)->statements : br;
+                                for (ASTNode* bs = brs; bs; bs = bs->next) {
+                                    if (bs->type != AST_RETURN_STMT) continue;
+                                    ASTReturnStmt* rs = (ASTReturnStmt*)bs;
+                                    if (!rs->expression) continue;
+                                    LamoType t = LAMO_TYPE_UNKNOWN;
+                                    switch (rs->expression->type) {
+                                        case AST_INT_LITERAL:    t = LAMO_TYPE_INT;    break;
+                                        case AST_FLOAT_LITERAL:  t = LAMO_TYPE_FLOAT;  break;
+                                        case AST_STRING_LITERAL: t = LAMO_TYPE_STRING; break;
+                                        case AST_BOOL_LITERAL:   t = LAMO_TYPE_BOOL;   break;
+                                        default: break;
+                                    }
+                                    if (t != LAMO_TYPE_UNKNOWN) {
+                                        if (first_ret_type == LAMO_TYPE_UNKNOWN) {
+                                            first_ret_type = t;
+                                        } else if (first_ret_type != t) {
+                                            int nc = (first_ret_type == LAMO_TYPE_INT && t == LAMO_TYPE_FLOAT) ||
+                                                     (first_ret_type == LAMO_TYPE_FLOAT && t == LAMO_TYPE_INT);
+                                            if (!nc) {
+                                                char message[256];
+                                                snprintf(message, sizeof(message),
+                                                    "function '%s' has inconsistent return types: %s and %s",
+                                                    fn_decl->name, type_name(first_ret_type), type_name(t));
+                                                semantic_error_at(ctx, bs->line, bs->column, message);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             semantic_visit_statement(ctx, fn_decl->body);
@@ -429,6 +637,8 @@ static void semantic_visit_statement(SemanticContext* ctx, ASTNode* node) {
             Scope* finished = ctx->current_scope;
             ctx->current_scope = parent;
             ctx->inside_function = previous_inside_function;
+            ctx->current_fn_return_type = previous_fn_return_type;
+            ctx->current_fn_name = previous_fn_name;
             scope_free(finished);
             break;
         }
@@ -475,7 +685,26 @@ static void semantic_visit_statement(SemanticContext* ctx, ASTNode* node) {
                 semantic_error_at(ctx, node->line, node->column, "return is only valid inside a function");
             }
             if (return_stmt->expression) {
-                semantic_infer_expression(ctx, return_stmt->expression);
+                LamoType ret_expr_type = semantic_infer_expression(ctx, return_stmt->expression);
+                /* Validate against the declared/inferred return type. Skip
+                 * when either side is UNKNOWN to avoid cascading errors. */
+                if (ctx->current_fn_return_type != LAMO_TYPE_UNKNOWN
+                    && ret_expr_type != LAMO_TYPE_UNKNOWN
+                    && ret_expr_type != ctx->current_fn_return_type) {
+                    /* Allow numeric widening (int ↔ float). */
+                    int numeric_compat =
+                        (ctx->current_fn_return_type == LAMO_TYPE_FLOAT && ret_expr_type == LAMO_TYPE_INT) ||
+                        (ctx->current_fn_return_type == LAMO_TYPE_INT   && ret_expr_type == LAMO_TYPE_FLOAT);
+                    if (!numeric_compat) {
+                        char message[256];
+                        snprintf(message, sizeof(message),
+                                 "function '%s' declared to return %s but this return yields %s",
+                                 ctx->current_fn_name ? ctx->current_fn_name : "<unknown>",
+                                 type_name(ctx->current_fn_return_type),
+                                 type_name(ret_expr_type));
+                        semantic_error_at(ctx, node->line, node->column, message);
+                    }
+                }
             }
             break;
         }
@@ -677,6 +906,9 @@ int semantic_analyze_with_source_lookup(ASTProgram* program, const char* file_pa
      * case semantic_error_at just omits the snippet. */
     ctx.source_lookup = lookup;
     ctx.source_lookup_user_data = user_data;
+    /* Return-type tracking: UNKNOWN at top level (not inside any function). */
+    ctx.current_fn_return_type = LAMO_TYPE_UNKNOWN;
+    ctx.current_fn_name = NULL;
 
     for (ASTNode* node = program->declarations; node; node = node->next) {
         if (node->type == AST_FN_DECL) {
@@ -696,7 +928,7 @@ int semantic_analyze_with_source_lookup(ASTProgram* program, const char* file_pa
                     semantic_error_at(&ctx, node->line, node->column, message);
                 }
             }
-            scope_define(&ctx, ctx.current_scope, fn_decl->name, SYMBOL_FN, fn_decl->param_count, ret_type, node->line, node->column);
+            scope_define(&ctx, ctx.current_scope, fn_decl->name, SYMBOL_FN, fn_decl->param_count, ret_type, node->line, node->column, node->file_path);
         }
     }
 

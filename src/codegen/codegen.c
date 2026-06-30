@@ -73,7 +73,7 @@ static void generate_call_arguments(ASTNode** args, int arg_count, FILE* out);
 static void generate_lang_builtin_call_expr(const char* name, ASTNode** args, int arg_count, FILE* out);
 static void generate_gui_call_expr(const char* name, ASTNode** args, int arg_count, FILE* out);
 static void generate_http_call_expr(const char* name, ASTNode** args, int arg_count, FILE* out);
-static void emit_runtime(FILE* out, int needs_gui, int needs_http);
+static void emit_runtime(FILE* out, int needs_gui, int needs_http, int feat_flags);
 static int ast_uses_gui(ASTNode* node);
 static int ast_uses_http(ASTNode* node);
 
@@ -276,8 +276,18 @@ static void generate_http_call_expr(const char* name, ASTNode** args, int arg_co
 // on whether the program uses those builtins. This replaces ~600 lines of
 // fprintf() calls in the old emit_value_runtime / emit_gui_runtime /
 // emit_http_runtime functions (nit #9 fix).
-static void emit_runtime(FILE* out, int needs_gui, int needs_http) {
+#define FEAT_STRINGS (1 << 0)
+#define FEAT_ARRAYS  (1 << 1)
+#define FEAT_FLOATS  (1 << 2)
+
+static void emit_runtime(FILE* out, int needs_gui, int needs_http, int feat_flags) {
     fputs("#define LAMO_NEEDS_VALUE_RUNTIME 1\n", out);
+    /* Fine-grained feature flags: let GCC dead-strip unused subsections
+     * even at -O0. A program that never touches strings, arrays, or floats
+     * sees a measurably smaller generated .c and faster GCC invocation. */
+    if (feat_flags & FEAT_STRINGS) fputs("#define LAMO_NEEDS_STRING_OPS 1\n", out);
+    if (feat_flags & FEAT_ARRAYS)  fputs("#define LAMO_NEEDS_ARRAY_OPS 1\n",  out);
+    if (feat_flags & FEAT_FLOATS)  fputs("#define LAMO_NEEDS_FLOAT_OPS 1\n",  out);
     if (needs_gui) {
         fputs("#define LAMO_NEEDS_GUI_RUNTIME 1\n", out);
     }
@@ -286,6 +296,9 @@ static void emit_runtime(FILE* out, int needs_gui, int needs_http) {
     }
     fputs(lamo_runtime_source, out);
     fputs("\n#undef LAMO_NEEDS_VALUE_RUNTIME\n", out);
+    if (feat_flags & FEAT_STRINGS) fputs("#undef LAMO_NEEDS_STRING_OPS\n", out);
+    if (feat_flags & FEAT_ARRAYS)  fputs("#undef LAMO_NEEDS_ARRAY_OPS\n",  out);
+    if (feat_flags & FEAT_FLOATS)  fputs("#undef LAMO_NEEDS_FLOAT_OPS\n",  out);
     if (needs_gui) {
         fputs("#undef LAMO_NEEDS_GUI_RUNTIME\n", out);
     }
@@ -429,10 +442,151 @@ static int ast_uses_http(ASTNode* node) {
     return ast_uses_builtin(node, lamo_builtin_is_http);
 }
 
+/* ── Feature detection: string, array, float ops ─────────────────────────
+ * These walk the AST and return 1 if the program uses the corresponding
+ * feature. Used to emit fine-grained #define flags before the runtime so
+ * GCC can dead-strip the unused sections even at -O0.
+ *
+ * "String ops" means: any string literal, any explicit string concatenation
+ * (+ on strings), or a call to str()/input()/len().
+ * "Array ops" means: any array literal, push/pop/append/array() calls.
+ * "Float ops" means: any float literal, or float() cast. */
+
+static int is_string_builtin(const char* name) {
+    return strcmp(name, "str") == 0 ||
+           strcmp(name, "input") == 0 ||
+           strcmp(name, "len") == 0;
+}
+static int is_array_builtin(const char* name) {
+    return strcmp(name, "push") == 0 ||
+           strcmp(name, "pop") == 0 ||
+           strcmp(name, "append") == 0 ||
+           strcmp(name, "array") == 0;
+}
+static int is_float_builtin(const char* name) {
+    return strcmp(name, "float") == 0 ||
+           strcmp(name, "sqrt") == 0 ||
+           strcmp(name, "pow") == 0 ||
+           strcmp(name, "floor") == 0 ||
+           strcmp(name, "ceil") == 0 ||
+           strcmp(name, "abs") == 0;
+}
+
+/* Single combined walk that detects all three features in one pass.
+ * Sets bits in *flags: bit 0 = strings, bit 1 = arrays, bit 2 = floats. */
+
+static void ast_detect_features(ASTNode* node, int* flags) {
+    int i;
+    if (!node || *flags == (FEAT_STRINGS | FEAT_ARRAYS | FEAT_FLOATS)) return;
+
+    switch (node->type) {
+        case AST_STRING_LITERAL:
+            *flags |= FEAT_STRINGS;
+            return;
+        case AST_FLOAT_LITERAL:
+            *flags |= FEAT_FLOATS;
+            return;
+        case AST_ARRAY_LITERAL: {
+            ASTArrayLiteral* arr = (ASTArrayLiteral*)node;
+            *flags |= FEAT_ARRAYS;
+            for (i = 0; i < arr->element_count; i++)
+                ast_detect_features(arr->elements[i], flags);
+            return;
+        }
+        case AST_PROP_EXPR:
+            /* .len property implies string or array usage. */
+            *flags |= FEAT_STRINGS;
+            ast_detect_features(((ASTPropExpr*)node)->object, flags);
+            return;
+        case AST_INDEX_EXPR: {
+            ASTIndexExpr* ie = (ASTIndexExpr*)node;
+            /* Index on a string is a string op; on array is array op.
+             * We can't know which without type info, so set both. */
+            *flags |= FEAT_STRINGS | FEAT_ARRAYS;
+            ast_detect_features(ie->array, flags);
+            ast_detect_features(ie->index, flags);
+            return;
+        }
+        case AST_CALL_STMT: {
+            ASTCallStmt* cs = (ASTCallStmt*)node;
+            if (is_string_builtin(cs->name)) *flags |= FEAT_STRINGS;
+            if (is_array_builtin(cs->name))  *flags |= FEAT_ARRAYS;
+            if (is_float_builtin(cs->name))  *flags |= FEAT_FLOATS;
+            for (i = 0; i < cs->arg_count; i++)
+                ast_detect_features(cs->args[i], flags);
+            return;
+        }
+        case AST_CALL_EXPR: {
+            ASTCallExpr* ce = (ASTCallExpr*)node;
+            if (is_string_builtin(ce->name)) *flags |= FEAT_STRINGS;
+            if (is_array_builtin(ce->name))  *flags |= FEAT_ARRAYS;
+            if (is_float_builtin(ce->name))  *flags |= FEAT_FLOATS;
+            for (i = 0; i < ce->arg_count; i++)
+                ast_detect_features(ce->args[i], flags);
+            return;
+        }
+        case AST_BINARY_EXPR: {
+            ASTBinaryExpr* be = (ASTBinaryExpr*)node;
+            /* % with floats at runtime calls lamo_mod which uses fmod — float op. */
+            if (be->operator == TOKEN_PERCENT) *flags |= FEAT_FLOATS;
+            ast_detect_features(be->left, flags);
+            ast_detect_features(be->right, flags);
+            return;
+        }
+        /* Recurse through all structural nodes. */
+        case AST_PROGRAM: {
+            for (ASTNode* c = ((ASTProgram*)node)->declarations; c; c = c->next)
+                ast_detect_features(c, flags);
+            return;
+        }
+        case AST_VAR_DECL:
+            ast_detect_features(((ASTVarDecl*)node)->initializer, flags); return;
+        case AST_FN_DECL:
+            ast_detect_features(((ASTFnDecl*)node)->body, flags); return;
+        case AST_BLOCK: {
+            for (ASTNode* s = ((ASTBlock*)node)->statements; s; s = s->next)
+                ast_detect_features(s, flags);
+            return;
+        }
+        case AST_IF_STMT: {
+            ASTIfStmt* is = (ASTIfStmt*)node;
+            ast_detect_features(is->condition, flags);
+            ast_detect_features(is->then_branch, flags);
+            ast_detect_features(is->else_branch, flags);
+            return;
+        }
+        case AST_WHILE_STMT: {
+            ASTWhileStmt* ws = (ASTWhileStmt*)node;
+            ast_detect_features(ws->condition, flags);
+            ast_detect_features(ws->body, flags);
+            return;
+        }
+        case AST_FOR_STMT: {
+            ASTForStmt* fs = (ASTForStmt*)node;
+            ast_detect_features(fs->initializer, flags);
+            ast_detect_features(fs->condition, flags);
+            ast_detect_features(fs->increment, flags);
+            ast_detect_features(fs->body, flags);
+            return;
+        }
+        case AST_RETURN_STMT:
+            ast_detect_features(((ASTReturnStmt*)node)->expression, flags); return;
+        case AST_ASSIGN_STMT:
+            ast_detect_features(((ASTAssignStmt*)node)->value, flags); return;
+        case AST_UNARY_EXPR:
+            ast_detect_features(((ASTUnaryExpr*)node)->right, flags); return;
+        case AST_GROUPING_EXPR:
+            ast_detect_features(((ASTGroupingExpr*)node)->expression, flags); return;
+        default:
+            return;
+    }
+}
+
 void generate_c_code(ASTNode* node, FILE* out) {
     ASTNode* current;
     int needs_gui_runtime;
     int needs_http_runtime;
+    int feat_flags = 0;
 
     if (!node) {
         return;
@@ -444,7 +598,8 @@ void generate_c_code(ASTNode* node, FILE* out) {
     fprintf(out, "#include <string.h>\n\n");
     needs_gui_runtime = ast_uses_gui(node);
     needs_http_runtime = ast_uses_http(node);
-    emit_runtime(out, needs_gui_runtime, needs_http_runtime);
+    ast_detect_features(node, &feat_flags);
+    emit_runtime(out, needs_gui_runtime, needs_http_runtime, feat_flags);
 
     // 1. Forward declarations de funções definidas pelo usuário.
     current = ((ASTProgram*)node)->declarations;

@@ -31,6 +31,7 @@
 #include "ast.h"
 #include "semantic.h"
 #include "builtins.h"
+#include "eval/eval.h"
 
 #define VERSION "2.0"
 
@@ -43,7 +44,8 @@ enum {
 typedef enum {
     COMMAND_RUN,
     COMMAND_BUILD,
-    COMMAND_CHECK
+    COMMAND_CHECK,
+    COMMAND_EVAL
 } LamoCommand;
 
 typedef enum {
@@ -71,10 +73,15 @@ static int run_argv(char* const argv[]);
 static int compile_sources(const char** input_files, int input_file_count, LamoCommand command, const char* output_path);
 static const char* executable_suffix(void);
 static int load_program_recursive(CompilationState* state, ASTProgram* aggregate_program, const char* path);
+static int load_program_recursive_from(CompilationState* state, ASTProgram* aggregate_program,
+                                        const char* path, const char* imported_from,
+                                        int import_line, int import_column);
 static int ensure_load_stack_capacity(CompilationState* state, int required_depth);
 static int push_loading_file(CompilationState* state, int file_index);
 static void pop_loading_file(CompilationState* state);
 static void report_import_cycle(const CompilationState* state, int repeated_index);
+static void report_import_cycle_at(const CompilationState* state, int repeated_index,
+                                    const char* importing_file, int line, int column);
 void generate_c_code(ASTNode* node, FILE* out);
 
 static char* duplicate_string(const char* value) {
@@ -200,6 +207,34 @@ static void report_import_cycle(const CompilationState* state, int repeated_inde
     }
 
     fprintf(stderr, "import cycle detected: ");
+    for (i = cycle_start; i < state->load_depth; i++) {
+        fprintf(stderr, "%s -> ", state->file_paths[state->load_stack[i]]);
+    }
+    fprintf(stderr, "%s\n", state->file_paths[repeated_index]);
+}
+
+/* Like report_import_cycle but prefixes the message with the file:line:col
+ * of the import statement that closed the cycle, matching the format used
+ * by parser and semantic errors so the user can jump to it directly. */
+static void report_import_cycle_at(const CompilationState* state, int repeated_index,
+                                    const char* importing_file, int line, int column) {
+    int cycle_start = -1;
+    int i;
+
+    for (i = 0; i < state->load_depth; i++) {
+        if (state->load_stack[i] == repeated_index) {
+            cycle_start = i;
+            break;
+        }
+    }
+
+    fprintf(stderr, "%s:%d:%d: import cycle: ", importing_file, line, column);
+
+    if (cycle_start < 0) {
+        fprintf(stderr, "%s already imported\n", state->file_paths[repeated_index]);
+        return;
+    }
+
     for (i = cycle_start; i < state->load_depth; i++) {
         fprintf(stderr, "%s -> ", state->file_paths[state->load_stack[i]]);
     }
@@ -387,7 +422,10 @@ static int load_imports_from_ast(CompilationState* state, ASTProgram* aggregate_
                         importing_file, current->line, current->column, imp->path);
                 return 0;
             }
-            if (!load_program_recursive(state, aggregate_program, resolved)) {
+            /* Pass the import site coordinates so cycle errors can point
+             * to the exact import statement that closed the cycle. */
+            if (!load_program_recursive_from(state, aggregate_program, resolved,
+                                              importing_file, current->line, current->column)) {
                 free(resolved);
                 return 0;
             }
@@ -403,6 +441,7 @@ static void print_usage(const char* prog) {
     printf("  %s run <file.lamo> [more-files.lamo ...] [-o output]\n", prog);
     printf("  %s build <file.lamo> [more-files.lamo ...] [-o output]\n", prog);
     printf("  %s check <file.lamo> [more-files.lamo ...]\n", prog);
+    printf("  %s eval <file.lamo>   (interpret without compiling — instant feedback)\n", prog);
     printf("  %s help\n", prog);
     printf("  %s version\n", prog);
 }
@@ -463,6 +502,9 @@ int main(int argc, char** argv) {
         arg_index = 2;
     } else if (strcmp(argv[1], "check") == 0) {
         command = COMMAND_CHECK;
+        arg_index = 2;
+    } else if (strcmp(argv[1], "eval") == 0) {
+        command = COMMAND_EVAL;
         arg_index = 2;
     }
 
@@ -578,6 +620,89 @@ static int load_program_recursive(CompilationState* state, ASTProgram* aggregate
     }
 
     // Carrega dependências antes de mesclar — preserva ordem de imports.
+    if (!load_imports_from_ast(state, aggregate_program, parsed_program->declarations, normalized_path)) {
+        ast_free((ASTNode*)parsed_program);
+        goto cleanup;
+    }
+
+    ast_program_append(aggregate_program, parsed_program);
+    state->load_states[slot] = FILE_LOADED;
+    success = 1;
+
+cleanup:
+    pop_loading_file(state);
+    if (!success && slot >= 0) {
+        state->load_states[slot] = FILE_NOT_LOADED;
+    }
+    return success;
+}
+
+/* Variant called when loading an import that originated from a specific AST
+ * node — carries the import site location so cycle errors point at the
+ * exact `import "..."` statement that closed the cycle. */
+static int load_program_recursive_from(CompilationState* state, ASTProgram* aggregate_program,
+                                        const char* path, const char* imported_from,
+                                        int import_line, int import_column) {
+    char* normalized_path = normalize_path(path);
+    char* raw_source;
+    ASTProgram* parsed_program;
+    int slot;
+    int existing_index;
+    int success = 0;
+
+    if (!normalized_path) {
+        fprintf(stderr, "%s:%d:%d: failed to resolve import: %s\n",
+                imported_from, import_line, import_column, strerror(errno));
+        return 0;
+    }
+
+    existing_index = find_loaded_file(state, normalized_path);
+    if (existing_index >= 0) {
+        if (state->load_states[existing_index] == FILE_LOADING) {
+            report_import_cycle_at(state, existing_index,
+                                   imported_from, import_line, import_column);
+            free(normalized_path);
+            return 0;
+        }
+        free(normalized_path);
+        return 1;
+    }
+
+    slot = reserve_file_slot(state, normalized_path);
+    if (slot < 0) {
+        fprintf(stderr, "failed to allocate compiler state for imported files\n");
+        free(normalized_path);
+        return 0;
+    }
+
+    state->load_states[slot] = FILE_LOADING;
+    if (!push_loading_file(state, slot)) {
+        fprintf(stderr, "failed to track import stack for %s\n", normalized_path);
+        state->load_states[slot] = FILE_NOT_LOADED;
+        return 0;
+    }
+
+    raw_source = read_file(normalized_path);
+    if (!raw_source) {
+        fprintf(stderr, "%s:%d:%d: cannot open imported file \"%s\": %s\n",
+                imported_from, import_line, import_column, path, strerror(errno));
+        goto cleanup;
+    }
+
+    state->sources[slot] = raw_source;
+    state->lexers[slot] = lexer_init(raw_source);
+    state->parsers[slot] = parser_init_with_file(state->lexers[slot], normalized_path);
+    parsed_program = parse_program_v2(state->parsers[slot]);
+
+    if (parser_had_error(state->parsers[slot])) {
+        fprintf(stderr, "%s: %d syntax error(s)\n",
+                normalized_path,
+                parser_error_count(state->parsers[slot]));
+        load_imports_from_ast(state, aggregate_program, parsed_program->declarations, normalized_path);
+        ast_free((ASTNode*)parsed_program);
+        goto cleanup;
+    }
+
     if (!load_imports_from_ast(state, aggregate_program, parsed_program->declarations, normalized_path)) {
         ast_free((ASTNode*)parsed_program);
         goto cleanup;
@@ -754,6 +879,14 @@ static int compile_sources(const char** input_files, int input_file_count, LamoC
         } else {
             printf("check passed: %d file(s)\n", input_file_count);
         }
+        goto cleanup;
+    }
+
+    if (command == COMMAND_EVAL) {
+        EvalEnv* env = eval_env_new(NULL);
+        int ok = eval_program(program_ast, env);
+        eval_env_free(env);
+        if (!ok) exit_code = EXIT_BACKEND_ERROR;
         goto cleanup;
     }
 

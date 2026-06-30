@@ -134,6 +134,18 @@ static void eat_p(Parser* p, LamoTokenType type) {
     }
 }
 
+/* expect_p: like eat_p but emits a human-readable message instead of the
+ * raw token type name. Use this at call sites where the context makes the
+ * error unambiguous (e.g. "missing ';' after statement" is clearer than
+ * "expected TOKEN_SEMICOLON, got TOKEN_IDENTIFIER"). */
+static void expect_p(Parser* p, LamoTokenType type, const char* human_msg) {
+    if (p->current.type == type) {
+        advance_p(p);
+    } else {
+        parser_error(p, human_msg);
+    }
+}
+
 ASTNode* parse_expression(Parser* p);
 static ASTNode* parse_primary(Parser* p);
 
@@ -418,7 +430,7 @@ ASTNode* parse_statement(Parser* p);
 static ASTNode* parse_block(Parser* p) {
     int line = p->current.line;
     int column = p->current.column;
-    eat_p(p, TOKEN_LBRACE);
+    expect_p(p, TOKEN_LBRACE, "expected '{' to open block");
     ASTNode* head = NULL;
     ASTNode* current = NULL;
     while (p->current.type != TOKEN_RBRACE && p->current.type != TOKEN_EOF) {
@@ -437,7 +449,7 @@ static ASTNode* parse_block(Parser* p) {
             parser_synchronize(p);
         }
     }
-    eat_p(p, TOKEN_RBRACE);
+    expect_p(p, TOKEN_RBRACE, "missing '}' — block not closed");
     return (ASTNode*)ast_new_block(head, line, column);
 }
 
@@ -479,7 +491,7 @@ ASTNode* parse_statement(Parser* p) {
             return parser_recover(p);
         }
         ASTNode* initializer = parse_expression(p);
-        eat_p(p, TOKEN_SEMICOLON);
+        expect_p(p, TOKEN_SEMICOLON, "missing ';' after let declaration");
         ASTNode* node = (ASTNode*)ast_new_var_decl_typed(name, initializer, type_annotation, line, column);
         free(name);
         free(type_annotation);
@@ -495,7 +507,7 @@ ASTNode* parse_statement(Parser* p) {
         int line = p->current.line;
         int column = p->current.column;
         eat_p(p, TOKEN_IDENTIFIER);
-        eat_p(p, TOKEN_LPAREN);
+        expect_p(p, TOKEN_LPAREN, "expected '(' after function name");
 
         char** params = NULL;
         char** param_types = NULL;  /* Sprint 3: per-param type annotations */
@@ -581,9 +593,7 @@ ASTNode* parse_statement(Parser* p) {
             param_count++;
             if (p->current.type == TOKEN_COMMA) advance_p(p);
         }
-        eat_p(p, TOKEN_RPAREN);
-
-        /* Sprint 3: optional `-> type` return-type annotation. */
+        expect_p(p, TOKEN_RPAREN, "missing ')' — did you forget to close the parameter list?");
         char* return_type_annotation = NULL;
         if (p->current.type == TOKEN_ARROW) {
             eat_p(p, TOKEN_ARROW);
@@ -613,7 +623,7 @@ ASTNode* parse_statement(Parser* p) {
         }
         char* path = strdup(p->current.value);
         eat_p(p, TOKEN_STRING);
-        eat_p(p, TOKEN_SEMICOLON);
+        expect_p(p, TOKEN_SEMICOLON, "missing ';' after import statement");
         ASTNode* node = (ASTNode*)ast_new_import_decl(path, line, column);
         free(path);
         return node;
@@ -644,8 +654,8 @@ ASTNode* parse_statement(Parser* p) {
                 }
                 if (p->current.type == TOKEN_COMMA) advance_p(p);
             }
-            eat_p(p, TOKEN_RPAREN);
-            eat_p(p, TOKEN_SEMICOLON);
+            expect_p(p, TOKEN_RPAREN, "missing ')' — did you forget to close the argument list?");
+            expect_p(p, TOKEN_SEMICOLON, "missing ';' after function call");
             ASTNode* node = (ASTNode*)ast_new_call_stmt(name, args, arg_count, line, column);
             free(name);
             return node;
@@ -655,13 +665,13 @@ ASTNode* parse_statement(Parser* p) {
             LamoTokenType op_type = p->current.type;
             advance_p(p);
             ASTNode* value = parse_expression(p);
-            eat_p(p, TOKEN_SEMICOLON);
+            expect_p(p, TOKEN_SEMICOLON, "missing ';' after assignment");
             ASTNode* node = (ASTNode*)ast_new_assign_stmt(name, value, op_type, line, column);
             free(name);
             return node;
         } else if (p->current.type == TOKEN_PLUS_PLUS) {
             advance_p(p);
-            eat_p(p, TOKEN_SEMICOLON);
+            expect_p(p, TOKEN_SEMICOLON, "missing ';' after '++'");
             ASTNode* one = (ASTNode*)ast_new_int_literal(1, line, column);
             ASTNode* ident = (ASTNode*)ast_new_identifier(name, line, column);
             ASTNode* expr = (ASTNode*)ast_new_binary_expr(ident, TOKEN_PLUS, one, line, column);
@@ -671,7 +681,7 @@ ASTNode* parse_statement(Parser* p) {
         }
         else if (p->current.type == TOKEN_MINUS_MINUS) {
             advance_p(p);
-            eat_p(p, TOKEN_SEMICOLON);
+            expect_p(p, TOKEN_SEMICOLON, "missing ';' after '--'");
             ASTNode* one = (ASTNode*)ast_new_int_literal(1, line, column);
             ASTNode* ident = (ASTNode*)ast_new_identifier(name, line, column);
             ASTNode* expr = (ASTNode*)ast_new_binary_expr(ident, TOKEN_MINUS, one, line, column);
@@ -680,7 +690,7 @@ ASTNode* parse_statement(Parser* p) {
             return node;
         }
         else {
-            parser_error(p, "expected assignment operator or function call");
+            parser_error(p, "expected '=', '+=', '-=', '++', '--', or '(' after identifier");
             free(name);
             return parser_recover(p);
         }
@@ -689,9 +699,9 @@ ASTNode* parse_statement(Parser* p) {
         eat_p(p, TOKEN_IF);
         int line = p->current.line;
         int column = p->current.column;
-        eat_p(p, TOKEN_LPAREN);
+        expect_p(p, TOKEN_LPAREN, "expected '(' after 'if'");
         ASTNode* condition = parse_expression(p);
-        eat_p(p, TOKEN_RPAREN);
+        expect_p(p, TOKEN_RPAREN, "missing ')' after if condition");
         ASTNode* then_branch = parse_block(p);
 
         ASTNode* else_branch = NULL;
@@ -709,9 +719,9 @@ ASTNode* parse_statement(Parser* p) {
         eat_p(p, TOKEN_WHILE);
         int line = p->current.line;
         int column = p->current.column;
-        eat_p(p, TOKEN_LPAREN);
+        expect_p(p, TOKEN_LPAREN, "expected '(' after 'while'");
         ASTNode* condition = parse_expression(p);
-        eat_p(p, TOKEN_RPAREN);
+        expect_p(p, TOKEN_RPAREN, "missing ')' after while condition");
         ASTNode* body = parse_block(p);
         return (ASTNode*)ast_new_while_stmt(condition, body, line, column);
     }
@@ -719,7 +729,7 @@ ASTNode* parse_statement(Parser* p) {
         eat_p(p, TOKEN_FOR);
         int line = p->current.line;
         int column = p->current.column;
-        eat_p(p, TOKEN_LPAREN);
+        expect_p(p, TOKEN_LPAREN, "expected '(' after 'for'");
 
         ASTNode* initializer = NULL;
         if (p->current.type == TOKEN_LET) {
@@ -782,10 +792,10 @@ ASTNode* parse_statement(Parser* p) {
             }
             free(v_name);
         }
-        eat_p(p, TOKEN_SEMICOLON);
+        expect_p(p, TOKEN_SEMICOLON, "missing ';' in for loop — expected 'for (init; condition; increment)'");
 
         ASTNode* condition = parse_expression(p);
-        eat_p(p, TOKEN_SEMICOLON);
+        expect_p(p, TOKEN_SEMICOLON, "missing ';' in for loop — expected 'for (init; condition; increment)'");
 
         ASTNode* increment = NULL;
         if (p->current.type == TOKEN_IDENTIFIER) {
@@ -814,7 +824,7 @@ ASTNode* parse_statement(Parser* p) {
             free(v_name);
         }
 
-        eat_p(p, TOKEN_RPAREN);
+        expect_p(p, TOKEN_RPAREN, "missing ')' to close for loop header");
         ASTNode* body = parse_block(p);
         return (ASTNode*)ast_new_for_stmt(initializer, condition, increment, body, line, column);
     }
@@ -826,21 +836,21 @@ ASTNode* parse_statement(Parser* p) {
         if (p->current.type != TOKEN_SEMICOLON) {
             expression = parse_expression(p);
         }
-        eat_p(p, TOKEN_SEMICOLON);
+        expect_p(p, TOKEN_SEMICOLON, "missing ';' after return statement");
         return (ASTNode*)ast_new_return_stmt(expression, line, column);
     }
     else if (p->current.type == TOKEN_BREAK) {
         int line = p->current.line;
         int column = p->current.column;
         eat_p(p, TOKEN_BREAK);
-        eat_p(p, TOKEN_SEMICOLON);
+        expect_p(p, TOKEN_SEMICOLON, "missing ';' after break");
         return ast_new_break_stmt(line, column);
     }
     else if (p->current.type == TOKEN_CONTINUE) {
         int line = p->current.line;
         int column = p->current.column;
         eat_p(p, TOKEN_CONTINUE);
-        eat_p(p, TOKEN_SEMICOLON);
+        expect_p(p, TOKEN_SEMICOLON, "missing ';' after continue");
         return ast_new_continue_stmt(line, column);
     }
     else if (p->current.type == TOKEN_UNKNOWN) {
