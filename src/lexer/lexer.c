@@ -251,8 +251,14 @@ Token lexer_next_token(Lexer* l) {
         else if (strcmp(t.value, "break") == 0) t.type = TOKEN_BREAK;
         else if (strcmp(t.value, "continue") == 0) t.type = TOKEN_CONTINUE;
         else if (strcmp(t.value, "as") == 0) t.type = TOKEN_AS;
+        else if (strcmp(t.value, "struct") == 0) t.type = TOKEN_STRUCT;
+        else if (strcmp(t.value, "impl") == 0) t.type = TOKEN_IMPL;
+        else if (strcmp(t.value, "enum") == 0) t.type = TOKEN_ENUM;
+        else if (strcmp(t.value, "match") == 0) t.type = TOKEN_MATCH;
         // print, input, isnumber, isstring, exit, abs são identificadores comuns:
         // resolvidos como builtins na tabela de símbolos e no codegen.
+        // self também é um identificador comum — o parser/seântico tratam disso
+        // implicitamente dentro de métodos `impl Type { fn ... self ... }`.
         else t.type = TOKEN_IDENTIFIER;
 
         return t;
@@ -317,6 +323,7 @@ Token lexer_next_token(Lexer* l) {
         case '%': t.type = TOKEN_PERCENT; t.value = strdup("%"); break;
         case '=':
             if (peek(l) == '=') { advance(l); t.type = TOKEN_EQ_EQ; t.value = strdup("=="); }
+            else if (peek(l) == '>') { advance(l); t.type = TOKEN_FAT_ARROW; t.value = strdup("=>"); }
             else { t.type = TOKEN_EQUALS; t.value = strdup("="); }
             break;
         case '!':
@@ -375,6 +382,10 @@ const char* token_type_name(LamoTokenType type) {
         case TOKEN_BREAK: return "break";
         case TOKEN_CONTINUE: return "continue";
         case TOKEN_AS: return "as";
+        case TOKEN_STRUCT: return "struct";
+        case TOKEN_IMPL: return "impl";
+        case TOKEN_ENUM: return "enum";
+        case TOKEN_MATCH: return "match";
         case TOKEN_IDENTIFIER: return "IDENTIFIER";
         case TOKEN_INT: return "INT";
         case TOKEN_FLOAT: return "FLOAT";
@@ -409,6 +420,7 @@ const char* token_type_name(LamoTokenType type) {
         case TOKEN_PLUS_PLUS: return "++";
         case TOKEN_MINUS_MINUS: return "--";
         case TOKEN_ARROW: return "->";
+        case TOKEN_FAT_ARROW: return "=>";
         case TOKEN_EOF: return "EOF";
         default: return "UNKNOWN";
     }

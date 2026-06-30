@@ -13,6 +13,11 @@ struct Parser {
     int error_count;
     int panic_mode;   // se 1, suprime próximos erros até sincronizar
     const char* file_path;  // Bug #4 fix: path exibido nas mensagens de erro
+    /* Phase 2: when non-zero, parse_primary does NOT treat `IDENTIFIER {`
+     * as a struct literal. Used by the match parser so `match c { ... }`
+     * doesn't get misparsed as `match (c { ... })`. The flag is set
+     * around the scrutinee expression and cleared afterwards. */
+    int no_struct_literal;
 };
 
 Parser* parser_init(Lexer* lexer) {
@@ -30,6 +35,7 @@ Parser* parser_init_with_file(Lexer* lexer, const char* file_path) {
     p->error_count = 0;
     p->panic_mode = 0;
     p->file_path = file_path;
+    p->no_struct_literal = 0;  /* Phase 2: struct literal parsing enabled by default */
     // Bug #5 fix: todos os nós da AST criados a partir deste momento até o
     // fim deste parse vão receber file_path como origem. O caller é dono do
     // string e deve mantê-lo vivo enquanto a AST existir (lamo_v2.c usa
@@ -76,6 +82,13 @@ static void parser_synchronize(Parser* p) {
             case TOKEN_BREAK:
             case TOKEN_CONTINUE:
             case TOKEN_AS:  /* Sprint 4: treat `as` as a sync point too */
+            /* Phase 2: struct / impl / enum / match also start new top-level
+             * or block-level statements, so the synchronizer should stop at
+             * them after an error. */
+            case TOKEN_STRUCT:
+            case TOKEN_IMPL:
+            case TOKEN_ENUM:
+            case TOKEN_MATCH:
                 return;
             default:
                 advance_p(p);
@@ -164,6 +177,21 @@ static void expect_p(Parser* p, LamoTokenType type, const char* human_msg) {
     }
 }
 
+/* Phase 2: consume an optional semicolon. The spec shows method bodies
+ * and top-level programs without semicolons; we accept both styles.
+ * If the next token is `;`, consume it. Otherwise, leave it alone (the
+ * next statement-parsing iteration will handle it). This is safe because
+ * Lamo's grammar is unambiguous without `;` in practice — every
+ * statement starts with a keyword (let, fn, if, while, for, return,
+ * break, continue, import, struct, impl, enum, match) or an identifier
+ * followed by `=`, `(`, `.`, `[`, `++`, `--`, none of which can extend
+ * the previous expression. */
+static void optional_semicolon(Parser* p) {
+    if (p->current.type == TOKEN_SEMICOLON) {
+        advance_p(p);
+    }
+}
+
 ASTNode* parse_expression(Parser* p);
 static ASTNode* parse_primary(Parser* p);
 
@@ -174,6 +202,7 @@ static ASTNode* parse_primary(Parser* p);
  * The implementation is a loop that keeps wrapping the current node
  * in an index or prop expr as long as we see `[` or `.`. */
 static ASTNode* parse_postfix(Parser* p);
+static ASTNode* parser_recover(Parser* p);
 
 static ASTNode* parse_postfix(Parser* p) {
     ASTNode* node = parse_primary(p);
@@ -194,9 +223,44 @@ static ASTNode* parse_postfix(Parser* p) {
                 return node;  /* return what we have so far; caller may recover */
             }
             char* prop_name = strdup(p->current.value);
+            int prop_line = p->current.line;
+            int prop_column = p->current.column;
             advance_p(p);
-            node = (ASTNode*)ast_new_prop_expr(node, prop_name, line, column);
-            free(prop_name);
+            /* Phase 2: if the next token is '(', this is a method call
+             * (expr.method(args)) - parse the argument list and build an
+             * AST_MEMBER_CALL. Otherwise it's a property access
+             * (expr.prop) - build an AST_PROP_EXPR. The semantic pass
+             * dispatches AST_MEMBER_CALL based on the object's inferred
+             * type: module alias / array / struct. */
+            if (p->current.type == TOKEN_LPAREN) {
+                advance_p(p);  /* consume '(' */
+                ASTNode** args = NULL;
+                int arg_count = 0;
+                while (p->current.type != TOKEN_RPAREN && p->current.type != TOKEN_EOF) {
+                    ASTNode* arg = parse_expression(p);
+                    if (arg) {
+                        ASTNode** resized = realloc(args, sizeof(ASTNode*) * (size_t)(arg_count + 1));
+                        if (!resized) {
+                            parser_error(p, "out of memory while growing argument list");
+                            ast_free(arg);
+                            for (int i = 0; i < arg_count; i++) ast_free(args[i]);
+                            free(args);
+                            free(prop_name);
+                            ast_free(node);
+                            return parser_recover(p);
+                        }
+                        args = resized;
+                        args[arg_count++] = arg;
+                    }
+                    if (p->current.type == TOKEN_COMMA) advance_p(p);
+                }
+                expect_p(p, TOKEN_RPAREN, "missing ')' after method call arguments");
+                node = (ASTNode*)ast_new_member_call(node, prop_name, args, arg_count, prop_line, prop_column);
+                free(prop_name);
+            } else {
+                node = (ASTNode*)ast_new_prop_expr(node, prop_name, line, column);
+                free(prop_name);
+            }
         } else {
             break;
         }
@@ -358,6 +422,70 @@ static ASTNode* parse_primary(Parser* p) {
             }
             eat_p(p, TOKEN_RPAREN);
             ASTNode* node = (ASTNode*)ast_new_call_expr(name, args, arg_count, line, column);
+            free(name);
+            return node;
+        } else if (p->current.type == TOKEN_LBRACE && !p->no_struct_literal) {
+            /* Phase 2: struct literal — `Name { field: value, ... }`.
+             * We treat `IDENTIFIER {` in expression position as a struct
+             * literal. The semantic pass rejects it if `Name` is not a
+             * declared struct type. Field order does NOT need to match
+             * the struct declaration order — we look up each field name
+             * at compile time.
+             *
+             * Why this is safe: Lamo has no block expressions, so a `{`
+             * after an identifier in expression position is unambiguously
+             * a struct literal. Statements like `if (cond) { ... }` work
+             * because the `(cond)` is parenthesized — after parse_primary
+             * returns the cond, the next token is `)` (not `{`), so this
+             * branch doesn't fire. */
+            advance_p(p);  /* consume '{' */
+            char** field_names = NULL;
+            ASTNode** field_values = NULL;
+            int field_count = 0;
+            while (p->current.type != TOKEN_RBRACE && p->current.type != TOKEN_EOF) {
+                if (p->current.type != TOKEN_IDENTIFIER) {
+                    parser_error(p, "expected field name in struct literal");
+                    for (int i = 0; i < field_count; i++) { free(field_names[i]); ast_free(field_values[i]); }
+                    free(field_names);
+                    free(field_values);
+                    free(name);
+                    return parser_recover(p);
+                }
+                char* fname = strdup(p->current.value);
+                advance_p(p);
+                expect_p(p, TOKEN_COLON, "expected ':' after field name in struct literal");
+                ASTNode* fval = parse_expression(p);
+                /* Grow arrays. */
+                {
+                    char** fn_resized = realloc(field_names, sizeof(char*) * (size_t)(field_count + 1));
+                    ASTNode** fv_resized = realloc(field_values, sizeof(ASTNode*) * (size_t)(field_count + 1));
+                    if (!fn_resized || !fv_resized) {
+                        parser_error(p, "out of memory while growing struct literal field list");
+                        free(fname);
+                        ast_free(fval);
+                        for (int i = 0; i < field_count; i++) { free(field_names[i]); ast_free(field_values[i]); }
+                        free(fn_resized ? fn_resized : field_names);
+                        free(fv_resized ? fv_resized : field_values);
+                        free(name);
+                        return parser_recover(p);
+                    }
+                    field_names = fn_resized;
+                    field_values = fv_resized;
+                    field_names[field_count] = fname;
+                    field_values[field_count] = fval;
+                    field_count++;
+                }
+                if (p->current.type == TOKEN_COMMA) advance_p(p);
+                else if (p->current.type == TOKEN_SEMICOLON) advance_p(p);
+            }
+            expect_p(p, TOKEN_RBRACE, "missing '}' at end of struct literal");
+            ASTNode* node = (ASTNode*)ast_new_struct_literal(name, field_names, field_values, field_count, line, column);
+            /* Free field_names array contents (the AST strdup'd them) and
+             * the field_values array (the AST took ownership of the elements).
+             * Free the arrays themselves (the AST made its own copies). */
+            for (int i = 0; i < field_count; i++) free(field_names[i]);
+            free(field_names);
+            free(field_values);
             free(name);
             return node;
         } else {
@@ -574,7 +702,8 @@ ASTNode* parse_statement(Parser* p) {
             return parser_recover(p);
         }
         ASTNode* initializer = parse_expression(p);
-        expect_p(p, TOKEN_SEMICOLON, "missing ';' after let declaration");
+        /* Phase 2: semicolon is optional (spec shows code without `;`). */
+        optional_semicolon(p);
         ASTNode* node = (ASTNode*)ast_new_var_decl_typed(name, initializer, type_annotation, line, column);
         free(name);
         free(type_annotation);
@@ -700,32 +829,270 @@ ASTNode* parse_statement(Parser* p) {
         int line = p->current.line;
         int column = p->current.column;
         eat_p(p, TOKEN_IMPORT);
-        if (p->current.type != TOKEN_STRING) {
-            parser_error(p, "expected string path after import");
+        /* Phase 2: accept either a STRING path (legacy) or an IDENTIFIER
+         * (bare module name like `import math`). For the bare form, we
+         * synthesize the path `<name>.lamo` and (if no `as` clause is
+         * given) use the name itself as the alias. This matches the
+         * spec syntax:
+         *   import math        // -> import "math.lamo" as math
+         *   import math as m   // -> import "math.lamo" as m
+         * The loader (lamo_v2.c::resolve_import_path) resolves the path
+         * relative to the importing file. */
+        char* path = NULL;
+        char* alias = NULL;
+        if (p->current.type == TOKEN_STRING) {
+            path = strdup(p->current.value);
+            eat_p(p, TOKEN_STRING);
+        } else if (p->current.type == TOKEN_IDENTIFIER) {
+            char* mod_name = strdup(p->current.value);
+            eat_p(p, TOKEN_IDENTIFIER);
+            /* Synthesize "<mod_name>.lamo". */
+            size_t plen = strlen(mod_name) + 6;
+            path = malloc(plen);
+            snprintf(path, plen, "%s.lamo", mod_name);
+            /* Default alias is the module name itself (so `import math`
+             * makes symbols accessible as `math.fn(args)`). */
+            alias = mod_name;  /* will be freed below; we strdup for the AST */
+        } else {
+            parser_error(p, "expected string path or module name after import");
             return parser_recover(p);
         }
-        char* path = strdup(p->current.value);
-        eat_p(p, TOKEN_STRING);
-        /* Sprint 4: optional `as IDENTIFIER` clause. When present, the
-         * imported file's symbols are accessed as `<alias>.<name>` rather
-         * than merged into the global namespace. The alias is validated
-         * for sanity (must start with a letter/underscore; no path
-         * separators) — full validation lives in the loader. */
-        char* alias = NULL;
+        /* Optional `as IDENTIFIER` clause. Overrides the default alias. */
         if (p->current.type == TOKEN_AS) {
             eat_p(p, TOKEN_AS);
             if (p->current.type != TOKEN_IDENTIFIER) {
                 parser_error(p, "expected identifier after 'as' in import");
                 free(path);
+                free(alias);
                 return parser_recover(p);
             }
+            free(alias);  /* free the default alias (if any) */
             alias = strdup(p->current.value);
             eat_p(p, TOKEN_IDENTIFIER);
         }
-        expect_p(p, TOKEN_SEMICOLON, "missing ';' after import statement");
+        optional_semicolon(p);  /* Phase 2: `;` optional */
         ASTNode* node = (ASTNode*)ast_new_import_decl_aliased(path, alias, line, column);
         free(path);
         free(alias);
+        return node;
+    }
+    /* ─── Phase 2: struct / impl / enum / match declarations ─────────── */
+    else if (p->current.type == TOKEN_STRUCT) {
+        int line = p->current.line;
+        int column = p->current.column;
+        eat_p(p, TOKEN_STRUCT);
+        if (p->current.type != TOKEN_IDENTIFIER) {
+            parser_error(p, "expected struct name after 'struct'");
+            return parser_recover(p);
+        }
+        char* name = strdup(p->current.value);
+        eat_p(p, TOKEN_IDENTIFIER);
+        expect_p(p, TOKEN_LBRACE, "expected '{' to open struct body");
+        char** field_names = NULL;
+        char** field_types = NULL;
+        int field_count = 0;
+        while (p->current.type != TOKEN_RBRACE && p->current.type != TOKEN_EOF) {
+            if (p->current.type != TOKEN_IDENTIFIER) {
+                parser_error(p, "expected field name in struct body");
+                for (int i = 0; i < field_count; i++) { free(field_names[i]); free(field_types[i]); }
+                free(field_names); free(field_types); free(name);
+                return parser_recover(p);
+            }
+            char* fname = strdup(p->current.value);
+            eat_p(p, TOKEN_IDENTIFIER);
+            expect_p(p, TOKEN_COLON, "expected ':' after field name in struct");
+            if (p->current.type != TOKEN_IDENTIFIER) {
+                parser_error(p, "expected type name after ':' in struct field");
+                free(fname); free(name);
+                for (int i = 0; i < field_count; i++) { free(field_names[i]); free(field_types[i]); }
+                free(field_names); free(field_types);
+                return parser_recover(p);
+            }
+            char* ftype = strdup(p->current.value);
+            eat_p(p, TOKEN_IDENTIFIER);
+            /* Grow both arrays. */
+            {
+                char** fn_r = realloc(field_names, sizeof(char*) * (size_t)(field_count + 1));
+                char** ft_r = realloc(field_types, sizeof(char*) * (size_t)(field_count + 1));
+                if (!fn_r || !ft_r) {
+                    parser_error(p, "out of memory while growing struct field list");
+                    free(fname); free(ftype); free(name);
+                    for (int i = 0; i < field_count; i++) { free(field_names[i]); free(field_types[i]); }
+                    free(fn_r ? fn_r : field_names); free(ft_r ? ft_r : field_types);
+                    return parser_recover(p);
+                }
+                field_names = fn_r; field_types = ft_r;
+                field_names[field_count] = fname;
+                field_types[field_count] = ftype;
+                field_count++;
+            }
+            /* Fields can be separated by `,` or `;` or just newlines
+             * (the spec example shows no separators, just one field per
+             * line). We accept all three for flexibility. */
+            if (p->current.type == TOKEN_COMMA) advance_p(p);
+            else if (p->current.type == TOKEN_SEMICOLON) advance_p(p);
+        }
+        expect_p(p, TOKEN_RBRACE, "missing '}' at end of struct body");
+        /* Optional trailing semicolon (struct decls usually don't have one,
+         * but we allow it for symmetry with other declarations). */
+        if (p->current.type == TOKEN_SEMICOLON) advance_p(p);
+        ASTNode* node = (ASTNode*)ast_new_struct_decl(name, field_names, field_types, field_count, line, column);
+        for (int i = 0; i < field_count; i++) { free(field_names[i]); free(field_types[i]); }
+        free(field_names); free(field_types); free(name);
+        return node;
+    }
+    else if (p->current.type == TOKEN_IMPL) {
+        int line = p->current.line;
+        int column = p->current.column;
+        eat_p(p, TOKEN_IMPL);
+        if (p->current.type != TOKEN_IDENTIFIER) {
+            parser_error(p, "expected struct name after 'impl'");
+            return parser_recover(p);
+        }
+        char* struct_name = strdup(p->current.value);
+        eat_p(p, TOKEN_IDENTIFIER);
+        expect_p(p, TOKEN_LBRACE, "expected '{' to open impl body");
+        /* Parse a sequence of `fn ...` declarations as the methods. */
+        ASTNode* head = NULL;
+        ASTNode* tail = NULL;
+        while (p->current.type != TOKEN_RBRACE && p->current.type != TOKEN_EOF) {
+            /* Reuse parse_statement's TOKEN_FN handling by calling it
+             * directly. parse_statement returns AST_FN_DECL nodes for
+             * `fn name(params) { body }`. We chain them via ->next. */
+            if (p->current.type != TOKEN_FN) {
+                parser_error(p, "expected 'fn' inside impl block");
+                parser_synchronize(p);
+                /* Try to recover by skipping to next 'fn' or '}'. */
+                while (p->current.type != TOKEN_FN && p->current.type != TOKEN_RBRACE && p->current.type != TOKEN_EOF) {
+                    advance_p(p);
+                }
+                continue;
+            }
+            ASTNode* method = parse_statement(p);
+            if (method) {
+                if (!head) { head = method; tail = method; }
+                else { tail->next = method; tail = method; }
+            }
+            if (p->panic_mode) parser_synchronize(p);
+        }
+        expect_p(p, TOKEN_RBRACE, "missing '}' at end of impl body");
+        if (p->current.type == TOKEN_SEMICOLON) advance_p(p);
+        ASTNode* node = (ASTNode*)ast_new_impl_decl(struct_name, head, line, column);
+        free(struct_name);
+        return node;
+    }
+    else if (p->current.type == TOKEN_ENUM) {
+        int line = p->current.line;
+        int column = p->current.column;
+        eat_p(p, TOKEN_ENUM);
+        if (p->current.type != TOKEN_IDENTIFIER) {
+            parser_error(p, "expected enum name after 'enum'");
+            return parser_recover(p);
+        }
+        char* name = strdup(p->current.value);
+        eat_p(p, TOKEN_IDENTIFIER);
+        expect_p(p, TOKEN_LBRACE, "expected '{' to open enum body");
+        char** variants = NULL;
+        int variant_count = 0;
+        while (p->current.type != TOKEN_RBRACE && p->current.type != TOKEN_EOF) {
+            if (p->current.type != TOKEN_IDENTIFIER) {
+                parser_error(p, "expected variant name in enum body");
+                for (int i = 0; i < variant_count; i++) free(variants[i]);
+                free(variants); free(name);
+                return parser_recover(p);
+            }
+            char* vname = strdup(p->current.value);
+            eat_p(p, TOKEN_IDENTIFIER);
+            {
+                char** resized = realloc(variants, sizeof(char*) * (size_t)(variant_count + 1));
+                if (!resized) {
+                    parser_error(p, "out of memory while growing enum variant list");
+                    free(vname);
+                    for (int i = 0; i < variant_count; i++) free(variants[i]);
+                    free(variants); free(name);
+                    return parser_recover(p);
+                }
+                variants = resized;
+                variants[variant_count++] = vname;
+            }
+            if (p->current.type == TOKEN_COMMA) advance_p(p);
+            else if (p->current.type == TOKEN_SEMICOLON) advance_p(p);
+        }
+        expect_p(p, TOKEN_RBRACE, "missing '}' at end of enum body");
+        if (p->current.type == TOKEN_SEMICOLON) advance_p(p);
+        ASTNode* node = (ASTNode*)ast_new_enum_decl(name, variants, variant_count, line, column);
+        for (int i = 0; i < variant_count; i++) free(variants[i]);
+        free(variants); free(name);
+        return node;
+    }
+    else if (p->current.type == TOKEN_MATCH) {
+        int line = p->current.line;
+        int column = p->current.column;
+        eat_p(p, TOKEN_MATCH);
+        /* Phase 2: disable struct literal parsing while parsing the
+         * scrutinee so `match c { ... }` doesn't get misparsed as
+         * `match (c { ... })` (a struct literal swallowing the match
+         * body). The flag is cleared after the scrutinee is parsed. */
+        p->no_struct_literal = 1;
+        ASTNode* scrutinee = parse_expression(p);
+        p->no_struct_literal = 0;
+        expect_p(p, TOKEN_LBRACE, "expected '{' to open match body");
+        char** patterns = NULL;
+        int* pattern_is_wildcard = NULL;
+        ASTNode** bodies = NULL;
+        int arm_count = 0;
+        while (p->current.type != TOKEN_RBRACE && p->current.type != TOKEN_EOF) {
+            char* pat = NULL;
+            int is_wild = 0;
+            if (p->current.type == TOKEN_IDENTIFIER) {
+                /* "_" is the wildcard pattern (we read it as an identifier
+                 * since the lexer doesn't have a special token for it). */
+                if (strcmp(p->current.value, "_") == 0) {
+                    is_wild = 1;
+                    pat = strdup("_");
+                } else {
+                    pat = strdup(p->current.value);
+                }
+                eat_p(p, TOKEN_IDENTIFIER);
+            } else {
+                parser_error(p, "expected pattern (variant name or '_') in match arm");
+                free(pat);
+                for (int i = 0; i < arm_count; i++) { free(patterns[i]); ast_free(bodies[i]); }
+                free(patterns); free(pattern_is_wildcard); free(bodies);
+                ast_free(scrutinee);
+                return parser_recover(p);
+            }
+            expect_p(p, TOKEN_FAT_ARROW, "expected '=>' in match arm");
+            /* Arm body: parse a single statement. We use parse_statement
+             * so the user can write `Red => print("red");` or
+             * `Red => { print("red"); print("!"); }`. */
+            ASTNode* body = parse_statement(p);
+            /* Grow arrays. */
+            {
+                char** p_r = realloc(patterns, sizeof(char*) * (size_t)(arm_count + 1));
+                int* w_r = realloc(pattern_is_wildcard, sizeof(int) * (size_t)(arm_count + 1));
+                ASTNode** b_r = realloc(bodies, sizeof(ASTNode*) * (size_t)(arm_count + 1));
+                if (!p_r || !w_r || !b_r) {
+                    parser_error(p, "out of memory while growing match arm list");
+                    free(pat); ast_free(body);
+                    for (int i = 0; i < arm_count; i++) { free(patterns[i]); ast_free(bodies[i]); }
+                    free(p_r ? p_r : patterns); free(w_r ? w_r : pattern_is_wildcard); free(b_r ? b_r : bodies);
+                    ast_free(scrutinee);
+                    return parser_recover(p);
+                }
+                patterns = p_r; pattern_is_wildcard = w_r; bodies = b_r;
+                patterns[arm_count] = pat;
+                pattern_is_wildcard[arm_count] = is_wild;
+                bodies[arm_count] = body;
+                arm_count++;
+            }
+            if (p->current.type == TOKEN_COMMA) advance_p(p);
+        }
+        expect_p(p, TOKEN_RBRACE, "missing '}' at end of match body");
+        if (p->current.type == TOKEN_SEMICOLON) advance_p(p);
+        ASTNode* node = (ASTNode*)ast_new_match_stmt(scrutinee, patterns, pattern_is_wildcard, bodies, arm_count, line, column);
+        for (int i = 0; i < arm_count; i++) free(patterns[i]);
+        free(patterns); free(pattern_is_wildcard); free(bodies);
         return node;
     }
     else if (p->current.type == TOKEN_IDENTIFIER) {
@@ -739,7 +1106,12 @@ ASTNode* parse_statement(Parser* p) {
          * the `.` would otherwise fall through to the "expected '=', '+='..."
          * error. The object is always an AST_IDENTIFIER naming the module
          * alias; the semantic pass validates that the alias was declared
-         * by an earlier `import "..." as alias;`. */
+         * by an earlier `import "..." as alias;`.
+         *
+         * Phase 2: we also accept `obj.field = value;` here (field
+         * assignment). The disambiguation is: after consuming `.IDENTIFIER`,
+         * if the next token is `(`, parse as method call; if it's `=`,
+         * `+=`, or `-=`, parse as field assignment. */
         if (p->current.type == TOKEN_DOT) {
             int obj_line = p->current.line;
             int obj_column = p->current.column;
@@ -751,33 +1123,87 @@ ASTNode* parse_statement(Parser* p) {
             }
             char* member_name = strdup(p->current.value);
             eat_p(p, TOKEN_IDENTIFIER);
-            expect_p(p, TOKEN_LPAREN, "expected '(' after module member name in call statement");
-            ASTNode** args = NULL;
-            int arg_count = 0;
-            while (p->current.type != TOKEN_RPAREN && p->current.type != TOKEN_EOF) {
-                ASTNode* arg = parse_expression(p);
-                if (arg) {
-                    ASTNode** resized = realloc(args, sizeof(ASTNode*) * (size_t)(arg_count + 1));
-                    if (!resized) {
-                        parser_error(p, "out of memory while growing argument list");
-                        ast_free(arg);
-                        free(args);
-                        free(name);
-                        free(member_name);
-                        return parser_recover(p);
+            if (p->current.type == TOKEN_LPAREN) {
+                /* Method call: `obj.method(args);` */
+                eat_p(p, TOKEN_LPAREN);
+                ASTNode** args = NULL;
+                int arg_count = 0;
+                while (p->current.type != TOKEN_RPAREN && p->current.type != TOKEN_EOF) {
+                    ASTNode* arg = parse_expression(p);
+                    if (arg) {
+                        ASTNode** resized = realloc(args, sizeof(ASTNode*) * (size_t)(arg_count + 1));
+                        if (!resized) {
+                            parser_error(p, "out of memory while growing argument list");
+                            ast_free(arg);
+                            free(args);
+                            free(name);
+                            free(member_name);
+                            return parser_recover(p);
+                        }
+                        args = resized;
+                        args[arg_count++] = arg;
                     }
-                    args = resized;
-                    args[arg_count++] = arg;
+                    if (p->current.type == TOKEN_COMMA) advance_p(p);
                 }
-                if (p->current.type == TOKEN_COMMA) advance_p(p);
+                expect_p(p, TOKEN_RPAREN, "missing ')' — did you forget to close the argument list?");
+                optional_semicolon(p);  /* Phase 2: `;` optional */
+                ASTNode* obj = (ASTNode*)ast_new_identifier(name, obj_line, obj_column);
+                ASTNode* node = (ASTNode*)ast_new_member_call(obj, member_name, args, arg_count, line, column);
+                free(name);
+                free(member_name);
+                return node;
+            } else if (p->current.type == TOKEN_EQUALS || p->current.type == TOKEN_PLUS_EQ ||
+                       p->current.type == TOKEN_MINUS_EQ) {
+                /* Phase 2: field assignment `obj.field = value;` */
+                LamoTokenType op_type = p->current.type;
+                advance_p(p);
+                ASTNode* value = parse_expression(p);
+                /* Semicolon is optional — the spec shows method bodies
+                 * without semicolons. We accept both `;` and no-`;` (e.g.
+                 * when the next token is `}`). */
+                if (p->current.type == TOKEN_SEMICOLON) advance_p(p);
+                ASTNode* obj = (ASTNode*)ast_new_identifier(name, obj_line, obj_column);
+                ASTNode* target = (ASTNode*)ast_new_prop_expr(obj, member_name, line, column);
+                ASTNode* node = (ASTNode*)ast_new_place_assign_stmt(target, value, op_type, line, column);
+                free(name);
+                free(member_name);
+                return node;
+            } else {
+                parser_error(p, "expected '(' or '=' after '.member' in statement");
+                free(name);
+                free(member_name);
+                return parser_recover(p);
             }
-            expect_p(p, TOKEN_RPAREN, "missing ')' — did you forget to close the argument list?");
-            expect_p(p, TOKEN_SEMICOLON, "missing ';' after module member call");
-            ASTNode* obj = (ASTNode*)ast_new_identifier(name, obj_line, obj_column);
-            ASTNode* node = (ASTNode*)ast_new_member_call(obj, member_name, args, arg_count, line, column);
-            free(name);
-            free(member_name);
-            return node;
+        }
+
+        /* Phase 2: `arr[index] = value;` — index assignment. We detect
+         * this when the identifier is followed by `[`. The expression
+         * form `arr[index]` (read) is handled by parse_postfix; here we
+         * specifically handle the assignment form. After consuming the
+         * `[index]`, we look for `=`, `+=`, or `-=`. */
+        if (p->current.type == TOKEN_LBRACKET) {
+            int idx_line = p->current.line;
+            int idx_column = p->current.column;
+            advance_p(p);  /* consume '[' */
+            ASTNode* index = parse_expression(p);
+            expect_p(p, TOKEN_RBRACKET, "missing ']' after index in assignment");
+            if (p->current.type == TOKEN_EQUALS || p->current.type == TOKEN_PLUS_EQ ||
+                p->current.type == TOKEN_MINUS_EQ) {
+                LamoTokenType op_type = p->current.type;
+                advance_p(p);
+                ASTNode* value = parse_expression(p);
+                optional_semicolon(p);  /* Phase 2: `;` optional */
+                ASTNode* obj = (ASTNode*)ast_new_identifier(name, idx_line, idx_column);
+                ASTNode* target = (ASTNode*)ast_new_index_expr(obj, index, line, column);
+                ASTNode* node = (ASTNode*)ast_new_place_assign_stmt(target, value, op_type, line, column);
+                free(name);
+                return node;
+            } else {
+                parser_error(p, "expected '=', '+=', or '-=' after 'arr[index]' in statement");
+                ast_free(index);
+                free(name);
+                return parser_recover(p);
+            }
         }
 
         if (p->current.type == TOKEN_LPAREN) {
@@ -801,7 +1227,7 @@ ASTNode* parse_statement(Parser* p) {
                 if (p->current.type == TOKEN_COMMA) advance_p(p);
             }
             expect_p(p, TOKEN_RPAREN, "missing ')' — did you forget to close the argument list?");
-            expect_p(p, TOKEN_SEMICOLON, "missing ';' after function call");
+            optional_semicolon(p);  /* Phase 2: `;` optional */
             ASTNode* node = (ASTNode*)ast_new_call_stmt(name, args, arg_count, line, column);
             free(name);
             return node;
@@ -811,13 +1237,13 @@ ASTNode* parse_statement(Parser* p) {
             LamoTokenType op_type = p->current.type;
             advance_p(p);
             ASTNode* value = parse_expression(p);
-            expect_p(p, TOKEN_SEMICOLON, "missing ';' after assignment");
+            optional_semicolon(p);  /* Phase 2: `;` optional */
             ASTNode* node = (ASTNode*)ast_new_assign_stmt(name, value, op_type, line, column);
             free(name);
             return node;
         } else if (p->current.type == TOKEN_PLUS_PLUS) {
             advance_p(p);
-            expect_p(p, TOKEN_SEMICOLON, "missing ';' after '++'");
+            optional_semicolon(p);  /* Phase 2: `;` optional */
             ASTNode* one = (ASTNode*)ast_new_int_literal(1, line, column);
             ASTNode* ident = (ASTNode*)ast_new_identifier(name, line, column);
             ASTNode* expr = (ASTNode*)ast_new_binary_expr(ident, TOKEN_PLUS, one, line, column);
@@ -827,7 +1253,7 @@ ASTNode* parse_statement(Parser* p) {
         }
         else if (p->current.type == TOKEN_MINUS_MINUS) {
             advance_p(p);
-            expect_p(p, TOKEN_SEMICOLON, "missing ';' after '--'");
+            optional_semicolon(p);  /* Phase 2: `;` optional */
             ASTNode* one = (ASTNode*)ast_new_int_literal(1, line, column);
             ASTNode* ident = (ASTNode*)ast_new_identifier(name, line, column);
             ASTNode* expr = (ASTNode*)ast_new_binary_expr(ident, TOKEN_MINUS, one, line, column);
@@ -985,21 +1411,28 @@ ASTNode* parse_statement(Parser* p) {
         if (p->current.type != TOKEN_SEMICOLON) {
             expression = parse_expression(p);
         }
-        expect_p(p, TOKEN_SEMICOLON, "missing ';' after return statement");
+        optional_semicolon(p);  /* Phase 2: `;` optional */
         return (ASTNode*)ast_new_return_stmt(expression, line, column);
+    }
+    else if (p->current.type == TOKEN_LBRACE) {
+        /* Phase 2: a bare block `{ ... }` as a statement. This is used
+         * by match arm bodies like `Red => { print("red"); print("!"); }`.
+         * We delegate to parse_block which handles the braces and the
+         * inner statement list. */
+        return parse_block(p);
     }
     else if (p->current.type == TOKEN_BREAK) {
         int line = p->current.line;
         int column = p->current.column;
         eat_p(p, TOKEN_BREAK);
-        expect_p(p, TOKEN_SEMICOLON, "missing ';' after break");
+        optional_semicolon(p);  /* Phase 2: `;` optional */
         return ast_new_break_stmt(line, column);
     }
     else if (p->current.type == TOKEN_CONTINUE) {
         int line = p->current.line;
         int column = p->current.column;
         eat_p(p, TOKEN_CONTINUE);
-        expect_p(p, TOKEN_SEMICOLON, "missing ';' after continue");
+        optional_semicolon(p);  /* Phase 2: `;` optional */
         return ast_new_continue_stmt(line, column);
     }
     else if (p->current.type == TOKEN_UNKNOWN) {

@@ -1,3 +1,0 @@
-// ERRO: ponto-e-virgula faltando
-let x = 1
-print(x);

@@ -35,6 +35,7 @@ ASTNode* ast_new_node(ASTNodeType type, size_t size, int line, int column) {
     node->column = column;
     node->next = NULL;
     node->file_path = g_default_file_path;
+    node->sema_struct_name = NULL;  /* Phase 2: populated by semantic pass */
     return node;
 }
 
@@ -248,6 +249,79 @@ ASTMemberCall* ast_new_member_call(ASTNode* object, char* member_name, ASTNode**
     return node;
 }
 
+/* ─── Phase 2: structs / methods / enums / match ──────────────────── */
+
+ASTNode* ast_new_struct_decl(char* name, char** field_names, char** field_types, int field_count, int line, int column) {
+    ASTStructDecl* node = (ASTStructDecl*)ast_new_node(AST_STRUCT_DECL, sizeof(ASTStructDecl), line, column);
+    int i;
+    node->name = strdup(name);
+    node->field_count = field_count;
+    node->field_names = field_count > 0 ? malloc(sizeof(char*) * (size_t)field_count) : NULL;
+    node->field_types = field_count > 0 ? malloc(sizeof(char*) * (size_t)field_count) : NULL;
+    for (i = 0; i < field_count; i++) {
+        node->field_names[i] = strdup(field_names[i] ? field_names[i] : "");
+        node->field_types[i] = field_types && field_types[i] ? strdup(field_types[i]) : NULL;
+    }
+    return (ASTNode*)node;
+}
+
+ASTNode* ast_new_impl_decl(char* struct_name, ASTNode* methods, int line, int column) {
+    ASTImplDecl* node = (ASTImplDecl*)ast_new_node(AST_IMPL_DECL, sizeof(ASTImplDecl), line, column);
+    node->struct_name = strdup(struct_name);
+    node->methods = methods;
+    return (ASTNode*)node;
+}
+
+ASTNode* ast_new_enum_decl(char* name, char** variants, int variant_count, int line, int column) {
+    ASTEnumDecl* node = (ASTEnumDecl*)ast_new_node(AST_ENUM_DECL, sizeof(ASTEnumDecl), line, column);
+    int i;
+    node->name = strdup(name);
+    node->variant_count = variant_count;
+    node->variants = variant_count > 0 ? malloc(sizeof(char*) * (size_t)variant_count) : NULL;
+    for (i = 0; i < variant_count; i++) {
+        node->variants[i] = strdup(variants[i] ? variants[i] : "");
+    }
+    return (ASTNode*)node;
+}
+
+ASTNode* ast_new_match_stmt(ASTNode* scrutinee, char** patterns, int* pattern_is_wildcard, ASTNode** bodies, int arm_count, int line, int column) {
+    ASTMatchStmt* node = (ASTMatchStmt*)ast_new_node(AST_MATCH_STMT, sizeof(ASTMatchStmt), line, column);
+    int i;
+    node->scrutinee = scrutinee;
+    node->arm_count = arm_count;
+    node->patterns = arm_count > 0 ? malloc(sizeof(char*) * (size_t)arm_count) : NULL;
+    node->pattern_is_wildcard = arm_count > 0 ? malloc(sizeof(int) * (size_t)arm_count) : NULL;
+    node->bodies = arm_count > 0 ? malloc(sizeof(ASTNode*) * (size_t)arm_count) : NULL;
+    for (i = 0; i < arm_count; i++) {
+        node->patterns[i] = strdup(patterns[i] ? patterns[i] : "_");
+        node->pattern_is_wildcard[i] = pattern_is_wildcard ? pattern_is_wildcard[i] : 0;
+        node->bodies[i] = bodies[i];
+    }
+    return (ASTNode*)node;
+}
+
+ASTNode* ast_new_struct_literal(char* struct_name, char** field_names, ASTNode** field_values, int field_count, int line, int column) {
+    ASTStructLiteral* node = (ASTStructLiteral*)ast_new_node(AST_STRUCT_LITERAL, sizeof(ASTStructLiteral), line, column);
+    int i;
+    node->struct_name = strdup(struct_name);
+    node->field_count = field_count;
+    node->field_names = field_count > 0 ? malloc(sizeof(char*) * (size_t)field_count) : NULL;
+    node->field_values = field_count > 0 ? malloc(sizeof(ASTNode*) * (size_t)field_count) : NULL;
+    for (i = 0; i < field_count; i++) {
+        node->field_names[i] = strdup(field_names[i] ? field_names[i] : "");
+        node->field_values[i] = field_values[i];
+    }
+    return (ASTNode*)node;
+}
+
+ASTNode* ast_new_place_assign_stmt(ASTNode* target, ASTNode* value, LamoTokenType op_type, int line, int column) {
+    ASTPlaceAssignStmt* node = (ASTPlaceAssignStmt*)ast_new_node(AST_PLACE_ASSIGN_STMT, sizeof(ASTPlaceAssignStmt), line, column);
+    node->target = target;
+    node->value = value;
+    node->op_type = op_type;
+    return (ASTNode*)node;
+}
+
 void ast_program_append(ASTProgram* destination, ASTProgram* source) {
     ASTNode* tail;
 
@@ -418,6 +492,65 @@ void ast_free(ASTNode* node) {
                     ast_free(mc->args[i]);
                 }
                 free(mc->args);
+                break;
+            }
+            case AST_STRUCT_DECL: {
+                ASTStructDecl* sd = (ASTStructDecl*)node;
+                int i;
+                free(sd->name);
+                for (i = 0; i < sd->field_count; i++) {
+                    free(sd->field_names[i]);
+                    free(sd->field_types[i]);  /* may be NULL — free is safe */
+                }
+                free(sd->field_names);
+                free(sd->field_types);
+                break;
+            }
+            case AST_IMPL_DECL: {
+                ASTImplDecl* id = (ASTImplDecl*)node;
+                free(id->struct_name);
+                ast_free(id->methods);
+                break;
+            }
+            case AST_ENUM_DECL: {
+                ASTEnumDecl* ed = (ASTEnumDecl*)node;
+                int i;
+                free(ed->name);
+                for (i = 0; i < ed->variant_count; i++) {
+                    free(ed->variants[i]);
+                }
+                free(ed->variants);
+                break;
+            }
+            case AST_MATCH_STMT: {
+                ASTMatchStmt* ms = (ASTMatchStmt*)node;
+                int i;
+                ast_free(ms->scrutinee);
+                for (i = 0; i < ms->arm_count; i++) {
+                    free(ms->patterns[i]);
+                    ast_free(ms->bodies[i]);
+                }
+                free(ms->patterns);
+                free(ms->pattern_is_wildcard);
+                free(ms->bodies);
+                break;
+            }
+            case AST_STRUCT_LITERAL: {
+                ASTStructLiteral* sl = (ASTStructLiteral*)node;
+                int i;
+                free(sl->struct_name);
+                for (i = 0; i < sl->field_count; i++) {
+                    free(sl->field_names[i]);
+                    ast_free(sl->field_values[i]);
+                }
+                free(sl->field_names);
+                free(sl->field_values);
+                break;
+            }
+            case AST_PLACE_ASSIGN_STMT: {
+                ASTPlaceAssignStmt* pa = (ASTPlaceAssignStmt*)node;
+                ast_free(pa->target);
+                ast_free(pa->value);
                 break;
             }
         }

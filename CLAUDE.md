@@ -112,6 +112,13 @@ Lamo is a transpiled language that compiles to C. The pipeline is:
   imported file's top-level declarations under `alias`. Member access uses
   `alias.fn(args)` syntax. Legacy `import "...";` (without `as`) still
   merges into the global namespace.
+- **Phase 2 language expansion**: structs (`struct Name { field: type, ... }`
+  + `Name { field: value, ... }` literals), methods (`impl Type { fn method(args) { self.field ... } }`
+  with implicit `self`), arrays (`[1, 2, 3]`, `arr[i]`, `arr[i] = value`,
+  `arr.push(x)`, `arr.pop()`, `arr.len()`), enums (`enum Name { Variant, ... }`
+  — variants are global int constants), match (`match scrutinee { Pattern => body, _ => default }`
+  with exhaustiveness warnings), bare-identifier imports (`import math` is
+  sugar for `import "math.lamo" as math`), and optional semicolons.
 
 ### Diagnostics (Sprint 4)
 

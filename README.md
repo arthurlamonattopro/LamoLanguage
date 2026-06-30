@@ -1,6 +1,10 @@
 # Lamo Language
 
-Lamo is a small experimental programming language implemented in C. Today it has a lexer, parser, AST, a first semantic-analysis pass, and a C backend with `run`, `build`, `check`, and `eval` commands. The repository also ships an integrated package manager (formerly a separate `lampm` binary) reachable through the same `lamo` executable as `lamo install`, `lamo update`, `lamo list`, etc.
+Lamo is a small experimental programming language implemented in C. It has a lexer, parser, AST, a semantic-analysis pass, and a C backend with `run`, `build`, `check`, and `eval` commands. The repository also ships an integrated package manager (formerly a separate `lampm` binary) reachable through the same `lamo` executable as `lamo install`, `lamo update`, `lamo list`, etc.
+
+> **Philosophy:** *As simple as an interpreted language, as fast as a compiled one.*
+> Lamo transpiles to C and is built by GCC, so it runs at native speed. But the
+> language surface stays tiny, readable, and easy to learn.
 
 Licensed under the [MIT License](./LICENSE).
 
@@ -10,14 +14,22 @@ Implemented now:
 
 - lexical analysis
 - parsing into an AST
-- semantic checks for scopes and functions
-- C code generation
+- semantic checks for scopes, functions, structs, enums, and methods
+- C code generation (transpilation to C, then GCC)
 - compile, build, and run CLI flow
 - fixture-based compiler tests
 - **namespaced module system** (`import "..." as alias;` + `alias.fn(args)`)
+- **bare-identifier imports** (`import math` and `import math as m`)
 - **error hints** (`hint: did you forget ...?` lines under error snippets)
 - **ANSI color** in diagnostics (auto-detected; disable with `--no-color`)
 - **`lamo test`** and **`lamo fmt`** CLI commands
+- **Phase 2 language features:**
+  - **structs** — `struct Player { name: string, hp: int }` with field access and assignment
+  - **methods** — `impl Player { fn damage(amount: int) { self.hp -= amount } }` with implicit `self`
+  - **arrays** — literals, indexing, `arr.push(x)`, `arr.pop()`, `arr.len()`, `arr[i] = value`
+  - **enums** — `enum Color { Red, Green, Blue }` with variants as int constants
+  - **match** — `match color { Red => print("red"), _ => print("other") }` with exhaustiveness warnings
+  - **optional semicolons** — both `let x = 5;` and `let x = 5` work
 
 Implemented in semantics:
 
@@ -32,14 +44,18 @@ Implemented in semantics:
   inside an imported file point to that file, not to `<multiple inputs>`)
 - module member call validation (`math.sqrt(x)` resolves through the
   module registry; arity is checked the same way as regular calls)
+- **struct field validation** (unknown fields are rejected at compile time)
+- **method validation** (unknown methods and wrong arity are rejected)
+- **enum variant validation** (match patterns must be known variants or `_`)
+- **match exhaustiveness warnings** (non-exhaustive matches are flagged)
 
 Not implemented yet:
 
-- typed variable or function declarations (types are inferred, not annotated)
 - a standard runtime/library design
-- arrays, structs, and maps (only `string` is a composite type today)
 - AST-based pretty-printer in `lamo fmt` (the current formatter only
   normalizes whitespace, line endings, and trailing newlines)
+- generics / traits
+- pattern matching beyond simple variant equality (no destructuring, no literals)
 
 ## Language Features
 
@@ -120,33 +136,37 @@ http_serve(8080);
 
 ### Modules and Namespaced Imports
 
-Lamo supports two import forms:
+Lamo supports three import forms:
 
 - **Legacy global merge** — `import "math.lamo";` keeps the previous
   behavior: every top-level declaration in `math.lamo` becomes
   available in the global namespace as if it had been defined in the
   importing file. Use this for quick scripts where name collisions
   aren't a concern.
-- **Namespaced** — `import "math.lamo" as math;` exposes the imported
+- **Namespaced (string path)** — `import "math.lamo" as math;` exposes the imported
   file's top-level functions and globals under the `math` alias. You
   then call them as `math.sqrt(25)`, `math.add(3, 4)`, etc. The alias
   can be any valid identifier — `import "math.lamo" as m;` and
   `m.sqrt(25)` work too.
+- **Bare identifier** (Phase 2) — `import math` is sugar for
+  `import "math.lamo" as math`. The module name is resolved to a file
+  `<name>.lamo` in the importing file's directory. Use
+  `import math as m` to specify a different alias.
 
 Example:
 
 ```lamo
 // math.lamo
-fn sqrt(n) { return n * n; }    // not really sqrt, just for the example
-fn add(a, b) { return a + b; }
+fn sqrt(n) { return n * n }    // not really sqrt, just for the example
+fn add(a, b) { return a + b }
 ```
 
 ```lamo
 // main.lamo
-import "math.lamo" as math;
+import math              // bare identifier — same as `import "math.lamo" as math`
 
-print(math.sqrt(5));     // 25
-print(math.add(3, 4));   // 7
+print(math.sqrt(5))      // 25
+print(math.add(3, 4))    // 7
 ```
 
 The semantic pass validates member access against the module registry:
@@ -159,6 +179,149 @@ Known limitation: the `lamo eval` and `lamo repl` paths do not load
 modules through the registry, so `math.sqrt(x)` in those modes raises
 a clear "use `lamo run` instead" error. Use `lamo run` for any program
 that uses namespaced imports.
+
+### Structs (Phase 2)
+
+A struct is a user-defined record with named fields:
+
+```lamo
+struct Player {
+    name: string,
+    hp: int,
+    level: int
+}
+
+let p = Player { name: "Arthur", hp: 100, level: 1 }
+print(p.name)        // Arthur
+print(p.hp)          // 100
+
+p.hp -= 30           // field assignment with -=
+print(p.hp)          // 70
+```
+
+- Fields can be separated by `,`, `;`, or just newlines.
+- Field order in the literal does NOT need to match the declaration order.
+- Missing fields default to `0` (a warning is emitted at compile time).
+- Field types are annotations only — Lamo is dynamically typed at runtime.
+
+### Methods (Phase 2)
+
+Methods are functions attached to a struct via `impl`:
+
+```lamo
+impl Player {
+    fn damage(amount: int) {
+        self.hp -= amount
+    }
+    fn heal(amount: int) {
+        self.hp += amount
+    }
+    fn is_alive() {
+        return self.hp > 0
+    }
+}
+
+let p = Player { name: "Hero", hp: 50, level: 1 }
+p.damage(20)
+print(p.hp)              // 30
+print(p.is_alive())      // 1 (true)
+p.damage(100)
+print(p.is_alive())      // 0 (false)
+```
+
+- `self` is implicit inside `impl` method bodies — do NOT declare it as a parameter.
+- Methods are called as `obj.method(args)`.
+- Method arity is validated at compile time.
+- Methods can return values and call other methods on `self`.
+
+### Arrays (Phase 2)
+
+Arrays are dynamic, heterogeneous lists:
+
+```lamo
+let numbers = [1, 2, 3]
+print(numbers.len())        // 3
+
+numbers.push(4)
+print(numbers.len())        // 4
+print(numbers[3])           // 4
+
+numbers[0] = 99
+print(numbers[0])           // 99
+
+let last = numbers.pop()
+print(last)                 // 4
+print(numbers.len())        // 3
+
+// Iteration
+let sum = 0
+for (let i = 0; i < numbers.len(); i++) {
+    sum += numbers[i]
+}
+print(sum)                  // 104 (99 + 2 + 3)
+```
+
+- `arr.push(x)`, `arr.pop()`, `arr.len()` are method-style calls.
+- `len(arr)`, `push(arr, x)`, `pop(arr)` are the equivalent builtin-function forms.
+- `arr[i] = value` is supported (index assignment).
+- `arr[i] += value` and `arr[i] -= value` work (read-modify-write).
+- Negative indices count from the end (`arr[-1]` is the last element).
+
+### Enums (Phase 2)
+
+An enum is a set of named integer constants:
+
+```lamo
+enum Color {
+    Red,
+    Green,
+    Blue
+}
+
+let c = Red
+print(c)                // 0
+print(c == Red)         // 1 (true)
+print(c != Blue)        // 1 (true)
+```
+
+- Variants are stored as `int` values (0, 1, 2, ...).
+- Variants are accessible by name at top level (no `Color::Red` qualifier needed).
+- Variant uniqueness within an enum is checked at compile time.
+
+### Match (Phase 2)
+
+`match` performs pattern matching on a value, dispatching to the first
+matching arm:
+
+```lamo
+enum Direction {
+    North,
+    South,
+    East,
+    West
+}
+
+let d = East
+match d {
+    North => print("going north"),
+    South => print("going south"),
+    East => print("going east"),
+    West => print("going west")
+}
+```
+
+- Patterns are enum variant names or `_` (wildcard, matches anything).
+- Arms are separated by `,` (or just newlines — both work).
+- Arm bodies can be a single statement or a block `{ ... }`.
+- A `_` arm is required for non-exhaustive matches; without it, the
+  compiler emits a warning if not all enum variants are covered.
+
+```lamo
+match color {
+    Red => print("red"),
+    _ => print("not red")
+}
+```
 
 ## Build And Run
 

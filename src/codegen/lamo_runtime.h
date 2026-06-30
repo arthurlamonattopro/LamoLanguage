@@ -48,7 +48,13 @@ typedef enum {
     LAMO_VALUE_FLOAT,
     LAMO_VALUE_STRING,
     LAMO_VALUE_BOOL,
-    LAMO_VALUE_ARRAY   /* Sprint 3: [1, 2, 3] — array of LamoValues */
+    LAMO_VALUE_ARRAY,  /* Sprint 3: [1, 2, 3] - array of LamoValues */
+    /* Phase 2: a struct value is stored as a LamoArray under the hood -
+     * field 0 is at items[0], field 1 at items[1], etc. We use a separate
+     * type tag so the printer can render it differently and so the
+     * semantic/codegen can tell struct-typed values from raw arrays at
+     * runtime (useful for debugging and for printing). */
+    LAMO_VALUE_STRUCT
 } LamoValueType;
 
 /* Sprint 3: forward-declare LamoArray so we can reference it from inside
@@ -127,11 +133,25 @@ static LAMO_UNUSED LamoValue lamo_make_string(const char* value) {
 
 /* Sprint 3: make an array value from an existing LamoArray pointer.
  * The LamoArray must already be heap-allocated (lamo_array_alloc).
- * The LamoValue does NOT take ownership — the arena tracks the array
+ * The LamoValue does NOT take ownership - the arena tracks the array
  * and frees it at exit. */
 static LAMO_UNUSED LamoValue lamo_make_array(LamoArray* array) {
     LamoValue result;
     result.type = LAMO_VALUE_ARRAY;
+    result.int_value = 0;
+    result.float_value = 0.0;
+    result.string_value = NULL;
+    result.array_value = array;
+    return result;
+}
+
+/* Phase 2: make a struct value. Structs reuse the LamoArray layout -
+ * each field occupies one slot in items[]. The distinct type tag lets
+ * the printer render `Player { name: "x", hp: 10 }` differently from
+ * `[ "x", 10 ]`, but the memory model is identical. */
+static LAMO_UNUSED LamoValue lamo_make_struct(LamoArray* array) {
+    LamoValue result;
+    result.type = LAMO_VALUE_STRUCT;
     result.int_value = 0;
     result.float_value = 0.0;
     result.string_value = NULL;
@@ -255,6 +275,44 @@ static LAMO_UNUSED char* lamo_value_to_owned_string(LamoValue value) {
         snprintf(buffer, sizeof(buffer), "%g", value.float_value);
         return lamo_heap_strdup(buffer);
     }
+    if (value.type == LAMO_VALUE_BOOL) {
+        return lamo_heap_strdup(value.int_value ? "true" : "false");
+    }
+    if (value.type == LAMO_VALUE_ARRAY || value.type == LAMO_VALUE_STRUCT) {
+        /* Recursively render the array/struct into a heap string. We
+         * build a temporary buffer, then strdup it. The capacity grows
+         * as needed. */
+        size_t cap = 64;
+        size_t len = 0;
+        char* out = (char*)malloc(cap);
+        if (!out) return lamo_heap_strdup("");
+        out[0] = '\0';
+        #define LAMO_APPEND_STR(s) do { \
+            size_t addlen = strlen(s); \
+            if (len + addlen + 1 > cap) { \
+                while (len + addlen + 1 > cap) cap *= 2; \
+                char* grown = (char*)realloc(out, cap); \
+                if (!grown) { free(out); return lamo_heap_strdup(""); } \
+                out = grown; \
+            } \
+            memcpy(out + len, s, addlen); \
+            len += addlen; \
+            out[len] = '\0'; \
+        } while (0)
+        LAMO_APPEND_STR(value.type == LAMO_VALUE_STRUCT ? "{ " : "[");
+        if (value.array_value) {
+            long long i;
+            for (i = 0; i < value.array_value->count; i++) {
+                if (i > 0) LAMO_APPEND_STR(", ");
+                char* elem = lamo_value_to_owned_string(value.array_value->items[i]);
+                LAMO_APPEND_STR(elem);
+                free(elem);
+            }
+        }
+        LAMO_APPEND_STR(value.type == LAMO_VALUE_STRUCT ? " }" : "]");
+        #undef LAMO_APPEND_STR
+        return out;
+    }
     snprintf(buffer, sizeof(buffer), "%lld", value.int_value);
     return lamo_heap_strdup(buffer);
 }
@@ -294,6 +352,11 @@ static LAMO_UNUSED int lamo_is_truthy(LamoValue value) {
         /* Sprint 3: arrays are truthy if non-empty. */
         return value.array_value != NULL && value.array_value->count > 0;
     }
+    if (value.type == LAMO_VALUE_STRUCT) {
+        /* Phase 2: a struct value is always truthy (even an empty one
+         * represents a constructed object). */
+        return value.array_value != NULL;
+    }
     return value.int_value != 0;
 }
 
@@ -319,6 +382,24 @@ static LAMO_UNUSED void lamo_print_value(LamoValue value) {
             }
         }
         printf("]\n");
+    } else if (value.type == LAMO_VALUE_STRUCT) {
+        /* Phase 2: print structs in `S { v0, v1, ... }` form. We don't
+         * know the struct's type name at runtime (that info lives in the
+         * compiler), so we just print the values. This matches what
+         * `print(player)` does for a Player{hp:10, name:"x"} - the user
+         * typically prints specific fields (`print(player.hp)`) rather
+         * than the whole struct. */
+        long long i;
+        printf("{ ");
+        if (value.array_value) {
+            for (i = 0; i < value.array_value->count; i++) {
+                if (i > 0) printf(", ");
+                char* text = lamo_value_to_owned_string(value.array_value->items[i]);
+                printf("%s", text);
+                free(text);
+            }
+        }
+        printf(" }\n");
     } else {
         printf("%lld\n", value.int_value);
     }
@@ -423,6 +504,83 @@ static LAMO_UNUSED LamoValue lamo_array_pop(LamoValue array_val) {
     }
     popped = array->items[--array->count];
     return popped;
+}
+
+/* Phase 2: array index assignment — `arr[i] = value`.
+ * Returns the assigned value (so it can be used in expressions, e.g.
+ * `let old = (arr[0] = 42);` though that's not idiomatic). */
+static LAMO_UNUSED LamoValue lamo_array_set(LamoValue array_val, long long index, LamoValue value) {
+    LamoArray* array;
+    if (array_val.type != LAMO_VALUE_ARRAY) {
+        lamo_runtime_type_error("expected array value for index assignment");
+    }
+    array = array_val.array_value;
+    if (!array) {
+        lamo_runtime_type_error("index-assign target array is NULL (internal error)");
+    }
+    if (index < 0) index += array->count;
+    if (index < 0 || index >= array->count) {
+        fprintf(stderr, "runtime error: array index %lld out of bounds in assignment (array length %lld)\n",
+                index, array->count);
+        exit(1);
+    }
+    array->items[index] = value;
+    return value;
+}
+
+/* Phase 2: struct helpers. Structs reuse LamoArray under the hood.
+ *
+ * lamo_struct_alloc(n) - create a struct value with n zero-initialized
+ *   fields (each slot is lamo_make_int(0)).
+ * lamo_struct_get(sval, i) - read field at index i (lamo_array_get works
+ *   too, but this function emits a clearer error message).
+ * lamo_struct_set(sval, i, value) - write field at index i. Returns the
+ *   assigned value (so it can be used in expressions). */
+static LAMO_UNUSED LamoValue lamo_struct_alloc(long long field_count) {
+    long long i;
+    LamoArray* array;
+    if (field_count < 0) field_count = 0;
+    array = lamo_array_alloc(field_count > 0 ? field_count : 4);
+    for (i = 0; i < field_count; i++) {
+        array->items[i] = lamo_make_int(0);
+    }
+    array->count = field_count;
+    return lamo_make_struct(array);
+}
+
+static LAMO_UNUSED LamoValue lamo_struct_get(LamoValue struct_val, long long index) {
+    LamoArray* array;
+    if (struct_val.type != LAMO_VALUE_STRUCT) {
+        lamo_runtime_type_error("expected struct value for field access");
+    }
+    array = struct_val.array_value;
+    if (!array) {
+        lamo_runtime_type_error("field access on NULL struct (internal error)");
+    }
+    if (index < 0 || index >= array->count) {
+        fprintf(stderr, "runtime error: struct field index %lld out of bounds (field count %lld)\n",
+                index, array->count);
+        exit(1);
+    }
+    return array->items[index];
+}
+
+static LAMO_UNUSED LamoValue lamo_struct_set(LamoValue struct_val, long long index, LamoValue value) {
+    LamoArray* array;
+    if (struct_val.type != LAMO_VALUE_STRUCT) {
+        lamo_runtime_type_error("expected struct value for field assignment");
+    }
+    array = struct_val.array_value;
+    if (!array) {
+        lamo_runtime_type_error("field-assign target struct is NULL (internal error)");
+    }
+    if (index < 0 || index >= array->count) {
+        fprintf(stderr, "runtime error: struct field index %lld out of bounds in assignment (field count %lld)\n",
+                index, array->count);
+        exit(1);
+    }
+    array->items[index] = value;
+    return value;
 }
 
 /* Operações aritméticas: se qualquer operando for float, resultado é float. */
@@ -530,6 +688,13 @@ static LAMO_UNUSED LamoValue lamo_greater_equal(LamoValue left, LamoValue right)
 }
 
 static LAMO_UNUSED LamoValue lamo_equal(LamoValue left, LamoValue right) {
+    /* Phase 2: arrays and structs compare by identity (same pointer).
+     * Deep equality would be expensive and surprising for mutable values. */
+    if (left.type == LAMO_VALUE_ARRAY || left.type == LAMO_VALUE_STRUCT ||
+        right.type == LAMO_VALUE_ARRAY || right.type == LAMO_VALUE_STRUCT) {
+        if (left.type != right.type) return lamo_make_bool(0);
+        return lamo_make_bool(left.array_value == right.array_value);
+    }
     if (left.type == LAMO_VALUE_STRING || right.type == LAMO_VALUE_STRING) {
         if (left.type != LAMO_VALUE_STRING || right.type != LAMO_VALUE_STRING) {
             return lamo_make_bool(0);

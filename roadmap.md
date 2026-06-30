@@ -162,10 +162,25 @@ Objective: make Lamo expressive enough for small real programs without outrunnin
 - Add each new construct only after semantics and backend support are designed.
 - Avoid growing syntax faster than diagnostics and tests.
 
+### Phase 2 (Language Expansion) — Delivered
+
+The following features were added in the Phase 2 sprint, each with full
+lexer → parser → AST → semantic → codegen → tests → docs coverage:
+
+- **Structs** — `struct Name { field: type, ... }` declaration, `Name { field: value, ... }` literals, `obj.field` access, `obj.field = value` assignment, `obj.field += value` compound assignment. Struct types are tracked in the semantic pass so field access is validated at compile time.
+- **Methods** — `impl Type { fn method(args) { self.field ... } }` with implicit `self`. Methods are mangled to `lamo_method_<Type>__<name>` at codegen time and take `self` as the first C parameter. Method arity is validated.
+- **Arrays** — `[1, 2, 3]` literals, `arr[i]` indexing (with negative-index support), `arr[i] = value` assignment, `arr.push(x)`, `arr.pop()`, `arr.len()` method-style calls (alongside the existing `len(arr)` / `push(arr, x)` / `pop(arr)` builtins).
+- **Enums** — `enum Name { Variant, ... }` declaration. Each variant becomes a global int constant (0, 1, 2, ...). Variants are accessible by name without qualification. Variant uniqueness within an enum is checked.
+- **Match** — `match scrutinee { Pattern => body, ... }` with enum-variant patterns and `_` wildcard. Desugars to an if/else chain at codegen. Exhaustiveness is checked when the scrutinee's enum type is known.
+- **Module system improvements** — bare-identifier imports (`import math` is sugar for `import "math.lamo" as math`) and `import math as m` aliasing. The existing string-path forms (`import "math.lamo";` and `import "math.lamo" as math;`) continue to work.
+- **Optional semicolons** — both `let x = 5;` and `let x = 5` are accepted. This makes the language feel lighter in method bodies and REPL one-liners while keeping backward compatibility.
+
 ### Exit Criteria
 
-- New language features feel consistent and are validated by the compiler.
-- The module system is part of the language, not just a loader convenience.
+- [x] New language features feel consistent and are validated by the compiler.
+- [x] The module system is part of the language, not just a loader convenience.
+- [x] Structs, methods, arrays, enums, and match each have positive and negative tests.
+- [x] Documentation (README) describes the new features with runnable examples.
 
 ## Phase 6: Tooling And Developer Experience
 

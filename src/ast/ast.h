@@ -42,7 +42,32 @@ typedef enum {
      * against the module registry kept in CompilationState; codegen emits
      * a call to lamo_mod_<alias>__<member_name>. Lives in both statement
      * and expression positions. */
-    AST_MEMBER_CALL
+    AST_MEMBER_CALL,
+    /* Phase 2: structs / methods / enums / match.
+     *
+     * AST_STRUCT_DECL    - `struct Name { field: type, ... }`
+     * AST_IMPL_DECL      - `impl Type { fn method(...) {...} ... }`
+     * AST_ENUM_DECL      - `enum Name { Variant, ... }`
+     * AST_MATCH_STMT     - `match expr { Pat => body, ... }`
+     * AST_STRUCT_LITERAL - `Name { field: value, ... }`
+     *
+     * Field access (no parens) reuses AST_PROP_EXPR so the existing
+     * `arr.len` shape keeps working. Method calls with parens reuse
+     * AST_MEMBER_CALL so the existing `module.fn(args)` shape keeps
+     * working - the semantic pass distinguishes module calls from
+     * value method calls by looking at the object's inferred type. */
+    AST_STRUCT_DECL,
+    AST_IMPL_DECL,
+    AST_ENUM_DECL,
+    AST_MATCH_STMT,
+    AST_STRUCT_LITERAL,
+    /* Phase 2: place-assignment statement - `arr[i] = value;` and
+     * `obj.field = value;`. `target` is an AST_INDEX_EXPR or AST_PROP_EXPR
+     * representing the lvalue, `value` is the RHS, `op_type` is `=`, `+=`,
+     * or `-=` (the latter two desugar to read-modify-write at codegen
+     * time). This avoids adding two separate node types for index-assign
+     * and field-assign since they share the same shape. */
+    AST_PLACE_ASSIGN_STMT
 } ASTNodeType;
 
 // Estrutura base para todos os nós da AST
@@ -57,6 +82,13 @@ typedef struct ASTNode {
     // (programa principal + imports). Pode ser NULL quando o nó é sintético
     // (ex.: nó criado pelo codegen sem passar pelo parser).
     const char* file_path;
+    /* Phase 2: optional struct-type annotation populated by the semantic
+     * pass and consumed by codegen. When non-NULL, this expression's
+     * inferred type is a struct with this name (borrowed pointer into the
+     * matching ASTStructDecl->name — NOT owned, NOT freed by ast_free).
+     * Used to resolve field access (AST_PROP_EXPR), method calls
+     * (AST_MEMBER_CALL on a struct value), and struct literals. */
+    const char* sema_struct_name;
 } ASTNode;
 
 typedef struct {
@@ -236,6 +268,77 @@ typedef struct {
     int arg_count;
 } ASTMemberCall;
 
+/* Phase 2: struct declaration.
+ *   struct Player { name: string; hp: int; level: int; }
+ * field_names[i] / field_types[i] are owned by the AST (strdup'd).
+ * field_types[i] may be NULL when the field has no annotation. */
+typedef struct {
+    ASTNode base;
+    char* name;
+    char** field_names;
+    char** field_types;
+    int field_count;
+} ASTStructDecl;
+
+/* Phase 2: impl block.
+ *   impl Player { fn damage(amount: int) { self.hp -= amount; } ... }
+ * struct_name is owned (strdup'd). methods is a linked list of AST_FN_DECL
+ * nodes (linked via ->next); we take ownership. */
+typedef struct {
+    ASTNode base;
+    char* struct_name;
+    struct ASTNode* methods;
+} ASTImplDecl;
+
+/* Phase 2: enum declaration.
+ *   enum Color { Red; Green; Blue; }
+ * variants[i] is owned (strdup'd). At runtime each variant is an int
+ * constant equal to its index. */
+typedef struct {
+    ASTNode base;
+    char* name;
+    char** variants;
+    int variant_count;
+} ASTEnumDecl;
+
+/* Phase 2: match statement.
+ *   match color { Red => print("red"); _ => print("other"); }
+ * patterns[i] is the variant name (or "_" for wildcard), strdup'd.
+ * pattern_is_wildcard[i] is 1 for "_", 0 otherwise.
+ * bodies[i] is a statement node (owned). */
+typedef struct {
+    ASTNode base;
+    struct ASTNode* scrutinee;
+    char** patterns;
+    int* pattern_is_wildcard;
+    struct ASTNode** bodies;
+    int arm_count;
+} ASTMatchStmt;
+
+/* Phase 2: struct literal.
+ *   Player { name: "Arthur"; hp: 100; level: 1; }
+ * struct_name is owned (strdup'd). field_names[i] / field_values[i]
+ * are owned; the AST frees them. */
+typedef struct {
+    ASTNode base;
+    char* struct_name;
+    char** field_names;
+    struct ASTNode** field_values;
+    int field_count;
+} ASTStructLiteral;
+
+/* Phase 2: place-assignment statement - `arr[i] = value;` or
+ * `obj.field = value;`. `target` is an AST_INDEX_EXPR or AST_PROP_EXPR
+ * representing the lvalue. `value` is the RHS. `op_type` is `=`, `+=`,
+ * or `-=`. For `+=`/`-=`, codegen desugars to read-modify-write using
+ * the appropriate getter/setter. */
+typedef struct {
+    ASTNode base;
+    struct ASTNode* target;   /* AST_INDEX_EXPR or AST_PROP_EXPR */
+    struct ASTNode* value;
+    LamoTokenType op_type;
+} ASTPlaceAssignStmt;
+
 typedef struct {
     ASTNode base;
     struct ASTNode* declarations;
@@ -287,6 +390,41 @@ ASTPropExpr* ast_new_prop_expr(ASTNode* object, char* prop_name, int line, int c
  * constructors as usual). `member_name` is strdup'd. `object` is owned
  * by the AST and freed in ast_free(). */
 ASTMemberCall* ast_new_member_call(ASTNode* object, char* member_name, ASTNode** args, int arg_count, int line, int column);
+
+/* ─── Phase 2: structs / methods / enums / match ──────────────────── */
+
+/* struct Name { field: type, ... }
+ * `field_names` and `field_types` are arrays of strings; we strdup each
+ * entry. field_types[i] may be NULL when no annotation is given for that
+ * field. The caller retains ownership of the input arrays. */
+ASTNode* ast_new_struct_decl(char* name, char** field_names, char** field_types, int field_count, int line, int column);
+
+/* impl Type { fn method(...) {...} ... } - `methods` is a linked list of
+ * AST_FN_DECL nodes (linked via ->next). The list is taken ownership of;
+ * the caller should NOT free it. struct_name is strdup'd. */
+ASTNode* ast_new_impl_decl(char* struct_name, ASTNode* methods, int line, int column);
+
+/* enum Name { Variant, ... } - `variants` is an array of strings, strdup'd
+ * here. The caller retains ownership of the input array. */
+ASTNode* ast_new_enum_decl(char* name, char** variants, int variant_count, int line, int column);
+
+/* match expr { Pat => body, ... }
+ * `patterns` is an array of strdup'd pattern names ("_" for wildcard).
+ * `pattern_is_wildcard` is an array of 0/1 (1 = wildcard "_").
+ * `bodies` is an array of ASTNode* (we take ownership). All arrays have
+ * arm_count entries. The caller retains ownership of the input arrays
+ * (we copy/stread what we need). */
+ASTNode* ast_new_match_stmt(ASTNode* scrutinee, char** patterns, int* pattern_is_wildcard, ASTNode** bodies, int arm_count, int line, int column);
+
+/* Struct literal: Name { field: value, ... }
+ * `field_names` and `field_values` are arrays of size field_count.
+ * field_names[i] is strdup'd. field_values[i] is owned by the AST. */
+ASTNode* ast_new_struct_literal(char* struct_name, char** field_names, ASTNode** field_values, int field_count, int line, int column);
+
+/* Place-assignment: `target op= value` where target is AST_INDEX_EXPR
+ * or AST_PROP_EXPR. The target and value nodes are owned by the AST. */
+ASTNode* ast_new_place_assign_stmt(ASTNode* target, ASTNode* value, LamoTokenType op_type, int line, int column);
+
 void ast_program_append(ASTProgram* destination, ASTProgram* source);
 
 void ast_free(ASTNode* node);

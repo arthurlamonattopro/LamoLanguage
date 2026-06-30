@@ -25,7 +25,13 @@ typedef enum {
     LAMO_TYPE_INT,
     LAMO_TYPE_FLOAT,
     LAMO_TYPE_STRING,
-    LAMO_TYPE_BOOL
+    LAMO_TYPE_BOOL,
+    /* Phase 2: composite types. ARRAY is the dynamic array type from
+     * Sprint 3; STRUCT is a user-defined struct. The struct's name is
+     * stored separately on the Symbol (struct_name field) since multiple
+     * distinct struct types exist. */
+    LAMO_TYPE_ARRAY,
+    LAMO_TYPE_STRUCT
 } LamoType;
 
 typedef enum {
@@ -49,6 +55,10 @@ typedef struct Symbol {
      * owned — it points into the AST node's file_path string which lives as
      * long as the ASTProgram. */
     const char* file_path;
+    /* Phase 2: when type == LAMO_TYPE_STRUCT, this is the struct's type
+     * name (e.g. "Player"). Borrowed pointer into the matching
+     * ASTStructDecl->name — NOT owned. NULL for non-struct symbols. */
+    const char* struct_name;
     struct Symbol* next;
 } Symbol;
 
@@ -93,6 +103,25 @@ typedef struct {
      * determined (no annotation, no inferrable body). */
     LamoType current_fn_return_type;
     const char* current_fn_name;   /* for error messages; may be NULL */
+    /* Phase 2: struct/enum/method registries.
+     *
+     * struct_defs: linked list of all AST_STRUCT_DECL nodes seen at top
+     *   level. Used to look up field indices for AST_STRUCT_LITERAL,
+     *   AST_PROP_EXPR (field access), AST_MEMBER_CALL (method call),
+     *   and AST_PLACE_ASSIGN_STMT (field assignment).
+     *
+     * enum_defs: linked list of all AST_ENUM_DECL nodes. Used to resolve
+     *   match-arm patterns and to register variant names as int constants.
+     *
+     * impl_defs: linked list of all AST_IMPL_DECL nodes. Used to look up
+     *   methods by struct name + method name. */
+    ASTNode* struct_defs;
+    ASTNode* enum_defs;
+    ASTNode* impl_defs;
+    /* Phase 2: when visiting an impl block, this is set to the struct
+     * name so that `self` references inside method bodies can be
+     * resolved. NULL outside of impl method bodies. */
+    const char* current_impl_struct;
 } SemanticContext;
 
 static void semantic_visit_statement(SemanticContext* ctx, ASTNode* node);
@@ -114,6 +143,8 @@ static const char* type_name(LamoType type) {
         case LAMO_TYPE_FLOAT:  return "float";
         case LAMO_TYPE_STRING: return "string";
         case LAMO_TYPE_BOOL:   return "bool";
+        case LAMO_TYPE_ARRAY:  return "array";
+        case LAMO_TYPE_STRUCT: return "struct";
         case LAMO_TYPE_UNKNOWN: return "unknown";
     }
     return "unknown";
@@ -256,8 +287,101 @@ static void scope_define(SemanticContext* ctx, Scope* scope, const char* name, S
     symbol->line = line;
     symbol->column = column;
     symbol->file_path = file_path;
+    symbol->struct_name = NULL;  /* Phase 2: set by callers via scope_define_struct */
     symbol->next = scope->symbols;
     scope->symbols = symbol;
+}
+
+/* Phase 2: define a variable with a known struct type. The struct_name
+ * is borrowed from the ASTStructDecl->name (NOT owned). */
+static void scope_define_struct_var(SemanticContext* ctx, Scope* scope, const char* name, const char* struct_name, int line, int column, const char* file_path) {
+    scope_define(ctx, scope, name, SYMBOL_VAR, 0, LAMO_TYPE_STRUCT, line, column, file_path);
+    Symbol* sym = scope_find_in_current(scope, name);
+    if (sym) sym->struct_name = struct_name;
+}
+
+/* ─── Phase 2: struct / enum / method lookup helpers ───────────────── */
+
+/* Find a struct definition by name. Returns NULL if not found. */
+static ASTStructDecl* find_struct_def(SemanticContext* ctx, const char* name) {
+    ASTNode* cur;
+    if (!name) return NULL;
+    for (cur = ctx->struct_defs; cur; cur = cur->next) {
+        if (cur->type == AST_STRUCT_DECL) {
+            ASTStructDecl* sd = (ASTStructDecl*)cur;
+            if (sd->name && strcmp(sd->name, name) == 0) return sd;
+        }
+    }
+    return NULL;
+}
+
+/* Find the index of a field in a struct. Returns -1 if not found. */
+static int struct_field_index(ASTStructDecl* sd, const char* field_name) {
+    int i;
+    if (!sd || !field_name) return -1;
+    for (i = 0; i < sd->field_count; i++) {
+        if (sd->field_names[i] && strcmp(sd->field_names[i], field_name) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* Find an enum definition by name. Returns NULL if not found. */
+static ASTEnumDecl* find_enum_def(SemanticContext* ctx, const char* name) {
+    ASTNode* cur;
+    if (!name) return NULL;
+    for (cur = ctx->enum_defs; cur; cur = cur->next) {
+        if (cur->type == AST_ENUM_DECL) {
+            ASTEnumDecl* ed = (ASTEnumDecl*)cur;
+            if (ed->name && strcmp(ed->name, name) == 0) return ed;
+        }
+    }
+    return NULL;
+}
+
+/* Find an enum variant by name across all registered enums. Returns the
+ * variant's index (>= 0) via *out_index, and the enum's name via the
+ * return value (borrowed pointer). Returns NULL if not found. */
+static const char* find_enum_variant_any(SemanticContext* ctx, const char* variant_name, int* out_index) {
+    ASTNode* cur;
+    if (!variant_name) return NULL;
+    for (cur = ctx->enum_defs; cur; cur = cur->next) {
+        if (cur->type == AST_ENUM_DECL) {
+            ASTEnumDecl* ed = (ASTEnumDecl*)cur;
+            int i;
+            for (i = 0; i < ed->variant_count; i++) {
+                if (ed->variants[i] && strcmp(ed->variants[i], variant_name) == 0) {
+                    if (out_index) *out_index = i;
+                    return ed->name;
+                }
+            }
+        }
+    }
+    return NULL;
+}
+
+/* Find a method on a struct by name. Returns the AST_FN_DECL node, or
+ * NULL if not found. Searches all impl blocks for the given struct. */
+static ASTFnDecl* find_method(SemanticContext* ctx, const char* struct_name, const char* method_name) {
+    ASTNode* cur;
+    if (!struct_name || !method_name) return NULL;
+    for (cur = ctx->impl_defs; cur; cur = cur->next) {
+        if (cur->type == AST_IMPL_DECL) {
+            ASTImplDecl* id = (ASTImplDecl*)cur;
+            if (id->struct_name && strcmp(id->struct_name, struct_name) == 0) {
+                for (ASTNode* m = id->methods; m; m = m->next) {
+                    if (m->type == AST_FN_DECL) {
+                        ASTFnDecl* fn = (ASTFnDecl*)m;
+                        if (fn->name && strcmp(fn->name, method_name) == 0) {
+                            return fn;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return NULL;
 }
 
 static void semantic_visit_block(SemanticContext* ctx, ASTBlock* block) {
@@ -398,14 +522,28 @@ static void semantic_check_numeric_operand(SemanticContext* ctx, const char* op_
 
 /* Sprint 3: map a type-annotation string ("int", "float", "string", "bool")
  * to the internal LamoType enum. Returns LAMO_TYPE_UNKNOWN for unknown
- * names so the caller can emit a single clear error. */
-static LamoType annotation_to_type(const char* annotation) {
+ * names so the caller can emit a single clear error.
+ *
+ * Phase 2: also recognizes user-defined struct names. Since structs are
+ * registered during the first pre-pass, we can resolve struct-name
+ * annotations here. We pass the SemanticContext so we can look up the
+ * struct registry. */
+static LamoType annotation_to_type_with_ctx(SemanticContext* ctx, const char* annotation) {
     if (!annotation) return LAMO_TYPE_UNKNOWN;
     if (strcmp(annotation, "int") == 0) return LAMO_TYPE_INT;
     if (strcmp(annotation, "float") == 0) return LAMO_TYPE_FLOAT;
     if (strcmp(annotation, "string") == 0) return LAMO_TYPE_STRING;
     if (strcmp(annotation, "bool") == 0) return LAMO_TYPE_BOOL;
+    if (strcmp(annotation, "array") == 0) return LAMO_TYPE_ARRAY;
+    /* Phase 2: struct-name annotation. */
+    if (ctx && find_struct_def(ctx, annotation)) return LAMO_TYPE_STRUCT;
     return LAMO_TYPE_UNKNOWN;
+}
+
+/* Legacy wrapper that doesn't take a context — kept for compatibility with
+ * any callers that don't have a SemanticContext. Loses struct-name resolution. */
+static LamoType annotation_to_type(const char* annotation) {
+    return annotation_to_type_with_ctx(NULL, annotation);
 }
 
 /* Infer the return type of a function body by scanning all direct
@@ -499,19 +637,49 @@ static void semantic_visit_statement(SemanticContext* ctx, ASTNode* node) {
         case AST_VAR_DECL: {
             ASTVarDecl* var_decl = (ASTVarDecl*)node;
             LamoType init_type = semantic_infer_expression(ctx, var_decl->initializer);
+            const char* inferred_struct_name = NULL;
+            /* If the initializer is a struct literal, infer the struct name
+             * from the literal itself. This lets `let p = Player {...};`
+             * work without requiring a `: Player` annotation. */
+            if (var_decl->initializer && var_decl->initializer->type == AST_STRUCT_LITERAL) {
+                ASTStructLiteral* sl = (ASTStructLiteral*)var_decl->initializer;
+                if (find_struct_def(ctx, sl->struct_name)) {
+                    inferred_struct_name = sl->struct_name;
+                    init_type = LAMO_TYPE_STRUCT;
+                }
+            }
+            /* If the initializer is an array literal, infer LAMO_TYPE_ARRAY. */
+            if (var_decl->initializer && var_decl->initializer->type == AST_ARRAY_LITERAL) {
+                init_type = LAMO_TYPE_ARRAY;
+            }
             /* Sprint 3: validate type annotation if present. The check is
              * strict: int != float (annotated int with float initializer
              * is an error), and string/bool are entirely separate. The
              * one relaxation: UNKNOWN initializer type (e.g. from a
              * previous error) is accepted to avoid cascading errors. */
+            const char* annotated_struct_name = NULL;
             if (var_decl->type_annotation) {
-                LamoType annotated = annotation_to_type(var_decl->type_annotation);
+                LamoType annotated = annotation_to_type_with_ctx(ctx, var_decl->type_annotation);
                 if (annotated == LAMO_TYPE_UNKNOWN) {
                     char message[256];
                     snprintf(message, sizeof(message),
-                             "unknown type annotation '%s' (expected int, float, string, or bool)",
+                             "unknown type annotation '%s' (expected int, float, string, bool, array, or a struct name)",
                              var_decl->type_annotation);
                     semantic_error_at(ctx, node->line, node->column, message);
+                } else if (annotated == LAMO_TYPE_STRUCT) {
+                    /* The annotation is a struct name; remember it so we
+                     * can define the variable with the struct type. */
+                    annotated_struct_name = var_decl->type_annotation;
+                    /* If the initializer is also a struct literal, validate
+                     * the struct names match. */
+                    if (inferred_struct_name && strcmp(inferred_struct_name, annotated_struct_name) != 0) {
+                        char message[256];
+                        snprintf(message, sizeof(message),
+                                 "type annotation '%s' does not match struct literal '%s'",
+                                 annotated_struct_name, inferred_struct_name);
+                        semantic_error_at(ctx, node->line, node->column, message);
+                    }
+                    init_type = LAMO_TYPE_STRUCT;
                 } else if (init_type != LAMO_TYPE_UNKNOWN && init_type != annotated) {
                     /* Allow int initializer for float annotation (numeric
                      * widening) and float initializer for int annotation
@@ -527,11 +695,24 @@ static void semantic_visit_statement(SemanticContext* ctx, ASTNode* node) {
                                  var_decl->type_annotation, type_name(init_type));
                         semantic_error_at(ctx, node->line, node->column, message);
                     }
+                    init_type = annotated;
+                } else {
+                    init_type = annotated;
                 }
-                /* Use the annotated type for downstream inference. */
-                init_type = annotated;
             }
-            scope_define(ctx, ctx->current_scope, var_decl->name, SYMBOL_VAR, 0, init_type, node->line, node->column, node->file_path);
+            /* Phase 2: if the variable has a struct type (either from
+             * annotation or inferred from a struct literal), define it
+             * with the struct name so field access can be validated. */
+            if (init_type == LAMO_TYPE_STRUCT) {
+                const char* sn = annotated_struct_name ? annotated_struct_name : inferred_struct_name;
+                if (sn) {
+                    scope_define_struct_var(ctx, ctx->current_scope, var_decl->name, sn, node->line, node->column, node->file_path);
+                } else {
+                    scope_define(ctx, ctx->current_scope, var_decl->name, SYMBOL_VAR, 0, init_type, node->line, node->column, node->file_path);
+                }
+            } else {
+                scope_define(ctx, ctx->current_scope, var_decl->name, SYMBOL_VAR, 0, init_type, node->line, node->column, node->file_path);
+            }
             break;
         }
         case AST_FN_DECL: {
@@ -548,19 +729,39 @@ static void semantic_visit_statement(SemanticContext* ctx, ASTNode* node) {
                 /* Sprint 3: if the parameter has a type annotation, use
                  * it as the inferred type; otherwise leave UNKNOWN so
                  * the caller's argument type flows in unchanged. We also
-                 * validate that the annotation is a known type name. */
+                 * validate that the annotation is a known type name.
+                 *
+                 * Phase 2: also recognize struct-name annotations, so a
+                 * function can declare `fn heal(p: Player) { ... }` and
+                 * access `p.hp` inside the body. */
                 LamoType param_type = LAMO_TYPE_UNKNOWN;
+                const char* param_struct_name = NULL;
                 if (fn_decl->param_types && fn_decl->param_types[i]) {
-                    param_type = annotation_to_type(fn_decl->param_types[i]);
+                    param_type = annotation_to_type_with_ctx(ctx, fn_decl->param_types[i]);
                     if (param_type == LAMO_TYPE_UNKNOWN) {
                         char message[256];
                         snprintf(message, sizeof(message),
-                                 "unknown type annotation '%s' on parameter '%s' (expected int, float, string, or bool)",
+                                 "unknown type annotation '%s' on parameter '%s' (expected int, float, string, bool, array, or a struct name)",
                                  fn_decl->param_types[i], fn_decl->params[i]);
                         semantic_error_at(ctx, node->line, node->column, message);
+                    } else if (param_type == LAMO_TYPE_STRUCT) {
+                        param_struct_name = fn_decl->param_types[i];
                     }
                 }
-                scope_define(ctx, ctx->current_scope, fn_decl->params[i], SYMBOL_VAR, 0, param_type, node->line, node->column, node->file_path);
+                if (param_type == LAMO_TYPE_STRUCT && param_struct_name) {
+                    scope_define_struct_var(ctx, ctx->current_scope, fn_decl->params[i], param_struct_name, node->line, node->column, node->file_path);
+                } else {
+                    scope_define(ctx, ctx->current_scope, fn_decl->params[i], SYMBOL_VAR, 0, param_type, node->line, node->column, node->file_path);
+                }
+            }
+
+            /* Phase 2: if we're inside an impl block, define `self` as a
+             * struct-typed variable so the method body can reference it.
+             * Methods in Lamo don't declare `self` as a parameter (it's
+             * implicit), so we add it to the local scope here. The codegen
+             * emits `self` as the first parameter of the underlying C function. */
+            if (ctx->current_impl_struct) {
+                scope_define_struct_var(ctx, ctx->current_scope, "self", ctx->current_impl_struct, node->line, node->column, node->file_path);
             }
 
             /* Look up the symbol we registered for this function so we can
@@ -803,7 +1004,12 @@ static void semantic_visit_statement(SemanticContext* ctx, ASTNode* node) {
             /* Sprint 4: `module.member(args);` statement. Resolve the
              * alias against the module registry, validate the member
              * exists, and validate call arity. The args are visited for
-             * type errors just like a regular call. */
+             * type errors just like a regular call.
+             *
+             * Phase 2: AST_MEMBER_CALL is also used for value method
+             * calls like `arr.push(x)` and `player.damage(10)`. The
+             * semantic_infer_expression function dispatches based on the
+             * object's inferred type. */
             ASTMemberCall* mc = (ASTMemberCall*)node;
             semantic_infer_expression(ctx, (ASTNode*)mc);  /* reuse the expression-path logic */
             break;
@@ -812,6 +1018,165 @@ static void semantic_visit_statement(SemanticContext* ctx, ASTNode* node) {
             // import é resolvido pelo loader antes da análise semântica; nada a
             // validar aqui além da estrutura.
             break;
+        /* ─── Phase 2: struct / impl / enum / match / place-assign ────── */
+        case AST_STRUCT_DECL: {
+            /* Already registered during the pre-pass; nothing to visit.
+             * We could validate field types here, but the type names are
+             * already validated lazily when variables are declared with
+             * those types. */
+            break;
+        }
+        case AST_IMPL_DECL: {
+            ASTImplDecl* id = (ASTImplDecl*)node;
+            /* Validate the struct exists. */
+            if (!find_struct_def(ctx, id->struct_name)) {
+                char message[256];
+                snprintf(message, sizeof(message),
+                         "impl for unknown struct '%s' (declare it with `struct %s { ... }` first)",
+                         id->struct_name, id->struct_name);
+                semantic_error_at(ctx, node->line, node->column, message);
+                break;
+            }
+            /* Set the current impl struct so method bodies can use `self`.
+             * Mark each method's AST node with sema_struct_name so codegen
+             * knows to (a) emit it with the mangled name `lamo_method_<Type>__<name>`
+             * and (b) prepend `self` as the first parameter. We do NOT
+             * mangle fn->name in-place — that would break find_method,
+             * which looks up methods by their original name. */
+            const char* prev_impl = ctx->current_impl_struct;
+            ctx->current_impl_struct = id->struct_name;
+            for (ASTNode* m = id->methods; m; m = m->next) {
+                if (m->type == AST_FN_DECL) {
+                    m->sema_struct_name = id->struct_name;
+                    semantic_visit_statement(ctx, m);
+                }
+            }
+            ctx->current_impl_struct = prev_impl;
+            break;
+        }
+        case AST_ENUM_DECL: {
+            /* Already registered during the pre-pass. Validate variant
+             * names are unique within the enum. */
+            ASTEnumDecl* ed = (ASTEnumDecl*)node;
+            for (int i = 0; i < ed->variant_count; i++) {
+                for (int j = i + 1; j < ed->variant_count; j++) {
+                    if (strcmp(ed->variants[i], ed->variants[j]) == 0) {
+                        char message[256];
+                        snprintf(message, sizeof(message),
+                                 "duplicate variant '%s' in enum '%s'",
+                                 ed->variants[i], ed->name);
+                        semantic_error_at(ctx, node->line, node->column, message);
+                    }
+                }
+            }
+            break;
+        }
+        case AST_MATCH_STMT: {
+            ASTMatchStmt* ms = (ASTMatchStmt*)node;
+            LamoType scrut_type = semantic_infer_expression(ctx, ms->scrutinee);
+            /* Validate each arm's pattern. Patterns can be:
+             *   - "_" (wildcard) - always matches
+             *   - Identifier that names an enum variant
+             *   - Integer literal (not yet supported - future work)
+             * We check that named patterns correspond to a registered
+             * enum variant. Exhaustiveness is checked below. */
+            int has_wildcard = 0;
+            int total_variants = -1;
+            const char* scrut_enum_name = NULL;
+            /* If the scrutinee's type is known to be an enum (we'd need
+             * to track enum types on Symbols, which we don't currently
+             * do for variables - only struct types are tracked). For now,
+             * we accept any patterns and check exhaustiveness only when
+             * all variants of some enum are listed (heuristic). */
+            for (int i = 0; i < ms->arm_count; i++) {
+                if (ms->pattern_is_wildcard[i]) {
+                    has_wildcard = 1;
+                } else {
+                    int vidx = -1;
+                    const char* ename = find_enum_variant_any(ctx, ms->patterns[i], &vidx);
+                    if (!ename) {
+                        char message[256];
+                        snprintf(message, sizeof(message),
+                                 "match pattern '%s' is not a known enum variant (declare an `enum { ... }` first, or use '_' for wildcard)",
+                                 ms->patterns[i]);
+                        semantic_error_at(ctx, node->line, node->column, message);
+                    } else {
+                        /* Track the enum we're matching against. */
+                        if (scrut_enum_name == NULL) {
+                            scrut_enum_name = ename;
+                            total_variants = ((ASTEnumDecl*)find_enum_def(ctx, ename))->variant_count;
+                        } else if (strcmp(scrut_enum_name, ename) != 0) {
+                            char message[256];
+                            snprintf(message, sizeof(message),
+                                     "match arm pattern '%s' belongs to enum '%s', but earlier arms matched enum '%s'",
+                                     ms->patterns[i], ename, scrut_enum_name);
+                            semantic_error_at(ctx, node->line, node->column, message);
+                        }
+                    }
+                }
+                /* Visit the arm body. */
+                if (ms->bodies[i]) {
+                    semantic_visit_statement(ctx, ms->bodies[i]);
+                }
+            }
+            /* Exhaustiveness check: if we know the enum (total_variants > 0)
+             * and there's no wildcard, count unique variants. If the count
+             * is less than total_variants, warn (but don't error - the user
+             * might intentionally not handle all cases). */
+            if (!has_wildcard && total_variants > 0) {
+                /* Count unique variant names among the patterns. */
+                int unique = 0;
+                for (int i = 0; i < ms->arm_count; i++) {
+                    if (ms->pattern_is_wildcard[i]) continue;
+                    int dup = 0;
+                    for (int j = 0; j < i; j++) {
+                        if (strcmp(ms->patterns[i], ms->patterns[j]) == 0) {
+                            dup = 1; break;
+                        }
+                    }
+                    if (!dup) unique++;
+                }
+                if (unique < total_variants) {
+                    /* Emit a warning (not an error - Lamo doesn't have a
+                     * separate warning channel, so we use stderr directly). */
+                    char message[256];
+                    snprintf(message, sizeof(message),
+                             "warning: match on enum '%s' is not exhaustive (%d of %d variants covered; add a '_' arm or cover the rest)",
+                             scrut_enum_name, unique, total_variants);
+                    semantic_error_at(ctx, node->line, node->column, message);
+                } else if (unique > total_variants) {
+                    /* Duplicate variant - already checked above per-enum. */
+                }
+            }
+            (void)scrut_type;
+            break;
+        }
+        case AST_PLACE_ASSIGN_STMT: {
+            ASTPlaceAssignStmt* pa = (ASTPlaceAssignStmt*)node;
+            /* Validate the target is AST_INDEX_EXPR or AST_PROP_EXPR. */
+            if (!pa->target) break;
+            if (pa->target->type == AST_INDEX_EXPR) {
+                ASTIndexExpr* ie = (ASTIndexExpr*)pa->target;
+                /* The object should be array-typed. We infer its type to
+                 * validate, but the codegen will emit lamo_array_set. */
+                semantic_infer_expression(ctx, ie->array);
+                semantic_infer_expression(ctx, ie->index);
+                LamoType value_type = semantic_infer_expression(ctx, pa->value);
+                (void)value_type;
+            } else if (pa->target->type == AST_PROP_EXPR) {
+                ASTPropExpr* pe = (ASTPropExpr*)pa->target;
+                /* The object should be struct-typed; the field name must
+                 * exist. semantic_infer_expression on a AST_PROP_EXPR
+                 * already does this validation. */
+                semantic_infer_expression(ctx, (ASTNode*)pe);
+                LamoType value_type = semantic_infer_expression(ctx, pa->value);
+                (void)value_type;
+            } else {
+                semantic_error_at(ctx, node->line, node->column,
+                                  "invalid assignment target (expected arr[i] or obj.field)");
+            }
+            break;
+        }
         default:
             break;
     }
@@ -942,65 +1307,274 @@ static LamoType semantic_infer_expression(SemanticContext* ctx, ASTNode* node) {
              * body is the prefixed function, and we don't have a cheap
              * way to look up its inferred return type from here. The
              * type-inference downstream will simply treat the result as
-             * unknown, which is safe (no cascading errors). */
+             * unknown, which is safe (no cascading errors).
+             *
+             * Phase 2: AST_MEMBER_CALL is now also used for value method
+             * calls — `arr.push(x)`, `arr.len()`, `player.damage(10)`.
+             * The dispatch:
+             *   - If the object is an identifier that matches a registered
+             *     module alias, it's a module call (existing behavior).
+             *   - Else if the object is an identifier that resolves to an
+             *     array-typed variable, it's an array method call.
+             *   - Else if the object is an identifier that resolves to a
+             *     struct-typed variable, it's a struct method call.
+             *   - Else: error. */
             ASTMemberCall* mc = (ASTMemberCall*)node;
             const char* alias = NULL;
-            /* Object should be AST_IDENTIFIER for a module member call.
-             * Anything else (e.g. `arr.len()` where arr is an expression)
-             * is not currently supported — emit a clear error. */
-            if (!mc->object || mc->object->type != AST_IDENTIFIER) {
+            if (!mc->object) {
                 semantic_error_at(ctx, node->line, node->column,
-                                  "member call on non-identifier is not supported (only `module.fn(args)`)");
-                /* Still visit args for cascading errors. */
+                                  "member call missing object expression");
+                return LAMO_TYPE_UNKNOWN;
+            }
+            /* If the object is an identifier, try module-alias resolution
+             * first (Sprint 4 behavior). */
+            if (mc->object->type == AST_IDENTIFIER) {
+                alias = ((ASTIdentifier*)mc->object)->name;
+                if (ctx->module_resolve && ctx->module_resolve(alias, mc->member_name, ctx->module_user_data)) {
+                    /* It's a module call. Validate arity and visit args. */
+                    if (!ctx->module_arity) {
+                        for (int i = 0; i < mc->arg_count; i++) {
+                            semantic_infer_expression(ctx, mc->args[i]);
+                        }
+                        return LAMO_TYPE_UNKNOWN;
+                    }
+                    int expected_arity = ctx->module_arity(alias, mc->member_name, ctx->module_user_data);
+                    if (expected_arity >= 0 && expected_arity != mc->arg_count) {
+                        char message[256];
+                        snprintf(message, sizeof(message),
+                                 "module member `%s.%s` expects %d argument(s), got %d",
+                                 alias, mc->member_name, expected_arity, mc->arg_count);
+                        semantic_error_at(ctx, node->line, node->column, message);
+                    }
+                    for (int i = 0; i < mc->arg_count; i++) {
+                        semantic_infer_expression(ctx, mc->args[i]);
+                    }
+                    return LAMO_TYPE_UNKNOWN;
+                }
+                /* Not a module alias; fall through to value-method-call. */
+            }
+            /* Phase 2: value method call. Infer the object's type. */
+            LamoType obj_type = semantic_infer_expression(ctx, mc->object);
+            const char* obj_struct_name = NULL;
+            if (mc->object->type == AST_IDENTIFIER) {
+                Symbol* sym = scope_find(ctx->current_scope, ((ASTIdentifier*)mc->object)->name);
+                if (sym && sym->kind == SYMBOL_VAR) {
+                    obj_struct_name = sym->struct_name;
+                }
+            }
+            if (obj_type == LAMO_TYPE_ARRAY || (obj_type == LAMO_TYPE_UNKNOWN && !obj_struct_name)) {
+                /* Array method call: .push, .pop, .len. */
+                if (strcmp(mc->member_name, "push") == 0) {
+                    if (mc->arg_count != 1) {
+                        char message[256];
+                        snprintf(message, sizeof(message),
+                                 "array method `push` expects 1 argument, got %d", mc->arg_count);
+                        semantic_error_at(ctx, node->line, node->column, message);
+                    }
+                } else if (strcmp(mc->member_name, "pop") == 0) {
+                    if (mc->arg_count != 0) {
+                        char message[256];
+                        snprintf(message, sizeof(message),
+                                 "array method `pop` expects 0 arguments, got %d", mc->arg_count);
+                        semantic_error_at(ctx, node->line, node->column, message);
+                    }
+                } else if (strcmp(mc->member_name, "len") == 0) {
+                    if (mc->arg_count != 0) {
+                        char message[256];
+                        snprintf(message, sizeof(message),
+                                 "array method `len` expects 0 arguments, got %d", mc->arg_count);
+                        semantic_error_at(ctx, node->line, node->column, message);
+                    }
+                } else {
+                    char message[256];
+                    snprintf(message, sizeof(message),
+                             "arrays have no method '%s' (valid: push, pop, len)",
+                             mc->member_name);
+                    semantic_error_at(ctx, node->line, node->column, message);
+                }
+                /* Visit args. */
                 for (int i = 0; i < mc->arg_count; i++) {
                     semantic_infer_expression(ctx, mc->args[i]);
                 }
+                /* Return type: push/pop return int (or the popped value's
+                 * type for pop, but we conservatively say UNKNOWN); len
+                 * returns int. */
+                if (strcmp(mc->member_name, "len") == 0) return LAMO_TYPE_INT;
                 return LAMO_TYPE_UNKNOWN;
             }
-            alias = ((ASTIdentifier*)mc->object)->name;
-
-            if (!ctx->module_resolve || !ctx->module_arity) {
-                semantic_error_at(ctx, node->line, node->column,
-                                  "module resolution not available in this context (are you running through the REPL?)");
+            if (obj_type == LAMO_TYPE_STRUCT && obj_struct_name) {
+                /* Struct method call. */
+                ASTFnDecl* method = find_method(ctx, obj_struct_name, mc->member_name);
+                if (!method) {
+                    char message[256];
+                    snprintf(message, sizeof(message),
+                             "struct '%s' has no method '%s'",
+                             obj_struct_name, mc->member_name);
+                    semantic_error_at(ctx, node->line, node->column, message);
+                } else {
+                    /* Validate arity: method's param_count + 1 (for self)
+                     * should equal arg_count + 1 = the actual number of
+                     * values we'll pass (self + args). So args should
+                     * equal method->param_count. */
+                    if (method->param_count != mc->arg_count) {
+                        char message[256];
+                        snprintf(message, sizeof(message),
+                                 "method '%s.%s' expects %d argument(s), got %d",
+                                 obj_struct_name, mc->member_name, method->param_count, mc->arg_count);
+                        semantic_error_at(ctx, node->line, node->column, message);
+                    }
+                }
+                /* Annotate the AST node so codegen knows the struct type. */
+                node->sema_struct_name = obj_struct_name;
+                /* Also annotate the object identifier for codegen. */
+                mc->object->sema_struct_name = obj_struct_name;
                 for (int i = 0; i < mc->arg_count; i++) {
                     semantic_infer_expression(ctx, mc->args[i]);
                 }
-                return LAMO_TYPE_UNKNOWN;
+                return LAMO_TYPE_UNKNOWN;  /* method return type unknown */
             }
-
-            const char* resolved = ctx->module_resolve(alias, mc->member_name, ctx->module_user_data);
-            if (!resolved) {
-                /* Either the alias doesn't exist, or the member doesn't
-                 * exist under that alias. Emit a helpful error. */
+            /* Object is not array, not struct, not module. */
+            {
                 char message[256];
                 snprintf(message, sizeof(message),
-                         "module `%s` has no member `%s` (or module `%s` was not imported)",
-                         alias, mc->member_name, alias);
+                         "cannot call method '%s' on value of type '%s' (only arrays and structs have methods)",
+                         mc->member_name, type_name(obj_type));
                 semantic_error_at(ctx, node->line, node->column, message);
                 for (int i = 0; i < mc->arg_count; i++) {
                     semantic_infer_expression(ctx, mc->args[i]);
                 }
                 return LAMO_TYPE_UNKNOWN;
             }
-
-            /* Validate arity. */
-            int expected_arity = ctx->module_arity(alias, mc->member_name, ctx->module_user_data);
-            if (expected_arity >= 0 && expected_arity != mc->arg_count) {
-                char message[256];
-                snprintf(message, sizeof(message),
-                         "module member `%s.%s` expects %d argument(s), got %d",
-                         alias, mc->member_name, expected_arity, mc->arg_count);
-                semantic_error_at(ctx, node->line, node->column, message);
-            }
-
-            /* Visit args for type errors. */
-            for (int i = 0; i < mc->arg_count; i++) {
-                semantic_infer_expression(ctx, mc->args[i]);
-            }
-            return LAMO_TYPE_UNKNOWN;
         }
         case AST_GROUPING_EXPR:
             return semantic_infer_expression(ctx, ((ASTGroupingExpr*)node)->expression);
+        /* ─── Phase 2: composite expression types ───────────────────── */
+        case AST_ARRAY_LITERAL: {
+            ASTArrayLiteral* arr = (ASTArrayLiteral*)node;
+            for (int i = 0; i < arr->element_count; i++) {
+                semantic_infer_expression(ctx, arr->elements[i]);
+            }
+            return LAMO_TYPE_ARRAY;
+        }
+        case AST_INDEX_EXPR: {
+            ASTIndexExpr* ie = (ASTIndexExpr*)node;
+            LamoType arr_type = semantic_infer_expression(ctx, ie->array);
+            semantic_infer_expression(ctx, ie->index);
+            /* If the array is a struct, indexing doesn't make sense. */
+            if (arr_type == LAMO_TYPE_STRUCT) {
+                semantic_error_at(ctx, node->line, node->column,
+                                  "cannot index into a struct value (use .field access instead)");
+            }
+            /* Indexing an array returns the element type, which we can't
+             * know statically (arrays are heterogeneous). Return UNKNOWN. */
+            return LAMO_TYPE_UNKNOWN;
+        }
+        case AST_PROP_EXPR: {
+            ASTPropExpr* pe = (ASTPropExpr*)node;
+            LamoType obj_type = semantic_infer_expression(ctx, pe->object);
+            const char* obj_struct_name = NULL;
+            if (pe->object->type == AST_IDENTIFIER) {
+                Symbol* sym = scope_find(ctx->current_scope, ((ASTIdentifier*)pe->object)->name);
+                if (sym && sym->kind == SYMBOL_VAR) {
+                    obj_struct_name = sym->struct_name;
+                }
+            }
+            /* Case 1: array.len (existing behavior). */
+            if (obj_type == LAMO_TYPE_ARRAY || (obj_type == LAMO_TYPE_UNKNOWN && !obj_struct_name)) {
+                if (strcmp(pe->prop_name, "len") == 0) {
+                    return LAMO_TYPE_INT;
+                }
+                /* Unknown property on an array/unknown-typed value. If the
+                 * object is unknown, don't error (could be a module alias
+                 * that's checked elsewhere). If it's an array, error. */
+                if (obj_type == LAMO_TYPE_ARRAY) {
+                    char message[256];
+                    snprintf(message, sizeof(message),
+                             "arrays have no property '%s' (did you mean .len?)",
+                             pe->prop_name);
+                    semantic_error_at(ctx, node->line, node->column, message);
+                }
+                return LAMO_TYPE_UNKNOWN;
+            }
+            /* Case 2: struct field access. */
+            if (obj_type == LAMO_TYPE_STRUCT && obj_struct_name) {
+                ASTStructDecl* sd = find_struct_def(ctx, obj_struct_name);
+                int idx = struct_field_index(sd, pe->prop_name);
+                if (idx < 0) {
+                    char message[256];
+                    snprintf(message, sizeof(message),
+                             "struct '%s' has no field '%s'",
+                             obj_struct_name, pe->prop_name);
+                    semantic_error_at(ctx, node->line, node->column, message);
+                }
+                /* Annotate the AST node so codegen knows the struct type
+                 * and can look up the field index. */
+                node->sema_struct_name = obj_struct_name;
+                pe->object->sema_struct_name = obj_struct_name;
+                /* Field type is UNKNOWN (we don't track per-field types
+                 * yet). Return UNKNOWN. */
+                return LAMO_TYPE_UNKNOWN;
+            }
+            /* Object is a string, int, etc. - no properties. */
+            {
+                char message[256];
+                snprintf(message, sizeof(message),
+                         "value of type '%s' has no property '%s'",
+                         type_name(obj_type), pe->prop_name);
+                semantic_error_at(ctx, node->line, node->column, message);
+                return LAMO_TYPE_UNKNOWN;
+            }
+        }
+        case AST_STRUCT_LITERAL: {
+            ASTStructLiteral* sl = (ASTStructLiteral*)node;
+            ASTStructDecl* sd = find_struct_def(ctx, sl->struct_name);
+            if (!sd) {
+                char message[256];
+                snprintf(message, sizeof(message),
+                         "unknown struct type '%s' (declare it with `struct %s { ... }` first)",
+                         sl->struct_name, sl->struct_name);
+                semantic_error_at(ctx, node->line, node->column, message);
+                /* Still visit field values for cascading errors. */
+                for (int i = 0; i < sl->field_count; i++) {
+                    semantic_infer_expression(ctx, sl->field_values[i]);
+                }
+                return LAMO_TYPE_UNKNOWN;
+            }
+            /* Validate each field name exists in the struct. */
+            for (int i = 0; i < sl->field_count; i++) {
+                int idx = struct_field_index(sd, sl->field_names[i]);
+                if (idx < 0) {
+                    char message[256];
+                    snprintf(message, sizeof(message),
+                             "struct '%s' has no field '%s'",
+                             sl->struct_name, sl->field_names[i]);
+                    semantic_error_at(ctx, node->line, node->column, message);
+                }
+                semantic_infer_expression(ctx, sl->field_values[i]);
+            }
+            /* Check that all struct fields are covered (warning, not error). */
+            if (sl->field_count < sd->field_count) {
+                /* Find a missing field and report it. */
+                for (int i = 0; i < sd->field_count; i++) {
+                    int found = 0;
+                    for (int j = 0; j < sl->field_count; j++) {
+                        if (strcmp(sd->field_names[i], sl->field_names[j]) == 0) {
+                            found = 1; break;
+                        }
+                    }
+                    if (!found) {
+                        char message[256];
+                        snprintf(message, sizeof(message),
+                                 "warning: struct '%s' field '%s' not set in literal (defaults to 0)",
+                                 sl->struct_name, sd->field_names[i]);
+                        semantic_error_at(ctx, node->line, node->column, message);
+                    }
+                }
+            }
+            /* Annotate the AST node so codegen knows the struct type. */
+            node->sema_struct_name = sl->struct_name;
+            return LAMO_TYPE_STRUCT;
+        }
         default:
             // Recurse into statement-shaped nodes that can appear inside
             // expressions via legacy AST types we still keep for compat.
@@ -1044,6 +1618,28 @@ int semantic_analyze_full(ASTProgram* program, const char* file_path,
     /* Return-type tracking: UNKNOWN at top level (not inside any function). */
     ctx.current_fn_return_type = LAMO_TYPE_UNKNOWN;
     ctx.current_fn_name = NULL;
+    /* Phase 2: initialize struct/enum/impl registries. We point them at
+     * program->declarations and walk that list, filtering by node type,
+     * in the lookup helpers (find_struct_def, find_enum_def, find_method).
+     * This avoids the need for separate linked lists (and the resulting
+     * corruption of node->next). */
+    ctx.struct_defs = program->declarations;
+    ctx.enum_defs = program->declarations;
+    ctx.impl_defs = program->declarations;
+    ctx.current_impl_struct = NULL;
+
+    /* Phase 2: register enum variants as global int constants. Each
+     * variant becomes a SYMBOL_VAR with type INT and a known value (its
+     * index). The codegen emits these as global LamoValue variables. */
+    for (ASTNode* node = program->declarations; node; node = node->next) {
+        if (node->type == AST_ENUM_DECL) {
+            ASTEnumDecl* ed = (ASTEnumDecl*)node;
+            for (int i = 0; i < ed->variant_count; i++) {
+                /* Register the variant name as a global int constant. */
+                scope_define(&ctx, ctx.current_scope, ed->variants[i], SYMBOL_VAR, 0, LAMO_TYPE_INT, node->line, node->column, node->file_path);
+            }
+        }
+    }
 
     for (ASTNode* node = program->declarations; node; node = node->next) {
         if (node->type == AST_FN_DECL) {
@@ -1054,11 +1650,11 @@ int semantic_analyze_full(ASTProgram* program, const char* file_path,
              * UNKNOWN if there's no context). */
             LamoType ret_type = LAMO_TYPE_UNKNOWN;
             if (fn_decl->return_type_annotation) {
-                ret_type = annotation_to_type(fn_decl->return_type_annotation);
+                ret_type = annotation_to_type_with_ctx(&ctx, fn_decl->return_type_annotation);
                 if (ret_type == LAMO_TYPE_UNKNOWN) {
                     char message[256];
                     snprintf(message, sizeof(message),
-                             "unknown return type annotation '%s' on function '%s' (expected int, float, string, or bool)",
+                             "unknown return type annotation '%s' on function '%s' (expected int, float, string, bool, array, or a struct name)",
                              fn_decl->return_type_annotation, fn_decl->name);
                     semantic_error_at(&ctx, node->line, node->column, message);
                 }

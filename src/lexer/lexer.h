@@ -9,6 +9,8 @@ typedef enum {
     TOKEN_TRUE, TOKEN_FALSE, TOKEN_IMPORT,
     TOKEN_BREAK, TOKEN_CONTINUE,
     TOKEN_AS,  /* Sprint 4: `as` keyword for `import "..." as alias;` */
+    /* Phase 2: struct / impl / enum / match keywords. */
+    TOKEN_STRUCT, TOKEN_IMPL, TOKEN_ENUM, TOKEN_MATCH,
 
     // Literals & Identifiers
     TOKEN_IDENTIFIER, TOKEN_INT, TOKEN_FLOAT, TOKEN_STRING,
@@ -19,6 +21,7 @@ typedef enum {
     TOKEN_AND_AND, TOKEN_OR_OR, TOKEN_BANG,
     TOKEN_PLUS_EQ, TOKEN_MINUS_EQ, TOKEN_PLUS_PLUS, TOKEN_MINUS_MINUS,
     TOKEN_ARROW,  /* Sprint 3: `->` for optional function return-type annotations */
+    TOKEN_FAT_ARROW,  /* Phase 2: `=>` for match arms */
 
     // Delimiters
     TOKEN_LPAREN, TOKEN_RPAREN, TOKEN_LBRACE, TOKEN_RBRACE,
