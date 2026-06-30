@@ -32,6 +32,8 @@
 #include "ast.h"
 #include "semantic.h"
 #include "builtins.h"
+#include "error_util.h"
+#include "modules.h"
 #include "eval/eval.h"
 #include "lampm/lampm.h"
 
@@ -46,6 +48,10 @@ enum {
 /* Global CLI options. Set in main() based on argv / env vars. */
 static int g_verbose = 0;       /* LAMO_VERBOSE=1 or --verbose */
 static int g_quiet = 0;         /* LAMO_QUIET=1 or --quiet */
+/* Sprint 4: --no-color / LAMO_NO_COLOR=1. Also auto-disabled when stderr
+ * is not a TTY (handled in error_util.h). Affects compiler errors and
+ * (eventually) all colored output. */
+static int g_no_color = 0;
 
 typedef enum {
     COMMAND_RUN,
@@ -74,6 +80,11 @@ typedef struct {
     int capacity;
     int load_depth;
     int load_stack_capacity;
+    /* Sprint 4: module registry. Tracks each `import "..." as alias;`
+     * statement so the semantic pass and codegen can resolve
+     * `alias.member(args)` calls. Lives for the duration of the
+     * compilation and is freed in free_compilation_state(). */
+    LamoModuleRegistry modules;
 } CompilationState;
 
 static void print_usage(const char* prog);
@@ -84,9 +95,14 @@ static int compile_sources(const char** input_files, int input_file_count, LamoC
 static const char* executable_suffix(void);
 static const char* lamo_cc(void);
 static int load_program_recursive(CompilationState* state, ASTProgram* aggregate_program, const char* path);
+/* Sprint 4: `alias` is non-NULL when the import was written as
+ * `import "..." as alias;` — the loader then renames the file's top-level
+ * declarations to `lamo_mod_<alias>__<name>` and registers them in
+ * state->modules. When NULL, the legacy global-merge behavior applies. */
 static int load_program_recursive_from(CompilationState* state, ASTProgram* aggregate_program,
                                         const char* path, const char* imported_from,
-                                        int import_line, int import_column);
+                                        int import_line, int import_column,
+                                        const char* alias);
 static int ensure_load_stack_capacity(CompilationState* state, int required_depth);
 static int push_loading_file(CompilationState* state, int file_index);
 static void pop_loading_file(CompilationState* state);
@@ -94,9 +110,19 @@ static void report_import_cycle(const CompilationState* state, int repeated_inde
 static void report_import_cycle_at(const CompilationState* state, int repeated_index,
                                     const char* importing_file, int line, int column);
 void generate_c_code(ASTNode* node, FILE* out);
+/* Sprint 4: forward declaration of the codegen module-registry setter.
+ * Defined in src/codegen/codegen.c. We forward-declare instead of
+ * #include-ing codegen.h to avoid pulling codegen's transitive deps
+ * (lamo_runtime.h, lamo_runtime_data.h, math.h, ...) into lamo_v2.c,
+ * matching the existing pattern for generate_c_code. The LamoModuleRegistry
+ * typedef comes from modules.h, already included above. */
+void codegen_set_module_registry(LamoModuleRegistry* reg);
 static int command_new(int argc, char** argv);
 static int command_clean(int argc, char** argv);
 static int command_repl(int argc, char** argv);
+/* Sprint 4: new developer-experience commands. */
+static int command_test(int argc, char** argv);
+static int command_fmt(int argc, char** argv);
 
 static char* duplicate_string(const char* value) {
     size_t length = strlen(value);
@@ -299,6 +325,8 @@ static void free_compilation_state(CompilationState* state) {
     free(state->file_paths);
     free(state->load_states);
     free(state->load_stack);
+    /* Sprint 4: free module registry. */
+    lamo_modules_free(&state->modules);
 }
 
 static int path_is_absolute(const char* path) {
@@ -422,6 +450,272 @@ static char* resolve_import_path(const char* importing_file, const char* import_
 // imports — agora respeita comentários e strings porque o lexer cuidou disso.
 static int load_imports_from_ast(CompilationState* state, ASTProgram* aggregate_program, ASTNode* node, const char* importing_file);
 
+/* Sprint 4: rename every top-level declaration in `program` by prefixing
+ * its name with `lamo_mod_<alias>__`. This is what makes namespaced
+ * imports actually namespace — without it, `import "math.lamo" as math;`
+ * would still merge math.lamo's `sqrt` into the global `sqrt` slot,
+ * defeating the whole point of the alias.
+ *
+ * We rename in-place on the AST (the ASTFnDecl.name / ASTVarDecl.name
+ * strings are freed and replaced). We also register each member in the
+ * module registry so semantic + codegen can resolve `alias.member(args)`
+ * calls.
+ *
+ * After renaming the top-level decls, we ALSO walk each function body
+ * and rewrite references to the module's own members (recursive calls,
+ * references to module globals, etc.) to use the prefixed names. Without
+ * this, `fn fib(n) { return fib(n-1); }` would have its outer name
+ * renamed to `lamo_mod_math__fib` but the inner call would still say
+ * `fib`, which the semantic pass would reject as undeclared.
+ *
+ * `program` is the parsed program from the imported file; we walk its
+ * top-level declarations list (program->declarations). Nested function
+ * declarations are NOT renamed — only top-level decls are exposed
+ * through the module namespace, matching the import semantics of every
+ * other namespaced language. */
+
+/* Helper: rewrite a single name string in-place if it matches one of
+ * the module's original names. Returns 1 if rewritten, 0 otherwise.
+ * `names` is a flat array of (original, prefixed) pairs, `count` is
+ * the number of pairs. */
+static int rewrite_name_if_member(char** name_slot,
+                                    const LamoModuleEntry* entry) {
+    int i;
+    if (!name_slot || !*name_slot || !entry) return 0;
+    for (i = 0; i < entry->member_count; i++) {
+        if (strcmp(*name_slot, entry->members[i].original_name) == 0) {
+            free(*name_slot);
+            *name_slot = strdup(entry->members[i].prefixed_name);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Recursive walker: rewrite references to the module's members inside
+ * an AST subtree. Visits calls, identifiers, assignments, and all
+ * structural nodes. */
+static void rewrite_member_refs_recursive(ASTNode* node, const LamoModuleEntry* entry) {
+    if (!node) return;
+    for (ASTNode* cur = node; cur; cur = cur->next) {
+        switch (cur->type) {
+            case AST_CALL_STMT: {
+                ASTCallStmt* cs = (ASTCallStmt*)cur;
+                rewrite_name_if_member(&cs->name, entry);
+                for (int i = 0; i < cs->arg_count; i++) {
+                    rewrite_member_refs_recursive(cs->args[i], entry);
+                }
+                break;
+            }
+            case AST_CALL_EXPR: {
+                ASTCallExpr* ce = (ASTCallExpr*)cur;
+                rewrite_name_if_member(&ce->name, entry);
+                for (int i = 0; i < ce->arg_count; i++) {
+                    rewrite_member_refs_recursive(ce->args[i], entry);
+                }
+                break;
+            }
+            case AST_IDENTIFIER: {
+                ASTIdentifier* id = (ASTIdentifier*)cur;
+                rewrite_name_if_member(&id->name, entry);
+                break;
+            }
+            case AST_ASSIGN_STMT: {
+                ASTAssignStmt* as = (ASTAssignStmt*)cur;
+                rewrite_name_if_member(&as->name, entry);
+                rewrite_member_refs_recursive(as->value, entry);
+                break;
+            }
+            case AST_VAR_DECL: {
+                ASTVarDecl* vd = (ASTVarDecl*)cur;
+                rewrite_member_refs_recursive(vd->initializer, entry);
+                break;
+            }
+            case AST_FN_DECL: {
+                ASTFnDecl* fn = (ASTFnDecl*)cur;
+                /* Don't rewrite the function's own name here — that was
+                 * already done by the outer loop in rename_module_declarations.
+                 * But DO rewrite references to OTHER module members in the
+                 * body. Also rewrite parameter names if they shadow module
+                 * members — but that's actually a semantic error (you
+                 * can't have a param named the same as a module member),
+                 * so we leave them alone and let the semantic pass complain.
+                 *
+                 * Also: do NOT descend into nested fn declarations
+                 * (they have their own scope). We only rewrite refs in
+                 * the body of THIS function, treating nested fns as
+                 * opaque. The semantic pass will visit them separately.
+                 * Actually, the nested fn's body would also need
+                 * rewriting if it references the module's members. So
+                 * we DO descend, but skip the nested fn's NAME (which
+                 * would have been a top-level decl if it were one).
+                 * Since nested fns aren't renamed, their NAME doesn't
+                 * match any module member anyway. So just descend. */
+                rewrite_member_refs_recursive(fn->body, entry);
+                break;
+            }
+            case AST_BLOCK: {
+                rewrite_member_refs_recursive(((ASTBlock*)cur)->statements, entry);
+                break;
+            }
+            case AST_IF_STMT: {
+                ASTIfStmt* is = (ASTIfStmt*)cur;
+                rewrite_member_refs_recursive(is->condition, entry);
+                rewrite_member_refs_recursive(is->then_branch, entry);
+                rewrite_member_refs_recursive(is->else_branch, entry);
+                break;
+            }
+            case AST_WHILE_STMT: {
+                ASTWhileStmt* ws = (ASTWhileStmt*)cur;
+                rewrite_member_refs_recursive(ws->condition, entry);
+                rewrite_member_refs_recursive(ws->body, entry);
+                break;
+            }
+            case AST_FOR_STMT: {
+                ASTForStmt* fs = (ASTForStmt*)cur;
+                rewrite_member_refs_recursive(fs->initializer, entry);
+                rewrite_member_refs_recursive(fs->condition, entry);
+                rewrite_member_refs_recursive(fs->increment, entry);
+                rewrite_member_refs_recursive(fs->body, entry);
+                break;
+            }
+            case AST_RETURN_STMT: {
+                rewrite_member_refs_recursive(((ASTReturnStmt*)cur)->expression, entry);
+                break;
+            }
+            case AST_BINARY_EXPR: {
+                ASTBinaryExpr* be = (ASTBinaryExpr*)cur;
+                rewrite_member_refs_recursive(be->left, entry);
+                rewrite_member_refs_recursive(be->right, entry);
+                break;
+            }
+            case AST_UNARY_EXPR: {
+                rewrite_member_refs_recursive(((ASTUnaryExpr*)cur)->right, entry);
+                break;
+            }
+            case AST_GROUPING_EXPR: {
+                rewrite_member_refs_recursive(((ASTGroupingExpr*)cur)->expression, entry);
+                break;
+            }
+            case AST_ARRAY_LITERAL: {
+                ASTArrayLiteral* arr = (ASTArrayLiteral*)cur;
+                for (int i = 0; i < arr->element_count; i++) {
+                    rewrite_member_refs_recursive(arr->elements[i], entry);
+                }
+                break;
+            }
+            case AST_INDEX_EXPR: {
+                ASTIndexExpr* ie = (ASTIndexExpr*)cur;
+                rewrite_member_refs_recursive(ie->array, entry);
+                rewrite_member_refs_recursive(ie->index, entry);
+                break;
+            }
+            case AST_PROP_EXPR: {
+                rewrite_member_refs_recursive(((ASTPropExpr*)cur)->object, entry);
+                break;
+            }
+            case AST_MEMBER_CALL: {
+                ASTMemberCall* mc = (ASTMemberCall*)cur;
+                rewrite_member_refs_recursive(mc->object, entry);
+                for (int i = 0; i < mc->arg_count; i++) {
+                    rewrite_member_refs_recursive(mc->args[i], entry);
+                }
+                break;
+            }
+            /* Leaves: AST_INT_LITERAL, AST_FLOAT_LITERAL, AST_STRING_LITERAL,
+             * AST_BOOL_LITERAL, AST_IMPORT, AST_BREAK_STMT, AST_CONTINUE_STMT.
+             * Nothing to rewrite. */
+            default:
+                break;
+        }
+    }
+}
+
+static int rename_module_declarations(ASTProgram* program, const char* alias,
+                                       LamoModuleRegistry* reg) {
+    char* prefix = lamo_module_prefix(alias);
+    ASTNode* cur;
+    const LamoModuleEntry* entry;
+    if (!prefix) return 0;
+
+    /* Phase 1: rename top-level decls and register them in the module. */
+    for (cur = program->declarations; cur; cur = cur->next) {
+        char* new_name;
+        const char* original_name;
+        int arity = -1;
+        if (cur->type == AST_FN_DECL) {
+            ASTFnDecl* fn = (ASTFnDecl*)cur;
+            original_name = fn->name;
+            arity = fn->param_count;
+            new_name = malloc(strlen(prefix) + strlen(original_name) + 1);
+            if (!new_name) { free(prefix); return 0; }
+            sprintf(new_name, "%s%s", prefix, original_name);
+            {
+                char* orig_copy = strdup(original_name);
+                if (!orig_copy) { free(new_name); free(prefix); return 0; }
+                if (!lamo_modules_add_member(reg, alias, orig_copy, new_name, arity)) {
+                    free(orig_copy);
+                    free(new_name);
+                    free(prefix);
+                    return 0;
+                }
+            }
+            free(fn->name);
+            fn->name = new_name;
+        } else if (cur->type == AST_VAR_DECL) {
+            ASTVarDecl* vd = (ASTVarDecl*)cur;
+            original_name = vd->name;
+            arity = -1;  /* non-function member */
+            new_name = malloc(strlen(prefix) + strlen(original_name) + 1);
+            if (!new_name) { free(prefix); return 0; }
+            sprintf(new_name, "%s%s", prefix, original_name);
+            {
+                char* orig_copy = strdup(original_name);
+                if (!orig_copy) { free(new_name); free(prefix); return 0; }
+                if (!lamo_modules_add_member(reg, alias, orig_copy, new_name, arity)) {
+                    free(orig_copy);
+                    free(new_name);
+                    free(prefix);
+                    return 0;
+                }
+            }
+            free(vd->name);
+            vd->name = new_name;
+        }
+        /* Skip AST_IMPORT and other node types — we don't expose them
+         * through the module namespace. */
+    }
+
+    /* Phase 2: now that all members are registered, look up the entry
+     * and walk each top-level decl's body to rewrite references to the
+     * module's own members (recursive calls, references to module
+     * globals, etc.). Without this, `fn fib(n) { return fib(n-1); }`
+     * would have its outer name renamed but the inner call would still
+     * say `fib`, causing a semantic error. */
+    entry = lamo_modules_lookup_alias(reg, alias);
+    if (entry) {
+        for (cur = program->declarations; cur; cur = cur->next) {
+            if (cur->type == AST_FN_DECL) {
+                ASTFnDecl* fn = (ASTFnDecl*)cur;
+                rewrite_member_refs_recursive(fn->body, entry);
+            } else if (cur->type == AST_VAR_DECL) {
+                ASTVarDecl* vd = (ASTVarDecl*)cur;
+                rewrite_member_refs_recursive(vd->initializer, entry);
+            }
+            /* Top-level call statements, assignments, etc. also need
+             * rewriting if they reference module members. */
+            if (cur->type == AST_CALL_STMT || cur->type == AST_ASSIGN_STMT ||
+                cur->type == AST_RETURN_STMT || cur->type == AST_IF_STMT ||
+                cur->type == AST_WHILE_STMT || cur->type == AST_FOR_STMT) {
+                rewrite_member_refs_recursive(cur, entry);
+            }
+        }
+    }
+
+    free(prefix);
+    return 1;
+}
+
 static int load_imports_from_ast(CompilationState* state, ASTProgram* aggregate_program, ASTNode* node, const char* importing_file) {
     if (!node) {
         return 1;
@@ -436,10 +730,12 @@ static int load_imports_from_ast(CompilationState* state, ASTProgram* aggregate_
                         importing_file, current->line, current->column, imp->path);
                 return 0;
             }
-            /* Pass the import site coordinates so cycle errors can point
-             * to the exact import statement that closed the cycle. */
+            /* Sprint 4: pass the alias through to the loader so it knows
+             * whether to rename the imported declarations (aliased import)
+             * or merge them as-is (legacy global-merge import). */
             if (!load_program_recursive_from(state, aggregate_program, resolved,
-                                              importing_file, current->line, current->column)) {
+                                              importing_file, current->line, current->column,
+                                              imp->alias)) {
                 free(resolved);
                 return 0;
             }
@@ -459,6 +755,8 @@ static void print_usage(const char* prog) {
     printf("  %s repl                (interactive read-eval-print loop)\n", prog);
     printf("  %s new   <project-name>\n", prog);
     printf("  %s clean               (remove generated lamo_exec* artifacts)\n", prog);
+    printf("  %s test                (run the test suite under tests/)\n", prog);
+    printf("  %s fmt   <file.lamo>   (normalize source formatting in place)\n", prog);
     printf("\n");
     printf("Package manager subcommands (formerly `lampm`):\n");
     printf("  %s init [project-name]              Create a new lamo.pkg (and scaffold)\n", prog);
@@ -479,12 +777,13 @@ static void print_usage(const char* prog) {
     printf("Global options (apply to most commands):\n");
     printf("  --verbose   Show extra progress information (also: LAMO_VERBOSE=1)\n");
     printf("  --quiet     Suppress success messages (also: LAMO_QUIET=1)\n");
-    printf("  --no-color  Disable ANSI color output (package-manager subcommands only)\n");
+    printf("  --no-color  Disable ANSI color output in compiler errors and package manager\n");
     printf("\n");
     printf("Environment variables:\n");
-    printf("  LAMO_CC     C compiler to use for `run`/`build` (default: gcc)\n");
+    printf("  LAMO_CC       C compiler to use for `run`/`build` (default: gcc)\n");
     printf("  LAMO_VERBOSE  Same as --verbose\n");
     printf("  LAMO_QUIET    Same as --quiet\n");
+    printf("  LAMO_NO_COLOR Same as --no-color\n");
 }
 
 static void print_command_help(const char* prog, const char* command) {
@@ -536,6 +835,26 @@ static void print_command_help(const char* prog, const char* command) {
         printf("Usage: %s clean\n\n", prog);
         printf("Deletes lamo_exec.c, lamo_exec, lamo_exec.exe (the intermediate C\n");
         printf("source and compiled binary). Source files are untouched.\n");
+    } else if (strcmp(command, "test") == 0) {
+        printf("test — Run the Lamo test suite.\n\n");
+        printf("Usage: %s test [test-binary-path]\n\n", prog);
+        printf("Invokes tests/run_tests.sh (POSIX) or tests/run_tests.ps1 (Windows),\n");
+        printf("discovering .lamo files under tests/valid/ (must check successfully),\n");
+        printf("tests/invalid/ (must fail check), and tests/runtime/ (must run and\n");
+        printf("match a sibling .expected file). With no argument, uses ./lamo.\n");
+        printf("Exits 0 on full pass, 1 if any test fails.\n");
+    } else if (strcmp(command, "fmt") == 0) {
+        printf("fmt — Normalize source formatting in place.\n\n");
+        printf("Usage: %s fmt <file.lamo> [more.lamo ...]\n\n", prog);
+        printf("Rewrites each file in place with:\n");
+        printf("  - LF line endings (CRLF converted)\n");
+        printf("  - trailing whitespace stripped from each line\n");
+        printf("  - file ends with exactly one newline\n");
+        printf("  - tabs converted to 4 spaces (matches the codegen output style)\n");
+        printf("Does NOT reflow expressions or reindent blocks yet — a full AST-based\n");
+        printf("pretty-printer is future work. Safe to run on any .lamo file.\n");
+        printf("Use --check to print a diff and exit non-zero without modifying files\n");
+        printf("(useful in CI / pre-commit hooks).\n");
     } else if (strcmp(command, "help") == 0) {
         printf("help — Show help.\n\n");
         printf("Usage: %s help [command]\n\n", prog);
@@ -904,6 +1223,348 @@ static int command_repl(int argc, char** argv) {
     return EXIT_SUCCESS_CODE;
 }
 
+/* Sprint 4: command_test — run the Lamo test suite.
+ *
+ * Invokes tests/run_tests.sh (POSIX) or tests/run_tests.ps1 (Windows),
+ * forwarding the lamo binary path as the first argument. The test runner
+ * discovers .lamo files under tests/{valid,invalid,runtime}/ and exits
+ * 0 on full pass, 1 on any failure.
+ *
+ * With no argument, we look for ./lamo (or ./lamo.exe on Windows). With
+ * one argument, we treat it as an explicit binary path. This lets users
+ * run `lamo test` after `make` without any setup.
+ *
+ * We use run_argv() (POSIX fork+exec / Windows CreateProcess) rather
+ * than system() to avoid shell-injection concerns on the user-supplied
+ * path. */
+static int command_test(int argc, char** argv) {
+    const char* lamo_bin = NULL;
+    char test_script[4096];
+    int i;
+    int exit_status;
+    char* argv_list[4];
+
+    for (i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            print_command_help(argv[0], "test");
+            return EXIT_SUCCESS_CODE;
+        }
+        if (argv[i][0] == '-') {
+            fprintf(stderr, "unknown option: %s\n", argv[i]);
+            return EXIT_COMPILE_ERROR;
+        }
+        if (!lamo_bin) {
+            lamo_bin = argv[i];
+        } else {
+            fprintf(stderr, "unexpected extra argument: %s\n", argv[i]);
+            return EXIT_COMPILE_ERROR;
+        }
+    }
+
+    if (!lamo_bin) {
+        /* Default: look for ./lamo or ./lamo.exe in the current directory. */
+#ifdef _WIN32
+        lamo_bin = "lamo.exe";
+#else
+        lamo_bin = "./lamo";
+#endif
+        /* Quick existence check — if not found, give a helpful message. */
+#ifdef _WIN32
+        {
+            FILE* probe = fopen(lamo_bin, "r");
+            if (!probe) {
+                fprintf(stderr, "lamo binary not found at ./%s. Build it first with `make`, or pass its path as `lamo test /path/to/lamo`.\n", lamo_bin);
+                return EXIT_COMPILE_ERROR;
+            }
+            fclose(probe);
+        }
+#else
+        {
+            struct stat st;
+            if (stat(lamo_bin, &st) != 0) {
+                fprintf(stderr, "lamo binary not found at %s. Build it first with `make`, or pass its path as `lamo test /path/to/lamo`.\n", lamo_bin);
+                return EXIT_COMPILE_ERROR;
+            }
+        }
+#endif
+    }
+
+    /* Locate the test script relative to the lamo binary's directory.
+     * Convention: tests/run_tests.sh sits next to the binary (when built
+     * in the repo root). We try a few candidate paths:
+     *   1. ./tests/run_tests.sh  (most common — running from repo root)
+     *   2. <bin_dir>/tests/run_tests.sh
+     *   3. <bin_dir>/../tests/run_tests.sh  (when binary is in a build/ subdir)
+     * On Windows we use tests/run_tests.ps1 instead.
+     */
+    {
+        const char* candidates[3];
+        int n_candidates = 0;
+        candidates[n_candidates++] = "tests/run_tests.sh";
+        {
+            /* Build <bin_dir>/tests/run_tests.sh */
+            char* bin_dir = path_directory(lamo_bin);
+            char* joined;
+            if (bin_dir) {
+                joined = path_join(bin_dir, "tests/run_tests.sh");
+                if (joined) candidates[n_candidates++] = joined;
+                joined = path_join(bin_dir, "../tests/run_tests.sh");
+                if (joined) candidates[n_candidates++] = joined;
+                free(bin_dir);
+            }
+        }
+        for (i = 0; i < n_candidates; i++) {
+            struct stat st;
+            if (stat(candidates[i], &st) == 0 && (st.st_mode & S_IFREG)) {
+                strncpy(test_script, candidates[i], sizeof(test_script) - 1);
+                test_script[sizeof(test_script) - 1] = '\0';
+                /* Free any later candidates we didn't use (they were malloc'd). */
+                for (int j = i + 1; j < n_candidates; j++) {
+                    if (candidates[j] != candidates[0]) free((void*)candidates[j]);
+                }
+                goto found;
+            }
+            /* Free this candidate if it was malloc'd. */
+            if (i > 0 && candidates[i] != candidates[0]) free((void*)candidates[i]);
+        }
+        fprintf(stderr, "could not find tests/run_tests.sh next to %s\n", lamo_bin);
+        fprintf(stderr, "looked in: tests/run_tests.sh, <bin_dir>/tests/run_tests.sh, <bin_dir>/../tests/run_tests.sh\n");
+        return EXIT_COMPILE_ERROR;
+    }
+found:
+
+    if (!g_quiet) {
+        printf("Running Lamo test suite via %s...\n", test_script);
+    }
+
+    /* Invoke: sh <test_script> <lamo_bin>
+     * On Windows we'd invoke powershell, but the script path is .ps1.
+     * For simplicity, this POSIX-only invocation uses sh. The Windows
+     * path (run_tests.ps1) is handled separately below. */
+#ifdef _WIN32
+    {
+        char ps_cmd[8192];
+        /* powershell -ExecutionPolicy Bypass -File <script> -LamoBinary <bin> */
+        /* But run_tests.ps1 doesn't take a binary arg the same way; it auto-detects.
+         * Just run the .ps1 directly. */
+        snprintf(ps_cmd, sizeof(ps_cmd),
+                 "powershell -ExecutionPolicy Bypass -File \"tests\\run_tests.ps1\"");
+        exit_status = system(ps_cmd);
+        /* system returns the exit code in the same way waitpid does on POSIX,
+         * so we need to extract it. But Windows system() returns the exit
+         * code directly. Either way, non-zero means failure. */
+        if (exit_status != 0) {
+            fprintf(stderr, "test suite failed (exit code %d)\n", exit_status);
+            return EXIT_COMPILE_ERROR;
+        }
+        return EXIT_SUCCESS_CODE;
+    }
+#else
+    argv_list[0] = (char*)"sh";
+    argv_list[1] = test_script;
+    argv_list[2] = (char*)lamo_bin;
+    argv_list[3] = NULL;
+    exit_status = run_argv(argv_list);
+    if (exit_status != 0) {
+        if (!g_quiet) {
+            fprintf(stderr, "test suite failed (exit code %d)\n", exit_status);
+        }
+        return EXIT_COMPILE_ERROR;
+    }
+    if (!g_quiet) {
+        printf("All tests passed.\n");
+    }
+    return EXIT_SUCCESS_CODE;
+#endif
+}
+
+/* Sprint 4: command_fmt — normalize source formatting in place.
+ *
+ * This is a deliberately conservative formatter. It does NOT reflow
+ * expressions, reindent blocks, or rename anything. It only applies
+ * safe, idempotent transformations:
+ *
+ *   - CRLF → LF (Windows line endings normalized to Unix)
+ *   - Tabs → 4 spaces (matches the codegen output style)
+ *   - Trailing whitespace stripped from each line
+ *   - File ends with exactly one trailing newline (no zero, no double)
+ *
+ * These are the transformations that NEVER change the meaning of a
+ * valid Lamo program. A full AST-based pretty-printer (reindent,
+ * space normalization around operators, etc.) is future work — see
+ * the roadmap. The current command is still useful for keeping a
+ * project's files normalized across contributors.
+ *
+ * --check: read-only mode. Print a diff for each file that would be
+ * changed and exit non-zero if any file needs formatting (CI mode).
+ * Files are not modified. */
+static int command_fmt(int argc, char** argv) {
+    const char** files = NULL;
+    int file_count = 0;
+    int check_mode = 0;
+    int i;
+    int rc = EXIT_SUCCESS_CODE;
+
+    for (i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            print_command_help(argv[0], "fmt");
+            return EXIT_SUCCESS_CODE;
+        }
+        if (strcmp(argv[i], "--check") == 0) {
+            check_mode = 1;
+            continue;
+        }
+        if (argv[i][0] == '-') {
+            fprintf(stderr, "unknown option: %s\n", argv[i]);
+            free(files);
+            return EXIT_COMPILE_ERROR;
+        }
+        /* Positional file argument. */
+        {
+            const char** resized = realloc(files, sizeof(char*) * (size_t)(file_count + 1));
+            if (!resized) {
+                fprintf(stderr, "out of memory\n");
+                free(files);
+                return EXIT_COMPILE_ERROR;
+            }
+            files = resized;
+            files[file_count++] = argv[i];
+        }
+    }
+
+    if (file_count == 0) {
+        fprintf(stderr, "no input files. Usage: %s fmt <file.lamo> [more.lamo ...]\n", argv[0]);
+        free(files);
+        return EXIT_COMPILE_ERROR;
+    }
+
+    for (i = 0; i < file_count; i++) {
+        const char* path = files[i];
+        char* source = read_file(path);
+        char* out;
+        size_t out_len;
+        size_t in_pos;
+        size_t out_pos;
+        size_t out_capacity;
+
+        if (!source) {
+            fprintf(stderr, "failed to read %s: %s\n", path, strerror(errno));
+            rc = EXIT_COMPILE_ERROR;
+            continue;
+        }
+
+        /* First pass: convert CRLF → LF and tabs → 4 spaces.
+         * Output buffer is at most 4x the input (every tab → 4 spaces).
+         * We allocate that worst case to avoid reallocation. */
+        in_pos = 0;
+        out_pos = 0;
+        {
+            size_t src_len = strlen(source);
+            out_capacity = src_len * 4 + 2;  /* +2 for trailing newline + NUL */
+            out = malloc(out_capacity);
+            if (!out) {
+                fprintf(stderr, "out of memory formatting %s\n", path);
+                free(source);
+                rc = EXIT_COMPILE_ERROR;
+                continue;
+            }
+        }
+        while (source[in_pos] != '\0') {
+            char c = source[in_pos++];
+            if (c == '\r') {
+                /* Skip; the following \n (if any) will produce the LF. */
+                /* If there's no \n (Mac classic line ending), emit LF. */
+                if (source[in_pos] != '\n') {
+                    out[out_pos++] = '\n';
+                }
+                continue;
+            }
+            if (c == '\t') {
+                out[out_pos++] = ' ';
+                out[out_pos++] = ' ';
+                out[out_pos++] = ' ';
+                out[out_pos++] = ' ';
+                continue;
+            }
+            out[out_pos++] = c;
+        }
+        out[out_pos] = '\0';
+
+        /* Second pass: strip trailing whitespace from each line, ensure
+         * exactly one trailing newline. We walk the (now LF-terminated)
+         * buffer line by line, copying trimmed lines into the final
+         * output. Reuse the same buffer — we never grow, only shrink. */
+        out_pos = 0;
+        for (in_pos = 0; in_pos < strlen(out); ) {
+            /* Find the end of this line. */
+            char* nl = strchr(out + in_pos, '\n');
+            size_t line_end = nl ? (size_t)(nl - (out + in_pos)) : strlen(out + in_pos);
+            size_t trimmed_end = line_end;
+            /* Strip trailing spaces (we already converted tabs). */
+            while (trimmed_end > 0 && (out[in_pos + trimmed_end - 1] == ' ' ||
+                                        out[in_pos + trimmed_end - 1] == '\r')) {
+                trimmed_end--;
+            }
+            /* Copy trimmed line into the output (in-place, so it always fits). */
+            memmove(out + out_pos, out + in_pos, trimmed_end);
+            out_pos += trimmed_end;
+            out[out_pos++] = '\n';
+            /* Advance past the original line + its newline. */
+            in_pos += line_end + (nl ? 1 : 0);
+        }
+
+        /* Ensure exactly one trailing newline. If the file is empty,
+         * leave it empty (no trailing newline on an empty file). */
+        while (out_pos >= 2 && out[out_pos - 1] == '\n' && out[out_pos - 2] == '\n') {
+            out_pos--;
+        }
+        out_len = out_pos;
+        out[out_len] = '\0';
+
+        /* Compare with original. If unchanged, skip writing. */
+        if (strcmp(source, out) == 0) {
+            if (g_verbose) {
+                printf("[verbose] %s: already formatted\n", path);
+            }
+            free(source);
+            free(out);
+            continue;
+        }
+
+        if (check_mode) {
+            /* Print a short diff summary. */
+            printf("%s: would reformat (%zu bytes -> %zu bytes)\n",
+                   path, strlen(source), out_len);
+            rc = EXIT_COMPILE_ERROR;  /* non-zero signals "needs formatting" */
+            free(source);
+            free(out);
+            continue;
+        }
+
+        /* Write the file in place. */
+        {
+            FILE* f = fopen(path, "wb");
+            if (!f) {
+                fprintf(stderr, "failed to write %s: %s\n", path, strerror(errno));
+                rc = EXIT_COMPILE_ERROR;
+                free(source);
+                free(out);
+                continue;
+            }
+            fwrite(out, 1, out_len, f);
+            fclose(f);
+        }
+        if (!g_quiet) {
+            printf("formatted %s (%zu -> %zu bytes)\n", path, strlen(source), out_len);
+        }
+        free(source);
+        free(out);
+    }
+
+    free(files);
+    return rc;
+}
+
 int main(int argc, char** argv) {
     LamoCommand command = COMMAND_RUN;
     const char** input_files = NULL;
@@ -921,6 +1582,12 @@ int main(int argc, char** argv) {
         strcmp(getenv("LAMO_QUIET"), "0") != 0) {
         g_quiet = 1;
     }
+    /* Sprint 4: LAMO_NO_COLOR env var. */
+    if (getenv("LAMO_NO_COLOR") && getenv("LAMO_NO_COLOR")[0] != '\0' &&
+        strcmp(getenv("LAMO_NO_COLOR"), "0") != 0) {
+        g_no_color = 1;
+        lamo_error_set_color(0);
+    }
 
     if (argc < 2) {
         print_usage(argv[0]);
@@ -935,6 +1602,11 @@ int main(int argc, char** argv) {
             arg_index++;
         } else if (strcmp(argv[arg_index], "--quiet") == 0) {
             g_quiet = 1;
+            arg_index++;
+        } else if (strcmp(argv[arg_index], "--no-color") == 0) {
+            /* Sprint 4: disable ANSI color in compiler errors. */
+            g_no_color = 1;
+            lamo_error_set_color(0);
             arg_index++;
         } else if (strcmp(argv[arg_index], "--help") == 0 ||
                    strcmp(argv[arg_index], "-h") == 0) {
@@ -1007,6 +1679,10 @@ int main(int argc, char** argv) {
                 g_verbose = 1;
             } else if (strcmp(argv[i], "--quiet") == 0) {
                 g_quiet = 1;
+            } else if (strcmp(argv[i], "--no-color") == 0) {
+                /* Sprint 4: same effect as leading --no-color. */
+                g_no_color = 1;
+                lamo_error_set_color(0);
             }
         }
 
@@ -1036,6 +1712,12 @@ int main(int argc, char** argv) {
             return command_new(sub_argc, sub_argv);
         } else if (strcmp(subcommand, "clean") == 0) {
             return command_clean(sub_argc, sub_argv);
+        } else if (strcmp(subcommand, "test") == 0) {
+            /* Sprint 4: run the test suite. */
+            return command_test(sub_argc, sub_argv);
+        } else if (strcmp(subcommand, "fmt") == 0) {
+            /* Sprint 4: format source files. */
+            return command_fmt(sub_argc, sub_argv);
         } else {
             fprintf(stderr, "unknown command: %s\n\n", subcommand);
             print_usage(argv[0]);
@@ -1179,10 +1861,17 @@ cleanup:
 
 /* Variant called when loading an import that originated from a specific AST
  * node — carries the import site location so cycle errors point at the
- * exact `import "..."` statement that closed the cycle. */
+ * exact `import "..."` statement that closed the cycle.
+ *
+ * Sprint 4: also carries the optional alias. When non-NULL, the imported
+ * file's top-level declarations are renamed to `lamo_mod_<alias>__<name>`
+ * before being merged into the aggregate program, and each one is
+ * registered in state->modules so the semantic pass and codegen can
+ * resolve `alias.member(args)` calls. */
 static int load_program_recursive_from(CompilationState* state, ASTProgram* aggregate_program,
                                         const char* path, const char* imported_from,
-                                        int import_line, int import_column) {
+                                        int import_line, int import_column,
+                                        const char* alias) {
     char* normalized_path = normalize_path(path);
     char* raw_source;
     ASTProgram* parsed_program;
@@ -1203,6 +1892,32 @@ static int load_program_recursive_from(CompilationState* state, ASTProgram* aggr
                                    imported_from, import_line, import_column);
             free(normalized_path);
             return 0;
+        }
+        /* Sprint 4: the same file is being imported again (not a cycle,
+         * just a re-import). If the new import has an alias, we still
+         * need to register the alias → members mapping in the module
+         * registry. The declarations were already merged on the first
+         * load — but if the first load was aliased and the second isn't
+         * (or vice versa), or the aliases differ, we honor the FIRST
+         * load's alias (the file's declarations are already renamed).
+         * This is a documented limitation: importing the same file twice
+         * with different aliases is not supported. */
+        if (alias) {
+            /* Register the alias so resolution still works on the second
+             * import. We can't re-rename, so if the first import was
+             * NOT aliased, this alias mapping would be wrong. We check
+             * for that case explicitly. */
+            const LamoModuleEntry* existing = lamo_modules_lookup_alias(&state->modules, alias);
+            if (!existing) {
+                /* This alias hasn't been registered. The original file
+                 * was either imported without alias (so its names are
+                 * global, not namespaced) or with a different alias.
+                 * Either way, registering this alias would point at
+                 * wrong names — emit a warning and skip. */
+                fprintf(stderr, "%s:%d:%d: warning: file \"%s\" already imported; "
+                        "alias `%s` will not be registered (re-import with a different alias is not supported)\n",
+                        imported_from, import_line, import_column, path, alias);
+            }
         }
         free(normalized_path);
         return 1;
@@ -1246,6 +1961,28 @@ static int load_program_recursive_from(CompilationState* state, ASTProgram* aggr
     if (!load_imports_from_ast(state, aggregate_program, parsed_program->declarations, normalized_path)) {
         ast_free((ASTNode*)parsed_program);
         goto cleanup;
+    }
+
+    /* Sprint 4: if this import had an alias, rename the parsed file's
+     * top-level declarations before merging. This must happen AFTER
+     * load_imports_from_ast so that any imports inside the module file
+     * are resolved normally (their symbols merge into the global
+     * namespace, NOT the module namespace — same as Python's `from x
+     * import *` inside a module). */
+    if (alias) {
+        if (!lamo_modules_register_alias(&state->modules, alias)) {
+            fprintf(stderr, "%s:%d:%d: failed to register module alias `%s` "
+                    "(duplicate alias or out of memory)\n",
+                    imported_from, import_line, import_column, alias);
+            ast_free((ASTNode*)parsed_program);
+            goto cleanup;
+        }
+        if (!rename_module_declarations(parsed_program, alias, &state->modules)) {
+            fprintf(stderr, "%s:%d:%d: failed to rename declarations for module `%s`\n",
+                    imported_from, import_line, import_column, alias);
+            ast_free((ASTNode*)parsed_program);
+            goto cleanup;
+        }
     }
 
     ast_program_append(aggregate_program, parsed_program);
@@ -1384,6 +2121,26 @@ static const char* lamo_source_lookup(const char* file_path, void* user_data) {
     return NULL;
 }
 
+/* Sprint 4: module-resolution callback for the semantic analyzer.
+ * Delegates to the registry stored in CompilationState. Given an alias
+ * and a member name, returns the prefixed function name (e.g.
+ * "lamo_mod_math__sqrt") that the codegen will emit a call to. */
+static const char* lamo_module_resolve_cb(const char* alias, const char* member, void* user_data) {
+    CompilationState* state = (CompilationState*)user_data;
+    if (!state || !alias || !member) return NULL;
+    return lamo_modules_resolve_member(&state->modules, alias, member);
+}
+
+/* Sprint 4: module-arity callback. Delegates to the registry's stored
+ * arity (captured at rename time from the ASTFnDecl's param_count).
+ * Returns -1 for non-function members or unknown alias/member — the
+ * semantic pass treats -1 as "skip arity check". */
+static int lamo_module_arity_cb(const char* alias, const char* member, void* user_data) {
+    CompilationState* state = (CompilationState*)user_data;
+    if (!state || !alias || !member) return -1;
+    return lamo_modules_resolve_arity(&state->modules, alias, member);
+}
+
 static int compile_sources(const char** input_files, int input_file_count, LamoCommand command, const char* output_path) {
     ASTProgram* program_ast = ast_new_program();
     CompilationState state;
@@ -1392,6 +2149,10 @@ static int compile_sources(const char** input_files, int input_file_count, LamoC
     int i;
 
     memset(&state, 0, sizeof(state));
+    /* Sprint 4: initialize the module registry. Tracks aliased imports
+     * (`import "..." as alias;`) so semantic + codegen can resolve
+     * `alias.member(args)` calls. */
+    lamo_modules_init(&state.modules);
 
     // Bug #5 fix: o label aqui é só fallback. O semântico agora usa
     // node->file_path de cada nó da AST (setado pelo parser) para reportar
@@ -1408,7 +2169,11 @@ static int compile_sources(const char** input_files, int input_file_count, LamoC
         }
     }
 
-    if (!semantic_analyze_with_source_lookup(program_ast, semantic_label, lamo_source_lookup, &state)) {
+    if (!semantic_analyze_full(program_ast, semantic_label,
+                                lamo_source_lookup, &state,
+                                lamo_module_resolve_cb,
+                                lamo_module_arity_cb,
+                                &state)) {
         exit_code = EXIT_COMPILE_ERROR;
         goto cleanup;
     }
@@ -1447,7 +2212,16 @@ static int compile_sources(const char** input_files, int input_file_count, LamoC
             goto cleanup;
         }
 
+        /* Sprint 4: register the module registry with the codegen so
+         * AST_MEMBER_CALL nodes can resolve `alias.member(args)` to the
+         * prefixed function name. The pointer is borrowed — the
+         * registry lives in CompilationState which outlives this call. */
+        codegen_set_module_registry(&state.modules);
         generate_c_code((ASTNode*)program_ast, out);
+        /* Clear the registry pointer to avoid dangling references on
+         * subsequent compile_sources() calls (defensive — the static
+         * would be reused otherwise). */
+        codegen_set_module_registry(NULL);
         fclose(out);
 
         if (g_verbose) {

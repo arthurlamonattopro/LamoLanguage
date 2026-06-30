@@ -75,6 +75,7 @@ static void parser_synchronize(Parser* p) {
             case TOKEN_IMPORT:
             case TOKEN_BREAK:
             case TOKEN_CONTINUE:
+            case TOKEN_AS:  /* Sprint 4: treat `as` as a sync point too */
                 return;
             default:
                 advance_p(p);
@@ -84,6 +85,14 @@ static void parser_synchronize(Parser* p) {
 }
 
 void parser_error(Parser* p, const char* msg) {
+    /* Delegate to the hinted variant with no hint. */
+    parser_error_with_hint(p, msg, NULL);
+}
+
+/* Sprint 4: parser_error with an optional hint. The hint is printed
+ * below the source snippet, formatted as "hint: <text>". Pass NULL
+ * when no hint is appropriate. */
+void parser_error_with_hint(Parser* p, const char* msg, const char* hint) {
     const char* label;
     if (p->panic_mode) {
         return; // já estamos em recuperação, ignora erros derivados
@@ -94,8 +103,15 @@ void parser_error(Parser* p, const char* msg) {
     // semantic.c. Caso o parser tenha sido criado sem file_path (caso legado
     // de parser_init()), usa "<input>".
     label = p->file_path ? p->file_path : "<input>";
-    fprintf(stderr, "\n%s:%d:%d: [Syntax Error] %s\n",
-            label, p->current.line, p->current.column, msg);
+    /* Sprint 4: color the "error" label red+bold when stderr is a TTY. */
+    if (lamo_error_use_color()) {
+        fprintf(stderr, "\n%s:%d:%d: %s[Syntax Error]%s %s\n",
+                label, p->current.line, p->current.column,
+                LAMO_COLOR_BOLD LAMO_COLOR_RED, LAMO_COLOR_RESET, msg);
+    } else {
+        fprintf(stderr, "\n%s:%d:%d: [Syntax Error] %s\n",
+                label, p->current.line, p->current.column, msg);
+    }
     fprintf(stderr, "  found token: %s (%s)\n",
             token_type_name(p->current.type),
             p->current.value ? p->current.value : "<null>");
@@ -112,6 +128,8 @@ void parser_error(Parser* p, const char* msg) {
         source = ((Lexer*)p->lexer)->source;
         error_print_snippet(stderr, source, p->current.line, p->current.column);
     }
+    /* Sprint 4: print the hint below the snippet, if any. */
+    error_print_hint(stderr, hint);
     // NÃO chama exit(1) — deixa o caller tentar sincronizar e continuar.
 }
 
@@ -255,6 +273,68 @@ static ASTNode* parse_primary(Parser* p) {
         int line = p->current.line;
         int column = p->current.column;
         advance_p(p);
+
+        /* Sprint 4: `module.member(args)` in expression position. We
+         * recognize this BEFORE the regular call-expression branch so the
+         * `.` doesn't fall through to parse_postfix (which would wrap it
+         * as a property expression and lose the call). The resulting
+         * AST_MEMBER_CALL is resolved by the semantic pass against the
+         * module registry. */
+        if (p->current.type == TOKEN_DOT) {
+            int obj_line = p->current.line;
+            int obj_column = p->current.column;
+            advance_p(p);  /* consume '.' */
+            if (p->current.type != TOKEN_IDENTIFIER) {
+                parser_error(p, "expected member name after '.' in module call expression");
+                free(name);
+                return parser_recover(p);
+            }
+            char* member_name = strdup(p->current.value);
+            eat_p(p, TOKEN_IDENTIFIER);
+            /* Only build a member CALL when followed by '('. Otherwise
+             * fall back to a property expression (AST_PROP_EXPR) so the
+             * existing `.len` and future `.prop` forms keep working. The
+             * conversion is done by building the prop_expr here and letting
+             * parse_postfix continue wrapping if there are more dots. */
+            if (p->current.type == TOKEN_LPAREN) {
+                eat_p(p, TOKEN_LPAREN);
+                ASTNode** args = NULL;
+                int arg_count = 0;
+                while (p->current.type != TOKEN_RPAREN && p->current.type != TOKEN_EOF) {
+                    ASTNode* arg = parse_expression(p);
+                    if (arg) {
+                        ASTNode** resized = realloc(args, sizeof(ASTNode*) * (size_t)(arg_count + 1));
+                        if (!resized) {
+                            parser_error(p, "out of memory while growing argument list");
+                            ast_free(arg);
+                            free(args);
+                            free(name);
+                            free(member_name);
+                            return parser_recover(p);
+                        }
+                        args = resized;
+                        args[arg_count++] = arg;
+                    }
+                    if (p->current.type == TOKEN_COMMA) advance_p(p);
+                }
+                eat_p(p, TOKEN_RPAREN);
+                ASTNode* obj = (ASTNode*)ast_new_identifier(name, obj_line, obj_column);
+                ASTNode* node = (ASTNode*)ast_new_member_call(obj, member_name, args, arg_count, line, column);
+                free(name);
+                free(member_name);
+                return node;
+            } else {
+                /* `module.member` without a call — build a prop_expr so
+                 * parse_postfix can keep wrapping further `.x.y.z` chains.
+                 * The semantic pass resolves whether `object` is a module
+                 * alias or a regular value (e.g. array `.len`). */
+                ASTNode* obj = (ASTNode*)ast_new_identifier(name, obj_line, obj_column);
+                ASTNode* node = (ASTNode*)ast_new_prop_expr(obj, member_name, line, column);
+                free(name);
+                free(member_name);
+                return node;
+            }
+        }
 
         if (p->current.type == TOKEN_LPAREN) {
             eat_p(p, TOKEN_LPAREN);
@@ -483,9 +563,12 @@ ASTNode* parse_statement(Parser* p) {
          * Without this, parse_expression() would fall through to parse_primary()
          * and emit a generic "invalid expression, found ;" — which technically
          * reports the error but is unhelpful to a beginner writing Lamo.
-         * The explicit message tells them exactly what is wrong. */
+         * The explicit message tells them exactly what is wrong.
+         * Sprint 4: also emit a hint suggesting the most likely fix. */
         if (p->current.type == TOKEN_SEMICOLON) {
-            parser_error(p, "missing initializer after '=' in let declaration");
+            parser_error_with_hint(p,
+                "missing initializer after '=' in let declaration",
+                "did you forget a value after '='? e.g. `let x = 0;`");
             free(name);
             free(type_annotation);
             return parser_recover(p);
@@ -623,9 +706,26 @@ ASTNode* parse_statement(Parser* p) {
         }
         char* path = strdup(p->current.value);
         eat_p(p, TOKEN_STRING);
+        /* Sprint 4: optional `as IDENTIFIER` clause. When present, the
+         * imported file's symbols are accessed as `<alias>.<name>` rather
+         * than merged into the global namespace. The alias is validated
+         * for sanity (must start with a letter/underscore; no path
+         * separators) — full validation lives in the loader. */
+        char* alias = NULL;
+        if (p->current.type == TOKEN_AS) {
+            eat_p(p, TOKEN_AS);
+            if (p->current.type != TOKEN_IDENTIFIER) {
+                parser_error(p, "expected identifier after 'as' in import");
+                free(path);
+                return parser_recover(p);
+            }
+            alias = strdup(p->current.value);
+            eat_p(p, TOKEN_IDENTIFIER);
+        }
         expect_p(p, TOKEN_SEMICOLON, "missing ';' after import statement");
-        ASTNode* node = (ASTNode*)ast_new_import_decl(path, line, column);
+        ASTNode* node = (ASTNode*)ast_new_import_decl_aliased(path, alias, line, column);
         free(path);
+        free(alias);
         return node;
     }
     else if (p->current.type == TOKEN_IDENTIFIER) {
@@ -633,6 +733,52 @@ ASTNode* parse_statement(Parser* p) {
         int line = p->current.line;
         int column = p->current.column;
         advance_p(p);
+
+        /* Sprint 4: `module.member(args);` — module member call statement.
+         * We handle this BEFORE the regular call-statement branch because
+         * the `.` would otherwise fall through to the "expected '=', '+='..."
+         * error. The object is always an AST_IDENTIFIER naming the module
+         * alias; the semantic pass validates that the alias was declared
+         * by an earlier `import "..." as alias;`. */
+        if (p->current.type == TOKEN_DOT) {
+            int obj_line = p->current.line;
+            int obj_column = p->current.column;
+            advance_p(p);  /* consume '.' */
+            if (p->current.type != TOKEN_IDENTIFIER) {
+                parser_error(p, "expected member name after '.' in module call");
+                free(name);
+                return parser_recover(p);
+            }
+            char* member_name = strdup(p->current.value);
+            eat_p(p, TOKEN_IDENTIFIER);
+            expect_p(p, TOKEN_LPAREN, "expected '(' after module member name in call statement");
+            ASTNode** args = NULL;
+            int arg_count = 0;
+            while (p->current.type != TOKEN_RPAREN && p->current.type != TOKEN_EOF) {
+                ASTNode* arg = parse_expression(p);
+                if (arg) {
+                    ASTNode** resized = realloc(args, sizeof(ASTNode*) * (size_t)(arg_count + 1));
+                    if (!resized) {
+                        parser_error(p, "out of memory while growing argument list");
+                        ast_free(arg);
+                        free(args);
+                        free(name);
+                        free(member_name);
+                        return parser_recover(p);
+                    }
+                    args = resized;
+                    args[arg_count++] = arg;
+                }
+                if (p->current.type == TOKEN_COMMA) advance_p(p);
+            }
+            expect_p(p, TOKEN_RPAREN, "missing ')' — did you forget to close the argument list?");
+            expect_p(p, TOKEN_SEMICOLON, "missing ';' after module member call");
+            ASTNode* obj = (ASTNode*)ast_new_identifier(name, obj_line, obj_column);
+            ASTNode* node = (ASTNode*)ast_new_member_call(obj, member_name, args, arg_count, line, column);
+            free(name);
+            free(member_name);
+            return node;
+        }
 
         if (p->current.type == TOKEN_LPAREN) {
             eat_p(p, TOKEN_LPAREN);
@@ -756,9 +902,12 @@ ASTNode* parse_statement(Parser* p) {
             }
             eat_p(p, TOKEN_EQUALS);
             /* Sprint 1 fix: same "missing initializer" check as the standalone
-             * `let` case — applies to `for (let i = ; ...)` as well. */
+             * `let` case — applies to `for (let i = ; ...)` as well.
+             * Sprint 4: same hint as the let case. */
             if (p->current.type == TOKEN_SEMICOLON) {
-                parser_error(p, "missing initializer after '=' in for-let declaration");
+                parser_error_with_hint(p,
+                    "missing initializer after '=' in for-let declaration",
+                    "did you forget a value after '='? e.g. `for (let i = 0; i < n; i++) { ... }`");
                 free(v_name);
                 free(v_type_annotation);
                 return parser_recover(p);

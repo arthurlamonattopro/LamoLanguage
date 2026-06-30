@@ -8,6 +8,7 @@ typedef enum {
     TOKEN_LET, TOKEN_FN, TOKEN_RETURN, TOKEN_IF, TOKEN_ELSE, TOKEN_WHILE, TOKEN_FOR,
     TOKEN_TRUE, TOKEN_FALSE, TOKEN_IMPORT,
     TOKEN_BREAK, TOKEN_CONTINUE,
+    TOKEN_AS,  /* Sprint 4: `as` keyword for `import "..." as alias;` */
 
     // Literals & Identifiers
     TOKEN_IDENTIFIER, TOKEN_INT, TOKEN_FLOAT, TOKEN_STRING,

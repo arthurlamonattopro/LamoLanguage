@@ -22,12 +22,24 @@ generated file (which is committed to the repo).
 ./lamo run   <file.lamo>            # Compile and run a Lamo source file
 ./lamo build <file.lamo> -o demo    # Compile to a binary, do not run
 ./lamo check <file.lamo>            # Parse + semantic-check only
+./lamo test                          # Run the test suite (tests/run_tests.sh)
+./lamo fmt   <file.lamo>            # Normalize source formatting in place
 ./lamo help                          # Show usage
 ./lamo version                       # Print version
 ```
 
 The compiler transpiles Lamo to C (`lamo_exec.c`), compiles it with GCC, and
 executes the result.
+
+### Namespaced Imports (Sprint 4)
+
+`import "math.lamo" as math;` exposes the imported file's top-level
+declarations under the `math` alias. Call them with `math.sqrt(25)`.
+The loader renames declarations to `lamo_mod_<alias>__<name>` and
+registers them in `src/modules.c`'s `LamoModuleRegistry`. The semantic
+pass and codegen consult this registry to resolve `AST_MEMBER_CALL`
+nodes. Legacy `import "math.lamo";` (without `as`) still merges into
+the global namespace as before.
 
 ## Architecture
 
@@ -69,6 +81,11 @@ Lamo is a transpiled language that compiles to C. The pipeline is:
   `src/lampm/lampm.h`), which `lamo_v2.c::main()` dispatches to when the
   subcommand is one of the package-manager ones (init, install, update,
   remove, list, info, outdated, why, lock, cache, doctor).
+- **src/modules.c** + **src/modules.h** — Module registry (Sprint 4) backing
+  the namespaced-import feature. The loader (`lamo_v2.c`) renames top-level
+  declarations of an aliased import to `lamo_mod_<alias>__<name>` and
+  registers them here; the semantic pass and codegen look them up via
+  `lamo_modules_resolve_member()` to resolve `alias.fn(args)` calls.
 - **src/lamo_v2.c** — Entry point: reads files, orchestrates compilation
   pipeline, handles imports recursively with cycle detection. Also parses
   global flags (--verbose / --quiet) and dispatches subcommands, including
@@ -91,6 +108,20 @@ Lamo is a transpiled language that compiles to C. The pipeline is:
   `gui_open`, `gui_should_close`, `gui_begin_frame`, `gui_draw_rect`,
   `gui_draw_text`, `gui_end_frame`, `gui_close`
 - HTTP server builtins: `http_route`, `http_serve`, `http_serve_once`
+- **Namespaced imports (Sprint 4)**: `import "..." as alias;` exposes the
+  imported file's top-level declarations under `alias`. Member access uses
+  `alias.fn(args)` syntax. Legacy `import "...";` (without `as`) still
+  merges into the global namespace.
+
+### Diagnostics (Sprint 4)
+
+Errors print `file:line:col: <kind> error: <message>`, followed by the
+source line with a caret pointing at the column, followed by an optional
+`hint: <advice>` line. The `<kind>` label is colored red+bold when stderr
+is a TTY; disable with `--no-color` or `LAMO_NO_COLOR=1`. Use
+`parser_error_with_hint(p, msg, hint)` (parser) and
+`semantic_error_at_hint(ctx, line, col, msg, hint)` (semantic) to attach
+a hint to a new error site.
 
 ### Code Style
 

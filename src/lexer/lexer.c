@@ -250,6 +250,7 @@ Token lexer_next_token(Lexer* l) {
         else if (strcmp(t.value, "import") == 0) t.type = TOKEN_IMPORT;
         else if (strcmp(t.value, "break") == 0) t.type = TOKEN_BREAK;
         else if (strcmp(t.value, "continue") == 0) t.type = TOKEN_CONTINUE;
+        else if (strcmp(t.value, "as") == 0) t.type = TOKEN_AS;
         // print, input, isnumber, isstring, exit, abs são identificadores comuns:
         // resolvidos como builtins na tabela de símbolos e no codegen.
         else t.type = TOKEN_IDENTIFIER;
@@ -373,6 +374,7 @@ const char* token_type_name(LamoTokenType type) {
         case TOKEN_IMPORT: return "import";
         case TOKEN_BREAK: return "break";
         case TOKEN_CONTINUE: return "continue";
+        case TOKEN_AS: return "as";
         case TOKEN_IDENTIFIER: return "IDENTIFIER";
         case TOKEN_INT: return "INT";
         case TOKEN_FLOAT: return "FLOAT";

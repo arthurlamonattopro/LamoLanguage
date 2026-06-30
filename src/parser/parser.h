@@ -22,6 +22,12 @@ ASTProgram* parse_program_v2(Parser* p);
 // depois de parse_program_v2 para saber se algum erro ocorreu.
 void parser_error(Parser* p, const char* message);
 
+/* Sprint 4: like parser_error, but with an optional hint printed below
+ * the source snippet. The hint is shown as "hint: <text>" and is meant
+ * to give actionable advice (e.g. "did you forget a value after '='?").
+ * Pass NULL when no hint is appropriate. */
+void parser_error_with_hint(Parser* p, const char* message, const char* hint);
+
 // Retorna 1 se o parser registrou pelo menos um erro desde a inicialização.
 int parser_had_error(const Parser* p);
 

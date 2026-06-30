@@ -385,6 +385,20 @@ EvalValue eval_expression(ASTNode* node, EvalEnv* env, EvalSignal* sig) {
 
         case AST_PROP_EXPR: {
             ASTPropExpr* pe = (ASTPropExpr*)node;
+            /* Sprint 4: if object is an identifier, this might be a
+             * module-qualified access (`math.PI`) from an aliased import.
+             * The eval/REPL path does not load modules through the
+             * CompilationState pipeline, so it has no module registry
+             * and cannot resolve these. Emit a clear error instead of
+             * the confusing "undefined variable 'math'" that would
+             * otherwise surface from eval_expression trying to look up
+             * the alias as a regular variable. */
+            if (pe->object && pe->object->type == AST_IDENTIFIER) {
+                RUNTIME_ERROR("module-qualified access `%s.%s` is not supported in eval/REPL mode (use `lamo run` instead)",
+                              ((ASTIdentifier*)pe->object)->name, pe->prop_name);
+                *sig = EVAL_SIG_ERROR;
+                return eval_error();
+            }
             EvalValue obj = eval_expression(pe->object, env, sig);
             if (*sig != EVAL_SIG_NONE) return obj;
             if (obj.type == EVAL_VAL_STRING && strcmp(pe->prop_name, "len") == 0) {
@@ -394,6 +408,19 @@ EvalValue eval_expression(ASTNode* node, EvalEnv* env, EvalSignal* sig) {
             }
             RUNTIME_ERROR("unknown property '%s'", pe->prop_name);
             eval_value_free(obj);
+            *sig = EVAL_SIG_ERROR;
+            return eval_error();
+        }
+
+        case AST_MEMBER_CALL: {
+            /* Sprint 4: `module.member(args)` — not supported in
+             * eval/REPL because there's no module registry. Emit a
+             * clear error pointing the user at `lamo run`. */
+            ASTMemberCall* mc = (ASTMemberCall*)node;
+            const char* alias = (mc->object && mc->object->type == AST_IDENTIFIER)
+                ? ((ASTIdentifier*)mc->object)->name : "<expr>";
+            RUNTIME_ERROR("module member call `%s.%s(...)` is not supported in eval/REPL mode (use `lamo run` instead)",
+                          alias, mc->member_name);
             *sig = EVAL_SIG_ERROR;
             return eval_error();
         }
@@ -672,6 +699,19 @@ EvalValue eval_statement(ASTNode* node, EvalEnv* env, EvalSignal* sig) {
             EvalValue result = eval_call(cs->name, cs->args, cs->arg_count, env, sig, node->line);
             eval_value_free(result);
             return eval_void();
+        }
+
+        case AST_MEMBER_CALL: {
+            /* Sprint 4: same as the expression case — emit a clear
+             * error rather than trying to look up the alias as a
+             * variable. */
+            ASTMemberCall* mc = (ASTMemberCall*)node;
+            const char* alias = (mc->object && mc->object->type == AST_IDENTIFIER)
+                ? ((ASTIdentifier*)mc->object)->name : "<expr>";
+            RUNTIME_ERROR("module member call `%s.%s(...)` is not supported in eval/REPL mode (use `lamo run` instead)",
+                          alias, mc->member_name);
+            *sig = EVAL_SIG_ERROR;
+            return eval_error();
         }
 
         case AST_IF_STMT: {

@@ -34,7 +34,15 @@ typedef enum {
      * etc. later without changing the AST shape). */
     AST_ARRAY_LITERAL,
     AST_INDEX_EXPR,
-    AST_PROP_EXPR
+    AST_PROP_EXPR,
+    /* Sprint 4: module member call — `module.member(args)`. `object` is
+     * the module alias (always AST_IDENTIFIER today), `member_name` is
+     * the function name being called inside the module, `args` /
+     * `arg_count` are the call arguments. Resolved by the semantic pass
+     * against the module registry kept in CompilationState; codegen emits
+     * a call to lamo_mod_<alias>__<member_name>. Lives in both statement
+     * and expression positions. */
+    AST_MEMBER_CALL
 } ASTNodeType;
 
 // Estrutura base para todos os nós da AST
@@ -178,6 +186,12 @@ typedef struct {
 typedef struct {
     ASTNode base;
     char* path;            // caminho bruto exatamente como apareceu entre aspas
+    /* Sprint 4: optional module alias. When non-NULL, the imported file's
+     * top-level declarations are renamed to `lamo_mod_<alias>__<name>` and
+     * accessed through `<alias>.<name>` syntax (AST_MEMBER_CALL). When NULL,
+     * the legacy behavior applies — everything is merged into the global
+     * namespace. */
+    char* alias;
 } ASTImport;
 
 /* Sprint 3: array literal — `[expr, expr, ...]`. elements is owned by
@@ -203,6 +217,24 @@ typedef struct {
     struct ASTNode* object;
     char* prop_name;
 } ASTPropExpr;
+
+/* Sprint 4: module member call — `module.member(args)`. `object` is
+ * conventionally an AST_IDENTIFIER naming a module alias declared by an
+ * earlier `import "..." as alias;`. `member_name` is the function inside
+ * the module. `args` / `arg_count` mirror ASTCallStmt.
+ *
+ * The same node type is used in both statement and expression positions;
+ * codegen and the interpreter dispatch on context. This avoids splitting
+ * the node into AST_MEMBER_CALL_STMT / AST_MEMBER_CALL_EXPR the way the
+ * legacy AST_CALL_STMT / AST_CALL_EXPR pair was split — a lesson learned
+ * the hard way from the call-stmt/call-expr duplication. */
+typedef struct {
+    ASTNode base;
+    struct ASTNode* object;       /* typically AST_IDENTIFIER(name = alias) */
+    char* member_name;            /* e.g. "sqrt" in `math.sqrt(x)` */
+    struct ASTNode** args;
+    int arg_count;
+} ASTMemberCall;
 
 typedef struct {
     ASTNode base;
@@ -243,9 +275,18 @@ ASTIdentifier* ast_new_identifier(char* name, int line, int column);
 ASTCallExpr* ast_new_call_expr(char* name, ASTNode** args, int arg_count, int line, int column);
 ASTGroupingExpr* ast_new_grouping_expr(ASTNode* expression, int line, int column);
 ASTImport* ast_new_import_decl(char* path, int line, int column);
+/* Sprint 4: variant of ast_new_import_decl that also takes a module alias.
+ * `alias` may be NULL — equivalent to the legacy constructor. The alias
+ * string is owned by the AST after this call (strdup'd). */
+ASTImport* ast_new_import_decl_aliased(char* path, char* alias, int line, int column);
 ASTArrayLiteral* ast_new_array_literal(ASTNode** elements, int element_count, int line, int column);
 ASTIndexExpr* ast_new_index_expr(ASTNode* array, ASTNode* index, int line, int column);
 ASTPropExpr* ast_new_prop_expr(ASTNode* object, char* prop_name, int line, int column);
+/* Sprint 4: module member call constructor. Takes ownership of `args`
+ * (the array, not the elements — elements are still owned by their
+ * constructors as usual). `member_name` is strdup'd. `object` is owned
+ * by the AST and freed in ast_free(). */
+ASTMemberCall* ast_new_member_call(ASTNode* object, char* member_name, ASTNode** args, int arg_count, int line, int column);
 void ast_program_append(ASTProgram* destination, ASTProgram* source);
 
 void ast_free(ASTNode* node);

@@ -79,6 +79,13 @@ typedef struct {
      * case semantic_error_at just omits the snippet. */
     SourceLookupFn source_lookup;
     void* source_lookup_user_data;
+    /* Sprint 4: module-resolution callbacks. May be NULL — in that case
+     * AST_MEMBER_CALL nodes always error with "module resolution not
+     * available". When set (by lamo_v2.c via semantic_analyze_full),
+     * they resolve `alias.member(args)` against the module registry. */
+    LamoModuleResolveFn module_resolve;
+    LamoModuleArityFn module_arity;
+    void* module_user_data;
     /* Return-type tracking: set when entering a function body so that
      * AST_RETURN_STMT can validate the returned expression against the
      * declared (or inferred) return type. LAMO_TYPE_UNKNOWN means either
@@ -90,6 +97,10 @@ typedef struct {
 
 static void semantic_visit_statement(SemanticContext* ctx, ASTNode* node);
 static LamoType semantic_infer_expression(SemanticContext* ctx, ASTNode* node);
+/* Sprint 4: forward declaration so semantic_error_at can delegate to
+ * the hinted variant below. */
+static void semantic_error_at_hint(SemanticContext* ctx, int line, int column,
+                                    const char* message, const char* hint);
 /* Sprint 2 refactor: arity lookup is now a single call into builtins.h's
  * lamo_builtin_arity(). The forward declaration is kept so the call sites
  * below don't need to be renamed. */
@@ -136,6 +147,16 @@ static void scope_free(Scope* scope) {
 }
 
 static void semantic_error_at(SemanticContext* ctx, int line, int column, const char* message) {
+    /* Delegate to the hinted variant with no hint. */
+    semantic_error_at_hint(ctx, line, column, message, NULL);
+}
+
+/* Sprint 4: semantic_error_at with an optional hint. The hint is
+ * printed below the source snippet as "hint: <text>". Pass NULL when
+ * no hint is appropriate. The hint should give actionable advice —
+ * e.g. "did you mean to declare 'x' with `let x = ...;`?". */
+static void semantic_error_at_hint(SemanticContext* ctx, int line, int column,
+                                    const char* message, const char* hint) {
     // Bug #5 fix: usa o file_path do nó específico que disparou o erro,
     // não o label global do contexto. Em compilações multi-arquivo (programa
     // principal + imports), isso significa que o erro aponta para o arquivo
@@ -148,8 +169,15 @@ static void semantic_error_at(SemanticContext* ctx, int line, int column, const 
     // file_path do contexto.
     const char* label = ctx->last_node_path ? ctx->last_node_path :
                         (ctx->file_path ? ctx->file_path : "<input>");
-    fprintf(stderr, "%s:%d:%d: semantic error: %s\n",
-            label, line, column, message);
+    /* Sprint 4: color the "semantic error" label red+bold on TTY. */
+    if (lamo_error_use_color()) {
+        fprintf(stderr, "%s:%d:%d: %ssemantic error:%s %s\n",
+                label, line, column,
+                LAMO_COLOR_BOLD LAMO_COLOR_RED, LAMO_COLOR_RESET, message);
+    } else {
+        fprintf(stderr, "%s:%d:%d: semantic error: %s\n",
+                label, line, column, message);
+    }
     /* Sprint 3: print the source line + caret. We ask the registered
      * source-lookup callback for the source text of the current file;
      * if no callback is registered (e.g. semantic_analyze was called
@@ -161,6 +189,8 @@ static void semantic_error_at(SemanticContext* ctx, int line, int column, const 
             error_print_snippet(stderr, source, line, column);
         }
     }
+    /* Sprint 4: print the hint below the snippet, if any. */
+    error_print_hint(stderr, hint);
     ctx->errors++;
 }
 
@@ -272,8 +302,12 @@ static LamoType semantic_visit_call(SemanticContext* ctx, const char* name, ASTN
         return_type = builtin_function_return_type(name, args, arg_count);
     } else {
         char message[256];
+        char hint[256];
         snprintf(message, sizeof(message), "call to undeclared function '%s'", name);
-        semantic_error_at(ctx, line, column, message);
+        snprintf(hint, sizeof(hint),
+                 "did you forget to define '%s' (with `fn %s(...) { ... }`) or import it (with `import \"...\" as ...;`)?",
+                 name, name);
+        semantic_error_at_hint(ctx, line, column, message, hint);
     }
 
     for (int i = 0; i < arg_count; i++) {
@@ -727,8 +761,12 @@ static void semantic_visit_statement(SemanticContext* ctx, ASTNode* node) {
             Symbol* symbol = scope_find(ctx->current_scope, assign_stmt->name);
             if (!symbol || symbol->kind != SYMBOL_VAR) {
                 char message[256];
+                char hint[256];
                 snprintf(message, sizeof(message), "assignment to undeclared variable '%s'", assign_stmt->name);
-                semantic_error_at(ctx, node->line, node->column, message);
+                snprintf(hint, sizeof(hint),
+                         "did you mean `let %s = ...;`? Lamo requires variables to be declared before assignment.",
+                         assign_stmt->name);
+                semantic_error_at_hint(ctx, node->line, node->column, message, hint);
             }
             LamoType value_type = semantic_infer_expression(ctx, assign_stmt->value);
             // Update the variable's inferred type to the new value. Lamo is
@@ -759,6 +797,15 @@ static void semantic_visit_statement(SemanticContext* ctx, ASTNode* node) {
         case AST_CALL_STMT: {
             ASTCallStmt* call_stmt = (ASTCallStmt*)node;
             semantic_visit_call(ctx, call_stmt->name, call_stmt->args, call_stmt->arg_count, node->line, node->column);
+            break;
+        }
+        case AST_MEMBER_CALL: {
+            /* Sprint 4: `module.member(args);` statement. Resolve the
+             * alias against the module registry, validate the member
+             * exists, and validate call arity. The args are visited for
+             * type errors just like a regular call. */
+            ASTMemberCall* mc = (ASTMemberCall*)node;
+            semantic_infer_expression(ctx, (ASTNode*)mc);  /* reuse the expression-path logic */
             break;
         }
         case AST_IMPORT:
@@ -801,8 +848,12 @@ static LamoType semantic_infer_expression(SemanticContext* ctx, ASTNode* node) {
                 // Permite usar builtins como valores? Por enquanto não — apenas
                 // como calls. Variáveis precisam estar declaradas.
                 char message[256];
+                char hint[256];
                 snprintf(message, sizeof(message), "use of undeclared variable '%s'", identifier->name);
-                semantic_error_at(ctx, node->line, node->column, message);
+                snprintf(hint, sizeof(hint),
+                         "did you forget to declare it with `let %s = ...;`?",
+                         identifier->name);
+                semantic_error_at_hint(ctx, node->line, node->column, message, hint);
                 return LAMO_TYPE_UNKNOWN;
             }
             return symbol->type;
@@ -883,6 +934,71 @@ static LamoType semantic_infer_expression(SemanticContext* ctx, ASTNode* node) {
             ASTCallExpr* call_expr = (ASTCallExpr*)node;
             return semantic_visit_call(ctx, call_expr->name, call_expr->args, call_expr->arg_count, node->line, node->column);
         }
+        case AST_MEMBER_CALL: {
+            /* Sprint 4: `module.member(args)` in expression position.
+             * Resolve through the module registry; if found, treat like
+             * a regular function call (validate arity, visit args). The
+             * return type is LAMO_TYPE_UNKNOWN — the module member's
+             * body is the prefixed function, and we don't have a cheap
+             * way to look up its inferred return type from here. The
+             * type-inference downstream will simply treat the result as
+             * unknown, which is safe (no cascading errors). */
+            ASTMemberCall* mc = (ASTMemberCall*)node;
+            const char* alias = NULL;
+            /* Object should be AST_IDENTIFIER for a module member call.
+             * Anything else (e.g. `arr.len()` where arr is an expression)
+             * is not currently supported — emit a clear error. */
+            if (!mc->object || mc->object->type != AST_IDENTIFIER) {
+                semantic_error_at(ctx, node->line, node->column,
+                                  "member call on non-identifier is not supported (only `module.fn(args)`)");
+                /* Still visit args for cascading errors. */
+                for (int i = 0; i < mc->arg_count; i++) {
+                    semantic_infer_expression(ctx, mc->args[i]);
+                }
+                return LAMO_TYPE_UNKNOWN;
+            }
+            alias = ((ASTIdentifier*)mc->object)->name;
+
+            if (!ctx->module_resolve || !ctx->module_arity) {
+                semantic_error_at(ctx, node->line, node->column,
+                                  "module resolution not available in this context (are you running through the REPL?)");
+                for (int i = 0; i < mc->arg_count; i++) {
+                    semantic_infer_expression(ctx, mc->args[i]);
+                }
+                return LAMO_TYPE_UNKNOWN;
+            }
+
+            const char* resolved = ctx->module_resolve(alias, mc->member_name, ctx->module_user_data);
+            if (!resolved) {
+                /* Either the alias doesn't exist, or the member doesn't
+                 * exist under that alias. Emit a helpful error. */
+                char message[256];
+                snprintf(message, sizeof(message),
+                         "module `%s` has no member `%s` (or module `%s` was not imported)",
+                         alias, mc->member_name, alias);
+                semantic_error_at(ctx, node->line, node->column, message);
+                for (int i = 0; i < mc->arg_count; i++) {
+                    semantic_infer_expression(ctx, mc->args[i]);
+                }
+                return LAMO_TYPE_UNKNOWN;
+            }
+
+            /* Validate arity. */
+            int expected_arity = ctx->module_arity(alias, mc->member_name, ctx->module_user_data);
+            if (expected_arity >= 0 && expected_arity != mc->arg_count) {
+                char message[256];
+                snprintf(message, sizeof(message),
+                         "module member `%s.%s` expects %d argument(s), got %d",
+                         alias, mc->member_name, expected_arity, mc->arg_count);
+                semantic_error_at(ctx, node->line, node->column, message);
+            }
+
+            /* Visit args for type errors. */
+            for (int i = 0; i < mc->arg_count; i++) {
+                semantic_infer_expression(ctx, mc->args[i]);
+            }
+            return LAMO_TYPE_UNKNOWN;
+        }
         case AST_GROUPING_EXPR:
             return semantic_infer_expression(ctx, ((ASTGroupingExpr*)node)->expression);
         default:
@@ -895,6 +1011,20 @@ static LamoType semantic_infer_expression(SemanticContext* ctx, ASTNode* node) {
 
 int semantic_analyze_with_source_lookup(ASTProgram* program, const char* file_path,
                                         LamoSourceLookupFn lookup, void* user_data) {
+    /* Delegate to the full entry point with NULL module callbacks —
+     * keeps the Sprint 3 signature compatible. */
+    return semantic_analyze_full(program, file_path, lookup, user_data,
+                                  NULL, NULL, NULL);
+}
+
+/* Sprint 4: full entry point with module-resolution callbacks. The
+ * source-lookup and module callbacks may all be NULL; the semantic pass
+ * just skips the corresponding features. */
+int semantic_analyze_full(ASTProgram* program, const char* file_path,
+                          LamoSourceLookupFn src_lookup, void* src_user_data,
+                          LamoModuleResolveFn mod_resolve,
+                          LamoModuleArityFn mod_arity,
+                          void* mod_user_data) {
     SemanticContext ctx;
     ctx.file_path = file_path;
     ctx.last_node_path = NULL;  // Bug #5 fix: preenchido por node->file_path
@@ -904,8 +1034,13 @@ int semantic_analyze_with_source_lookup(ASTProgram* program, const char* file_pa
     ctx.errors = 0;
     /* Sprint 3: source lookup for error snippets. May be NULL — in that
      * case semantic_error_at just omits the snippet. */
-    ctx.source_lookup = lookup;
-    ctx.source_lookup_user_data = user_data;
+    ctx.source_lookup = src_lookup;
+    ctx.source_lookup_user_data = src_user_data;
+    /* Sprint 4: module-resolution callbacks. May be NULL — in that case
+     * AST_MEMBER_CALL nodes always error. */
+    ctx.module_resolve = mod_resolve;
+    ctx.module_arity = mod_arity;
+    ctx.module_user_data = mod_user_data;
     /* Return-type tracking: UNKNOWN at top level (not inside any function). */
     ctx.current_fn_return_type = LAMO_TYPE_UNKNOWN;
     ctx.current_fn_name = NULL;

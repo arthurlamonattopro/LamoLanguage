@@ -20,7 +20,8 @@ RUNTIME_DATA   = src/codegen/lamo_runtime_data.c
 # lampm.c is the integrated package manager (originally a separate
 # LamoPacketManager binary). It now compiles into the main `lamo`
 # executable and is reachable through `lamo install`, `lamo update`, etc.
-SRCS = src/lamo_v2.c src/lexer/lexer.c src/parser/parser.c src/ast/ast.c src/codegen/codegen.c src/semantic/semantic.c src/eval/eval.c src/lampm/lampm.c $(RUNTIME_DATA)
+# modules.c backs the Sprint 4 namespaced-import feature (`import "..." as alias;`).
+SRCS = src/lamo_v2.c src/lexer/lexer.c src/parser/parser.c src/ast/ast.c src/codegen/codegen.c src/semantic/semantic.c src/eval/eval.c src/lampm/lampm.c src/modules.c $(RUNTIME_DATA)
 OBJS = $(SRCS:.c=.o)
 
 ifeq ($(OS),Windows_NT)
@@ -46,7 +47,16 @@ $(RUNTIME_DATA): $(RUNTIME_HEADER) scripts/embed_runtime.py
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) $(OBJS) -o $@ $(LDFLAGS)
 
-%.o: %.c
+# Sprint 4 fix: header dependencies. The old pattern rule `%.o: %.c` only
+# tracked .c mtime, so editing a shared header (lexer.h, ast.h, builtins.h,
+# error_util.h, etc.) would NOT rebuild the .o files that included it —
+# leading to silent ABI skew (e.g. enum value shifts) that produced wrong
+# codegen. We now list the headers each .c file transitively includes, so
+# `make` does the right thing on header edits. Generated lamo_runtime_data.c
+# has no extra deps beyond itself.
+SRCS_DEP_H = src/lexer/lexer.h src/parser/parser.h src/ast/ast.h src/builtins.h src/error_util.h src/semantic/semantic.h src/codegen/codegen.h src/codegen/lamo_runtime_data.h src/codegen/lamo_runtime.h src/eval/eval.h src/lampm/lampm.h src/modules.h
+
+%.o: %.c $(SRCS_DEP_H)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:

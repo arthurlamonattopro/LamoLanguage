@@ -189,10 +189,13 @@ Objective: make Lamo pleasant to build, test, and extend.
 - [x] Add `LAMO_CC` env var to override the C compiler used by `run`/`build`.
 - [x] Improve backend failure messages (now name the C compiler and exit code).
 - [x] Add golden tests for emitted C where useful.
-- [ ] Improve diagnostic formatting with file, line, column, and source snippets.
-- [ ] Consider a formatter or at least a canonical style guide.
+- [x] Improve diagnostic formatting with file, line, column, and source snippets.
+- [x] Add a basic formatter (`lamo fmt`) that normalizes line endings, tabs, trailing whitespace, and trailing newlines. (A full AST-based pretty-printer is still future work.)
 - [ ] Keep examples representative of supported features.
 - [x] Reduce noisy success output unless verbose mode is requested.
+- [x] Add `lamo test` to run the test suite without invoking `make test` or the shell script directly.
+- [x] Add error hints (`hint: did you forget ...?` lines under error snippets) for common mistakes like missing initializers, undeclared variables, undeclared functions, and missing `let` on assignment.
+- [x] Add ANSI color in diagnostics (auto-detected on TTY; disable with `--no-color` or `LAMO_NO_COLOR=1`).
 
 ### Exit Criteria
 
@@ -225,11 +228,20 @@ Objective: move from basic imported scripts to a deliberate multi-file language 
 - [x] Fix `lampm` bugs: `_POSIX_C_SOURCE` feature-macro missing under `-std=c99`
       (broke `popen`/`pclose`/`S_IFDIR`); `2>nul` Windows-only null redirection
       used on POSIX (created a literal file named `nul`).
+- [x] **Namespaced imports** (Sprint 4): `import "..." as alias;` exposes the
+      imported file's top-level declarations under `alias`. Member access uses
+      the `alias.fn(args)` syntax (new `AST_MEMBER_CALL` node). The loader
+      renames declarations to `lamo_mod_<alias>__<name>` and registers them
+      in a module registry (`src/modules.c`); the semantic pass and codegen
+      consult the registry to resolve and emit member calls. Arity is
+      validated the same way as regular function calls.
 - [ ] Define whether imported symbols are all public by default or need explicit export rules.
 - [ ] Decide how package or folder-based modules should work.
 - [x] Detect and report import cycles explicitly.
 - [ ] Define duplicate import behavior.
 - [ ] Clarify entry file vs library file expectations.
+- [ ] Extend `lamo eval` and `lamo repl` to load modules through the registry
+      (today they emit a clear "use `lamo run` instead" error for member calls).
 
 ### Exit Criteria
 

@@ -1,12 +1,24 @@
 #include "codegen.h"
 #include "lamo_runtime_data.h"
 #include "../builtins.h"
+#include "../modules.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>   /* fmod() — used by constant folding for float % */
 
 static int indent_level = 0;
+
+/* Sprint 4: module registry pointer. Set via codegen_set_module_registry()
+ * before generate_c_code() is called. May be NULL — in that case,
+ * AST_MEMBER_CALL nodes emit a defensive `lamo_make_int(0)` (the
+ * semantic pass should have already rejected them, so this is just a
+ * safety net). */
+static LamoModuleRegistry* g_module_registry = NULL;
+
+void codegen_set_module_registry(LamoModuleRegistry* reg) {
+    g_module_registry = reg;
+}
 
 static void print_indent(FILE* out) {
     int i;
@@ -833,6 +845,29 @@ static void generate_statement_code(ASTNode* node, FILE* out) {
             fprintf(out, ";\n");
             break;
         }
+        case AST_MEMBER_CALL: {
+            /* Sprint 4: `module.member(args);` statement. Resolve the
+             * alias through the module registry and emit a call to the
+             * prefixed function name (e.g. `lamo_u_lamo_mod_math__sqrt`).
+             * If the registry isn't set or the member isn't found, emit
+             * a defensive no-op (the semantic pass should have caught
+             * this already). */
+            ASTMemberCall* mc = (ASTMemberCall*)node;
+            const char* prefixed = NULL;
+            if (g_module_registry && mc->object && mc->object->type == AST_IDENTIFIER) {
+                const char* alias = ((ASTIdentifier*)mc->object)->name;
+                prefixed = lamo_modules_resolve_member(g_module_registry, alias, mc->member_name);
+            }
+            if (prefixed) {
+                fprintf(out, "%s(", user_name1(prefixed));
+                generate_call_arguments(mc->args, mc->arg_count, out);
+                fprintf(out, ")");
+            } else {
+                fprintf(out, "lamo_make_int(0)");
+            }
+            fprintf(out, ";\n");
+            break;
+        }
         case AST_IMPORT:
             // import é resolvido antes do codegen; não emite nada aqui.
             break;
@@ -1025,6 +1060,25 @@ static void generate_expression_code(ASTNode* node, FILE* out) {
                 fprintf(out, "%s(", user_name1(call_expr->name));
                 generate_call_arguments(call_expr->args, call_expr->arg_count, out);
                 fprintf(out, ")");
+            }
+            break;
+        }
+        case AST_MEMBER_CALL: {
+            /* Sprint 4: `module.member(args)` in expression position.
+             * Same resolution as the statement case — emit a call to
+             * the prefixed function name. */
+            ASTMemberCall* mc = (ASTMemberCall*)node;
+            const char* prefixed = NULL;
+            if (g_module_registry && mc->object && mc->object->type == AST_IDENTIFIER) {
+                const char* alias = ((ASTIdentifier*)mc->object)->name;
+                prefixed = lamo_modules_resolve_member(g_module_registry, alias, mc->member_name);
+            }
+            if (prefixed) {
+                fprintf(out, "%s(", user_name1(prefixed));
+                generate_call_arguments(mc->args, mc->arg_count, out);
+                fprintf(out, ")");
+            } else {
+                fprintf(out, "lamo_make_int(0)");
             }
             break;
         }

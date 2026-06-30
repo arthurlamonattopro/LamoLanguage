@@ -197,8 +197,17 @@ ASTGroupingExpr* ast_new_grouping_expr(ASTNode* expression, int line, int column
 }
 
 ASTImport* ast_new_import_decl(char* path, int line, int column) {
+    return ast_new_import_decl_aliased(path, NULL, line, column);
+}
+
+/* Sprint 4: aliased import constructor. The legacy ast_new_import_decl()
+ * above is now a thin wrapper. `alias` may be NULL (legacy global-merge
+ * behavior). The alias string is strdup'd so the caller may free its
+ * copy immediately. */
+ASTImport* ast_new_import_decl_aliased(char* path, char* alias, int line, int column) {
     ASTImport* node = (ASTImport*)ast_new_node(AST_IMPORT, sizeof(ASTImport), line, column);
     node->path = strdup(path);
+    node->alias = alias ? strdup(alias) : NULL;
     return node;
 }
 
@@ -223,6 +232,19 @@ ASTPropExpr* ast_new_prop_expr(ASTNode* object, char* prop_name, int line, int c
     ASTPropExpr* node = (ASTPropExpr*)ast_new_node(AST_PROP_EXPR, sizeof(ASTPropExpr), line, column);
     node->object = object;
     node->prop_name = strdup(prop_name);
+    return node;
+}
+
+/* Sprint 4: module member call constructor. `object` is owned by the AST
+ * after this call. `member_name` is strdup'd. `args` array is owned but
+ * its elements are NOT — they remain owned by their respective constructors
+ * (which is the same convention as ASTCallStmt / ASTCallExpr). */
+ASTMemberCall* ast_new_member_call(ASTNode* object, char* member_name, ASTNode** args, int arg_count, int line, int column) {
+    ASTMemberCall* node = (ASTMemberCall*)ast_new_node(AST_MEMBER_CALL, sizeof(ASTMemberCall), line, column);
+    node->object = object;
+    node->member_name = strdup(member_name);
+    node->args = args;
+    node->arg_count = arg_count;
     return node;
 }
 
@@ -359,6 +381,8 @@ void ast_free(ASTNode* node) {
                 break;
             case AST_IMPORT:
                 free(((ASTImport*)node)->path);
+                /* Sprint 4: free optional module alias. */
+                free(((ASTImport*)node)->alias);
                 break;
             case AST_ARRAY_LITERAL: {
                 /* Sprint 3: array literal. Free each element expression,
@@ -381,6 +405,19 @@ void ast_free(ASTNode* node) {
                 ASTPropExpr* prop = (ASTPropExpr*)node;
                 ast_free(prop->object);
                 free(prop->prop_name);
+                break;
+            }
+            case AST_MEMBER_CALL: {
+                /* Sprint 4: module member call. Free object, member_name,
+                 * each arg expression, then the args array itself. */
+                ASTMemberCall* mc = (ASTMemberCall*)node;
+                int i;
+                ast_free(mc->object);
+                free(mc->member_name);
+                for (i = 0; i < mc->arg_count; i++) {
+                    ast_free(mc->args[i]);
+                }
+                free(mc->args);
                 break;
             }
         }

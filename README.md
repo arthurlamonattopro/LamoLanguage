@@ -14,6 +14,10 @@ Implemented now:
 - C code generation
 - compile, build, and run CLI flow
 - fixture-based compiler tests
+- **namespaced module system** (`import "..." as alias;` + `alias.fn(args)`)
+- **error hints** (`hint: did you forget ...?` lines under error snippets)
+- **ANSI color** in diagnostics (auto-detected; disable with `--no-color`)
+- **`lamo test`** and **`lamo fmt`** CLI commands
 
 Implemented in semantics:
 
@@ -26,15 +30,16 @@ Implemented in semantics:
 - compile-time type inference and operator checks (e.g. `"abc" * 3` is rejected at compile time, not at runtime)
 - per-node file-aware diagnostics across merged multi-file builds (errors
   inside an imported file point to that file, not to `<multiple inputs>`)
+- module member call validation (`math.sqrt(x)` resolves through the
+  module registry; arity is checked the same way as regular calls)
 
 Not implemented yet:
 
 - typed variable or function declarations (types are inferred, not annotated)
 - a standard runtime/library design
-- richer diagnostics with source snippets
 - arrays, structs, and maps (only `string` is a composite type today)
-- module system with explicit exports (today all `import`ed declarations are
-  merged into a single global namespace)
+- AST-based pretty-printer in `lamo fmt` (the current formatter only
+  normalizes whitespace, line endings, and trailing newlines)
 
 ## Language Features
 
@@ -113,6 +118,48 @@ print("HTTP server on http://127.0.0.1:8080");
 http_serve(8080);
 ```
 
+### Modules and Namespaced Imports
+
+Lamo supports two import forms:
+
+- **Legacy global merge** — `import "math.lamo";` keeps the previous
+  behavior: every top-level declaration in `math.lamo` becomes
+  available in the global namespace as if it had been defined in the
+  importing file. Use this for quick scripts where name collisions
+  aren't a concern.
+- **Namespaced** — `import "math.lamo" as math;` exposes the imported
+  file's top-level functions and globals under the `math` alias. You
+  then call them as `math.sqrt(25)`, `math.add(3, 4)`, etc. The alias
+  can be any valid identifier — `import "math.lamo" as m;` and
+  `m.sqrt(25)` work too.
+
+Example:
+
+```lamo
+// math.lamo
+fn sqrt(n) { return n * n; }    // not really sqrt, just for the example
+fn add(a, b) { return a + b; }
+```
+
+```lamo
+// main.lamo
+import "math.lamo" as math;
+
+print(math.sqrt(5));     // 25
+print(math.add(3, 4));   // 7
+```
+
+The semantic pass validates member access against the module registry:
+- calling `math.unknown(...)` produces a clear error pointing at the
+  call site, with the available members listed
+- arity is checked the same way as regular function calls
+  (`math.sqrt(1, 2, 3)` is rejected at compile time)
+
+Known limitation: the `lamo eval` and `lamo repl` paths do not load
+modules through the registry, so `math.sqrt(x)` in those modes raises
+a clear "use `lamo run` instead" error. Use `lamo run` for any program
+that uses namespaced imports.
+
 ## Build And Run
 
 Build the compiler:
@@ -125,7 +172,7 @@ Or compile directly with GCC:
 
 ```sh
 gcc -Wall -Wextra -std=c99 -O2 -g -Isrc -Isrc/lexer -Isrc/parser -Isrc/ast -Isrc/codegen -Isrc/semantic -Isrc/eval \
-    src/lamo_v2.c src/lexer/lexer.c src/parser/parser.c src/ast/ast.c src/codegen/codegen.c src/semantic/semantic.c src/eval/eval.c src/codegen/lamo_runtime_data.c \
+    src/lamo_v2.c src/lexer/lexer.c src/parser/parser.c src/ast/ast.c src/codegen/codegen.c src/semantic/semantic.c src/eval/eval.c src/lampm/lampm.c src/modules.c src/codegen/lamo_runtime_data.c \
     -o lamo -lm
 ```
 
@@ -209,6 +256,33 @@ Remove generated build artifacts:
 This deletes `lamo_exec.c`, `lamo_exec`, and `lamo_exec.exe` from the current
 directory. Source files are untouched.
 
+Run the test suite:
+
+```sh
+./lamo test
+```
+
+Invokes `tests/run_tests.sh` (POSIX) or `tests/run_tests.ps1` (Windows),
+discovering `.lamo` files under `tests/valid/` (must `check` successfully),
+`tests/invalid/` (must fail `check`), and `tests/runtime/` (must `run` and
+produce stdout matching the sibling `.expected` file). With no argument, uses
+`./lamo`; pass a path to use a different binary. Exits 0 on full pass, 1 on
+any failure.
+
+Normalize source formatting:
+
+```sh
+./lamo fmt main.lamo
+./lamo fmt main.lamo lib.lamo        # multiple files
+./lamo fmt --check main.lamo         # CI mode: print diff, exit non-zero if needs formatting
+```
+
+Rewrites each file in place with conservative, idempotent transformations:
+CRLF → LF, tabs → 4 spaces, trailing whitespace stripped, file ends with
+exactly one newline. Does **not** reflow expressions or reindent blocks — a
+full AST-based pretty-printer is future work (see roadmap). Safe to run on
+any `.lamo` file.
+
 Show help or version:
 
 ```sh
@@ -228,9 +302,10 @@ Show help or version:
 ### Environment Variables
 
 ```
-LAMO_CC       C compiler to use for `run`/`build` (default: gcc)
-LAMO_VERBOSE  Same as --verbose
-LAMO_QUIET    Same as --quiet
+LAMO_CC         C compiler to use for `run`/`build` (default: gcc)
+LAMO_VERBOSE    Same as --verbose
+LAMO_QUIET      Same as --quiet
+LAMO_NO_COLOR   Same as --no-color (disables ANSI color in diagnostics)
 ```
 
 Example: use `clang` instead of `gcc`:
@@ -341,12 +416,14 @@ The tests cover:
 - [src/eval/eval.c](./src/eval/eval.c) — tree-walking interpreter (powers `lamo eval` and `lamo repl`)
 - [src/lampm/lampm.c](./src/lampm/lampm.c) — integrated package manager (formerly `lampm`)
 - [src/lampm/lampm.h](./src/lampm/lampm.h) — public API for the package manager
+- [src/modules.c](./src/modules.c) + [src/modules.h](./src/modules.h) — module registry backing the namespaced-import feature (`import "..." as alias;` + `alias.fn(args)`)
 - [src/lamo_v2.c](./src/lamo_v2.c) — CLI entry point: parses global flags, dispatches subcommands
 - [tests/run_tests.sh](./tests/run_tests.sh) — POSIX test runner
 - [tests/run_tests.ps1](./tests/run_tests.ps1) — Windows PowerShell test runner
 - [tests/valid/](./tests/valid) — programs that must `check` successfully
 - [tests/invalid/](./tests/invalid) — programs that must fail `check`
 - [tests/runtime/](./tests/runtime) — programs that must `run` and match expected stdout
+- [tests/fixtures/](./tests/fixtures) — helper files imported by other tests (e.g. the module-alias helper)
 
 ## Contributor Note
 
