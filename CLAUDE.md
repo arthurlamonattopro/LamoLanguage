@@ -60,8 +60,19 @@ Lamo is a transpiled language that compiles to C. The pipeline is:
   `-Wunused-function`.
 - **src/codegen/lamo_runtime_data.{c,h}** — Auto-generated embedded-string
   version of `lamo_runtime.h`. Regenerate with `python3 scripts/embed_runtime.py`.
+- **src/eval/eval.c** — Tree-walking AST interpreter. Powers `lamo eval`
+  and `lamo repl`. Independent of the C codegen backend.
+- **src/lampm/lampm.c** — Integrated package manager. Originally a separate
+  `lampm` binary (LamoPacketManager repo); now compiled into the main `lamo`
+  executable. Reachable through `lamo install`, `lamo update`, `lamo list`,
+  etc. The single public entry point is `lampm_main()` (see
+  `src/lampm/lampm.h`), which `lamo_v2.c::main()` dispatches to when the
+  subcommand is one of the package-manager ones (init, install, update,
+  remove, list, info, outdated, why, lock, cache, doctor).
 - **src/lamo_v2.c** — Entry point: reads files, orchestrates compilation
-  pipeline, handles imports recursively with cycle detection.
+  pipeline, handles imports recursively with cycle detection. Also parses
+  global flags (--verbose / --quiet) and dispatches subcommands, including
+  the package-manager ones via `lampm_main()`.
 
 ### Language Features
 

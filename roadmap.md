@@ -177,14 +177,22 @@ Objective: make Lamo pleasant to build, test, and extend.
 - better diagnostics
 - clearer build flow
 - style and contribution guidance
+- REPL, project scaffolding, and clean commands
 
 ### Tasks
 
-- Add golden tests for emitted C where useful.
-- Improve diagnostic formatting with file, line, column, and source snippets.
-- Consider a formatter or at least a canonical style guide.
-- Keep examples representative of supported features.
-- Reduce noisy success output unless verbose mode is requested.
+- [x] Add `lamo repl` (interactive read-eval-print loop using the eval module).
+- [x] Add `lamo new <project-name>` (scaffolds main.lamo, .gitignore, lamo.pkg).
+- [x] Add `lamo clean` (removes lamo_exec* artifacts).
+- [x] Add per-command help (`lamo help run`, `lamo help new`, etc.).
+- [x] Add `--verbose` / `--quiet` global flags and `LAMO_VERBOSE` / `LAMO_QUIET` env vars.
+- [x] Add `LAMO_CC` env var to override the C compiler used by `run`/`build`.
+- [x] Improve backend failure messages (now name the C compiler and exit code).
+- [x] Add golden tests for emitted C where useful.
+- [ ] Improve diagnostic formatting with file, line, column, and source snippets.
+- [ ] Consider a formatter or at least a canonical style guide.
+- [ ] Keep examples representative of supported features.
+- [x] Reduce noisy success output unless verbose mode is requested.
 
 ### Exit Criteria
 
@@ -200,14 +208,28 @@ Objective: move from basic imported scripts to a deliberate multi-file language 
 - import/module system defined in the frontend
 - symbol visibility rules
 - predictable project layout rules
+- a working package manager with version pinning and a lockfile, integrated
+  into the main `lamo` binary
 
 ### Tasks
 
-- Define whether imported symbols are all public by default or need explicit export rules.
-- Decide how package or folder-based modules should work.
-- Detect and report import cycles explicitly.
-- Define duplicate import behavior.
-- Clarify entry file vs library file expectations.
+- [x] **Merge `lampm` into `lamo`.** The package manager is now a set of
+      subcommands of the main `lamo` binary (`lamo install`, `lamo update`,
+      `lamo list`, etc.) rather than a separate executable. Implementation
+      lives in `src/lampm/lampm.c` and is dispatched from `lamo_v2.c::main()`
+      through `lampm_main()` (declared in `src/lampm/lampm.h`).
+- [x] LamoPacketManager v0.2: version pinning (`@ref`), lockfile (`lamo.lock`),
+      new commands (`update`, `outdated`, `info`, `doctor`, `cache`, `lock`, `why`),
+      non-GitHub sources (gitlab/bitbucket/generic git), `.gitignore` scaffolding,
+      per-subcommand help, `--verbose`/`--quiet`/`--no-color` global flags.
+- [x] Fix `lampm` bugs: `_POSIX_C_SOURCE` feature-macro missing under `-std=c99`
+      (broke `popen`/`pclose`/`S_IFDIR`); `2>nul` Windows-only null redirection
+      used on POSIX (created a literal file named `nul`).
+- [ ] Define whether imported symbols are all public by default or need explicit export rules.
+- [ ] Decide how package or folder-based modules should work.
+- [x] Detect and report import cycles explicitly.
+- [ ] Define duplicate import behavior.
+- [ ] Clarify entry file vs library file expectations.
 
 ### Exit Criteria
 

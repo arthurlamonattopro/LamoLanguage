@@ -1,6 +1,6 @@
 # Lamo Language
 
-Lamo is a small experimental programming language implemented in C. Today it has a lexer, parser, AST, a first semantic-analysis pass, and a C backend with `run`, `build`, and `check` commands.
+Lamo is a small experimental programming language implemented in C. Today it has a lexer, parser, AST, a first semantic-analysis pass, and a C backend with `run`, `build`, `check`, and `eval` commands. The repository also ships an integrated package manager (formerly a separate `lampm` binary) reachable through the same `lamo` executable as `lamo install`, `lamo update`, `lamo list`, etc.
 
 Licensed under the [MIT License](./LICENSE).
 
@@ -124,9 +124,9 @@ make
 Or compile directly with GCC:
 
 ```sh
-gcc -Wall -Wextra -std=c99 -Isrc -Isrc/lexer -Isrc/parser -Isrc/ast -Isrc/codegen -Isrc/semantic \
-    src/lamo_v2.c src/lexer/lexer.c src/parser/parser.c src/ast/ast.c src/codegen/codegen.c src/semantic/semantic.c \
-    -o lamo
+gcc -Wall -Wextra -std=c99 -O2 -g -Isrc -Isrc/lexer -Isrc/parser -Isrc/ast -Isrc/codegen -Isrc/semantic -Isrc/eval \
+    src/lamo_v2.c src/lexer/lexer.c src/parser/parser.c src/ast/ast.c src/codegen/codegen.c src/semantic/semantic.c src/eval/eval.c src/codegen/lamo_runtime_data.c \
+    -o lamo -lm
 ```
 
 Run a program:
@@ -159,16 +159,150 @@ Check parsing and semantics only:
 ./lamo check examples/test.lamo
 ```
 
+Interpret a program without going through GCC (uses the built-in
+tree-walking evaluator):
+
+```sh
+./lamo eval examples/test.lamo
+```
+
+Start an interactive REPL:
+
+```sh
+./lamo repl
+```
+
+In the REPL, lines starting with `let`, `fn`, `if`, `while`, `for`,
+`return`, `break`, `continue`, or `import` are parsed as statements;
+everything else is parsed as an expression and its value is printed:
+
+```
+lamo> 1 + 2
+3
+lamo> let x = 10;
+lamo> x * 2
+20
+lamo> fn double(n) { return n * 2; }
+lamo> double(21)
+42
+lamo> .exit
+```
+
+Scaffold a new Lamo project:
+
+```sh
+./lamo new my-app
+cd my-app
+./lamo run main.lamo
+```
+
+This creates `my-app/main.lamo` (a hello-world entry point), `my-app/.gitignore`
+(ignoring `lamo_exec*` and `lamo_modules/`), and `my-app/lamo.pkg` (an empty
+package manifest, ready for `lampm install`).
+
+Remove generated build artifacts:
+
+```sh
+./lamo clean
+```
+
+This deletes `lamo_exec.c`, `lamo_exec`, and `lamo_exec.exe` from the current
+directory. Source files are untouched.
+
 Show help or version:
 
 ```sh
 ./lamo help
+./lamo help run
 ./lamo version
+./lamo version --verbose
 ```
+
+### Global Options
+
+```
+--verbose   Show extra progress information (also: LAMO_VERBOSE=1)
+--quiet     Suppress success messages (also: LAMO_QUIET=1)
+```
+
+### Environment Variables
+
+```
+LAMO_CC       C compiler to use for `run`/`build` (default: gcc)
+LAMO_VERBOSE  Same as --verbose
+LAMO_QUIET    Same as --quiet
+```
+
+Example: use `clang` instead of `gcc`:
+
+```sh
+LAMO_CC=clang ./lamo run examples/test.lamo
+```
+
+Example: see exactly what GCC command is being invoked:
+
+```sh
+./lamo --verbose run examples/test.lamo
+```
+
+## Package Manager (Integrated)
+
+The package manager (originally a separate `lampm` binary) is now built into
+the `lamo` executable. There is no separate binary to install — every
+package-manager subcommand is available directly:
+
+```
+lamo init [project-name]              Create a new lamo.pkg (and scaffold)
+lamo install [owner/repo@ref] [alias] Install a dependency (or all)
+lamo update [alias]                   Pull latest HEAD for one or all deps
+lamo remove <alias>                   Remove a dependency and its install dir
+lamo list                             List dependencies and their state
+lamo info <alias>                     Show details about a dependency
+lamo outdated                         Check which deps are behind remote HEAD
+lamo why <alias>                      Alias for `info`
+lamo lock                             Refresh the lockfile from installed deps
+lamo cache <clean|list>               Manage the local packages directory
+lamo doctor                           Verify your environment is set up
+```
+
+Quick start:
+
+```sh
+lamo new my-app          # scaffold a project (creates my-app/main.lamo, .gitignore, lamo.pkg)
+cd my-app
+lamo install arthurlamonattopro/LamoLanguage   # add a dependency
+lamo install arthurlamonattopro/LamoLanguage@v1.0.0   # pinned to a tag
+lamo list                # see installed deps and locked commits
+lamo run main.lamo       # build and run the project
+lamo clean               # remove generated lamo_exec* artifacts
+lamo cache clean         # remove lamo_modules/
+```
+
+Repository specs accepted by `lamo install`:
+
+```
+owner/repo                       GitHub shorthand (HEAD)
+owner/repo@v1.0.0                pinned to tag/branch/commit
+github.com/owner/repo
+https://github.com/owner/repo[.git]
+https://gitlab.com/owner/repo[.git]
+git+https://example.com/foo/bar.git
+git@github.com:owner/repo.git
+```
+
+The lockfile (`lamo.lock`) records the exact commit installed for each
+dependency so that `lamo install` (no args) reproduces the same checkout
+across machines. Commit it alongside `lamo.pkg`.
+
+The package manager also adds the `--no-color` global flag (auto-disabled
+on non-TTY output) on top of the compiler's `--verbose` / `--quiet` flags.
 
 ## Generated Output
 
-The current backend emits C code to `lamo_exec.c`, then invokes `gcc` to build the executable. This is still a temporary backend strategy while the language model matures.
+The current backend emits C code to `lamo_exec.c`, then invokes the C
+compiler (configurable via `LAMO_CC`, default `gcc`) to build the executable.
+This is still a temporary backend strategy while the language model matures.
+Use `lamo clean` to remove these generated artifacts.
 
 On Windows, GUI builtins are lowered to Win32 + GDI in the generated C and can open real native windows. On non-Windows platforms they compile to no-op stubs with a runtime warning for now.
 
@@ -198,12 +332,16 @@ The tests cover:
 
 ## Repository Layout
 
-- [src/lexer/lexer.c](/l:/Codes/LamoLanguage/src/lexer/lexer.c)
-- [src/parser/parser.c](/l:/Codes/LamoLanguage/src/parser/parser.c)
-- [src/ast/ast.c](/l:/Codes/LamoLanguage/src/ast/ast.c)
-- [src/semantic/semantic.c](/l:/Codes/LamoLanguage/src/semantic/semantic.c)
-- [src/codegen/codegen.c](/l:/Codes/LamoLanguage/src/codegen/codegen.c)
-- [src/lamo_v2.c](/l:/Codes/LamoLanguage/src/lamo_v2.c)
+- [src/lexer/lexer.c](./src/lexer/lexer.c) — tokenizer
+- [src/parser/parser.c](./src/parser/parser.c) — recursive-descent parser
+- [src/ast/ast.c](./src/ast/ast.c) — AST node constructors and free
+- [src/semantic/semantic.c](./src/semantic/semantic.c) — scope + type analysis
+- [src/codegen/codegen.c](./src/codegen/codegen.c) — AST → C transpiler
+- [src/codegen/lamo_runtime.h](./src/codegen/lamo_runtime.h) — runtime (value type, arena, GUI, HTTP)
+- [src/eval/eval.c](./src/eval/eval.c) — tree-walking interpreter (powers `lamo eval` and `lamo repl`)
+- [src/lampm/lampm.c](./src/lampm/lampm.c) — integrated package manager (formerly `lampm`)
+- [src/lampm/lampm.h](./src/lampm/lampm.h) — public API for the package manager
+- [src/lamo_v2.c](./src/lamo_v2.c) — CLI entry point: parses global flags, dispatches subcommands
 - [tests/run_tests.sh](./tests/run_tests.sh) — POSIX test runner
 - [tests/run_tests.ps1](./tests/run_tests.ps1) — Windows PowerShell test runner
 - [tests/valid/](./tests/valid) — programs that must `check` successfully

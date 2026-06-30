@@ -3,7 +3,7 @@ CC = gcc
 # Both flags are harmless in combination; -O2 lets the compiler inline the
 # many static helpers in lamo_runtime.h, and -g preserves source-level
 # debugging through the AST/codegen pipeline.
-CFLAGS = -Wall -Wextra -std=c99 -O2 -g -Isrc -Isrc/lexer -Isrc/parser -Isrc/ast -Isrc/codegen -Isrc/semantic -Isrc/eval
+CFLAGS = -Wall -Wextra -std=c99 -O2 -g -Isrc -Isrc/lexer -Isrc/parser -Isrc/ast -Isrc/codegen -Isrc/semantic -Isrc/eval -Isrc/lampm
 
 # Sprint 3 fix: link the compiler itself with -lm, because codegen.c now
 # uses fmod() directly for constant folding of float % expressions. The
@@ -17,7 +17,10 @@ LDFLAGS = -lm
 RUNTIME_HEADER = src/codegen/lamo_runtime.h
 RUNTIME_DATA   = src/codegen/lamo_runtime_data.c
 
-SRCS = src/lamo_v2.c src/lexer/lexer.c src/parser/parser.c src/ast/ast.c src/codegen/codegen.c src/semantic/semantic.c src/eval/eval.c $(RUNTIME_DATA)
+# lampm.c is the integrated package manager (originally a separate
+# LamoPacketManager binary). It now compiles into the main `lamo`
+# executable and is reachable through `lamo install`, `lamo update`, etc.
+SRCS = src/lamo_v2.c src/lexer/lexer.c src/parser/parser.c src/ast/ast.c src/codegen/codegen.c src/semantic/semantic.c src/eval/eval.c src/lampm/lampm.c $(RUNTIME_DATA)
 OBJS = $(SRCS:.c=.o)
 
 ifeq ($(OS),Windows_NT)

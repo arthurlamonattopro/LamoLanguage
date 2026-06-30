@@ -180,15 +180,22 @@
 - [x] Add `lamo run`.
 - [x] Add `lamo build`.
 - [x] Add `lamo check`.
+- [x] Add `lamo eval`.
+- [x] Add `lamo repl` — interactive read-eval-print loop using the eval module.
+- [x] Add `lamo new <project-name>` — scaffold a project with main.lamo, .gitignore, lamo.pkg.
+- [x] Add `lamo clean` — remove generated lamo_exec* artifacts.
 - [x] Add `lamo version`.
-- [x] Add `lamo help`.
+- [x] Add `lamo help` with per-command help (`lamo help run`, `lamo help new`, etc.).
+- [x] Add `--verbose` / `--quiet` global flags and `LAMO_VERBOSE` / `LAMO_QUIET` env vars.
+- [x] Add `LAMO_CC` env var to override the C compiler used by `run`/`build`.
 
 ### Diagnostics And UX
 
 - [ ] Show file path, line, and column in all compiler errors.
+- [x] Improve backend failure messages when generated C fails to compile (now reports the C compiler name, exit code, and points to lamo_exec.c).
+- [x] Make successful compiler output less noisy unless verbose mode is enabled (`--quiet` / `LAMO_QUIET=1`).
+- [x] Add `--verbose` mode showing the underlying C compiler invocation.
 - [ ] Consider showing a source snippet with a caret marker.
-- [ ] Improve backend failure messages when generated C fails to compile.
-- [ ] Make successful compiler output less noisy unless verbose mode is enabled.
 
 ### Formatting And Style
 
@@ -229,6 +236,28 @@
 - [ ] Add duplicate-function and duplicate-import semantic tests.
 - [x] Introduce a `Type` enum and start annotating AST nodes.
 - [ ] Preserve per-file source ownership in multi-file diagnostics.
+
+## Recently Added (CLI Tooling Pass)
+
+- [x] `lamo new <name>` scaffolds a project (main.lamo, .gitignore, lamo.pkg).
+- [x] `lamo clean` removes lamo_exec* artifacts.
+- [x] `lamo repl` runs an interactive read-eval-print loop using the eval module.
+- [x] `lamo help <command>` shows per-command help.
+- [x] `--verbose` / `--quiet` global flags; `LAMO_VERBOSE` / `LAMO_QUIET` env vars.
+- [x] `LAMO_CC` env var overrides the C compiler used for `run`/`build`.
+- [x] Backend failure messages now name the C compiler and exit code.
+- [x] **Merge `lampm` into the `lamo` binary.** The package manager is now
+      reachable as `lamo install`, `lamo update`, `lamo list`, `lamo info`,
+      `lamo outdated`, `lamo doctor`, `lamo cache`, `lamo lock`, `lamo why`,
+      `lamo remove`, `lamo init`. There is no separate `lampm` binary to
+      install. The implementation lives in `src/lampm/lampm.c` and the
+      public API is `lampm_main()` declared in `src/lampm/lampm.h`.
+- [x] LamoPacketManager (`lampm`) v0.2: version pinning (`@ref`), lockfile (`lamo.lock`),
+      new commands (`update`, `outdated`, `info`, `doctor`, `cache`, `lock`, `why`),
+      non-GitHub sources (gitlab/bitbucket/generic git), `.gitignore` scaffolding,
+      per-subcommand help, `--verbose`/`--quiet`/`--no-color` global flags,
+      fix for the `2>nul` Windows-only null redirection bug, and fix for the
+      `_POSIX_C_SOURCE` feature-macro bug that broke `-std=c99` builds.
 
 ## Recently Fixed (Lint Pass)
 

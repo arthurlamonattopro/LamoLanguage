@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #ifdef _WIN32
 /* Sprint 1 fix (Windows): the Lamo TokenType (in lexer.h) used to collide
  * with the Windows SDK TokenType (an enumerator in winnt.h's
@@ -32,8 +33,9 @@
 #include "semantic.h"
 #include "builtins.h"
 #include "eval/eval.h"
+#include "lampm/lampm.h"
 
-#define VERSION "2.0"
+#define VERSION "2.2.0"
 
 enum {
     EXIT_SUCCESS_CODE = 0,
@@ -41,11 +43,18 @@ enum {
     EXIT_BACKEND_ERROR = 2
 };
 
+/* Global CLI options. Set in main() based on argv / env vars. */
+static int g_verbose = 0;       /* LAMO_VERBOSE=1 or --verbose */
+static int g_quiet = 0;         /* LAMO_QUIET=1 or --quiet */
+
 typedef enum {
     COMMAND_RUN,
     COMMAND_BUILD,
     COMMAND_CHECK,
-    COMMAND_EVAL
+    COMMAND_EVAL,
+    COMMAND_NEW,
+    COMMAND_CLEAN,
+    COMMAND_REPL
 } LamoCommand;
 
 typedef enum {
@@ -68,10 +77,12 @@ typedef struct {
 } CompilationState;
 
 static void print_usage(const char* prog);
+static void print_command_help(const char* prog, const char* command);
 static char* read_file(const char* path);
 static int run_argv(char* const argv[]);
 static int compile_sources(const char** input_files, int input_file_count, LamoCommand command, const char* output_path);
 static const char* executable_suffix(void);
+static const char* lamo_cc(void);
 static int load_program_recursive(CompilationState* state, ASTProgram* aggregate_program, const char* path);
 static int load_program_recursive_from(CompilationState* state, ASTProgram* aggregate_program,
                                         const char* path, const char* imported_from,
@@ -83,6 +94,9 @@ static void report_import_cycle(const CompilationState* state, int repeated_inde
 static void report_import_cycle_at(const CompilationState* state, int repeated_index,
                                     const char* importing_file, int line, int column);
 void generate_c_code(ASTNode* node, FILE* out);
+static int command_new(int argc, char** argv);
+static int command_clean(int argc, char** argv);
+static int command_repl(int argc, char** argv);
 
 static char* duplicate_string(const char* value) {
     size_t length = strlen(value);
@@ -436,14 +450,107 @@ static int load_imports_from_ast(CompilationState* state, ASTProgram* aggregate_
 }
 
 static void print_usage(const char* prog) {
-    printf("Lamo v%s\n\n", VERSION);
+    printf("Lamo v%s (with integrated package manager v%s)\n\n", VERSION, LAMPM_VERSION);
     printf("Usage:\n");
-    printf("  %s run <file.lamo> [more-files.lamo ...] [-o output]\n", prog);
+    printf("  %s run   <file.lamo> [more-files.lamo ...] [-o output]\n", prog);
     printf("  %s build <file.lamo> [more-files.lamo ...] [-o output]\n", prog);
     printf("  %s check <file.lamo> [more-files.lamo ...]\n", prog);
-    printf("  %s eval <file.lamo>   (interpret without compiling — instant feedback)\n", prog);
-    printf("  %s help\n", prog);
-    printf("  %s version\n", prog);
+    printf("  %s eval  <file.lamo>   (interpret without compiling — instant feedback)\n", prog);
+    printf("  %s repl                (interactive read-eval-print loop)\n", prog);
+    printf("  %s new   <project-name>\n", prog);
+    printf("  %s clean               (remove generated lamo_exec* artifacts)\n", prog);
+    printf("\n");
+    printf("Package manager subcommands (formerly `lampm`):\n");
+    printf("  %s init [project-name]              Create a new lamo.pkg (and scaffold)\n", prog);
+    printf("  %s install [owner/repo@ref] [alias] Install a dependency (or all)\n", prog);
+    printf("  %s update [alias]                   Pull latest HEAD for one or all deps\n", prog);
+    printf("  %s remove <alias>                   Remove a dependency and its install dir\n", prog);
+    printf("  %s list                             List dependencies and their state\n", prog);
+    printf("  %s info <alias>                     Show details about a dependency\n", prog);
+    printf("  %s outdated                         Check which deps are behind remote HEAD\n", prog);
+    printf("  %s why <alias>                      Alias for `info`\n", prog);
+    printf("  %s lock                             Refresh the lockfile from installed deps\n", prog);
+    printf("  %s cache <clean|list>               Manage the local packages directory\n", prog);
+    printf("  %s doctor                           Verify your environment is set up\n", prog);
+    printf("\n");
+    printf("  %s help [command]\n", prog);
+    printf("  %s version [--verbose]\n", prog);
+    printf("\n");
+    printf("Global options (apply to most commands):\n");
+    printf("  --verbose   Show extra progress information (also: LAMO_VERBOSE=1)\n");
+    printf("  --quiet     Suppress success messages (also: LAMO_QUIET=1)\n");
+    printf("  --no-color  Disable ANSI color output (package-manager subcommands only)\n");
+    printf("\n");
+    printf("Environment variables:\n");
+    printf("  LAMO_CC     C compiler to use for `run`/`build` (default: gcc)\n");
+    printf("  LAMO_VERBOSE  Same as --verbose\n");
+    printf("  LAMO_QUIET    Same as --quiet\n");
+}
+
+static void print_command_help(const char* prog, const char* command) {
+    /* Delegate package-manager subcommands to the lampm help. */
+    if (lampm_is_subcommand(command)) {
+        char* fake_argv[3];
+        fake_argv[0] = (char*)prog;
+        fake_argv[1] = (char*)"help";
+        fake_argv[2] = (char*)command;
+        lampm_main(3, fake_argv);
+        return;
+    }
+
+    if (strcmp(command, "run") == 0) {
+        printf("run — Compile and execute a Lamo program.\n\n");
+        printf("Usage: %s run <file.lamo> [more-files.lamo ...] [-o output]\n\n", prog);
+        printf("Transpiles to C, invokes the C compiler (LAMO_CC, default gcc), then\n");
+        printf("executes the resulting binary. With -o, the binary is saved under that\n");
+        printf("name (plus a platform .exe suffix on Windows); otherwise it's named\n");
+        printf("lamo_exec and removed after execution.\n");
+    } else if (strcmp(command, "build") == 0) {
+        printf("build — Compile a Lamo program to a binary, without running it.\n\n");
+        printf("Usage: %s build <file.lamo> [more-files.lamo ...] [-o output]\n\n", prog);
+        printf("Like `run`, but stops after the binary is built.\n");
+    } else if (strcmp(command, "check") == 0) {
+        printf("check — Parse and semantic-check a Lamo program without codegen.\n\n");
+        printf("Usage: %s check <file.lamo> [more-files.lamo ...]\n\n", prog);
+        printf("Fastest way to validate syntax and types. -o is rejected.\n");
+    } else if (strcmp(command, "eval") == 0) {
+        printf("eval — Interpret a Lamo program directly (no C compiler).\n\n");
+        printf("Usage: %s eval <file.lamo>\n\n", prog);
+        printf("Uses the built-in tree-walking interpreter. Best for quick feedback\n");
+        printf("or environments without a C compiler. Not all runtime features\n");
+        printf("(GUI, HTTP) are available in eval mode.\n");
+    } else if (strcmp(command, "repl") == 0) {
+        printf("repl — Interactive read-eval-print loop.\n\n");
+        printf("Usage: %s repl\n\n", prog);
+        printf("Reads one line at a time. Lines starting with `let`, `fn`, `if`,\n");
+        printf("`while`, `for`, `return`, `break`, `continue`, or `import` are\n");
+        printf("parsed as statements; everything else is parsed as an expression\n");
+        printf("and its value is printed. Type .exit or .quit to leave.\n");
+    } else if (strcmp(command, "new") == 0) {
+        printf("new — Scaffold a new Lamo project.\n\n");
+        printf("Usage: %s new <project-name>\n\n", prog);
+        printf("Creates a directory <project-name> with a starter main.lamo,\n");
+        printf("a .gitignore, and a lamo.pkg manifest ready for `lamo install`.\n");
+    } else if (strcmp(command, "clean") == 0) {
+        printf("clean — Remove generated build artifacts.\n\n");
+        printf("Usage: %s clean\n\n", prog);
+        printf("Deletes lamo_exec.c, lamo_exec, lamo_exec.exe (the intermediate C\n");
+        printf("source and compiled binary). Source files are untouched.\n");
+    } else if (strcmp(command, "help") == 0) {
+        printf("help — Show help.\n\n");
+        printf("Usage: %s help [command]\n\n", prog);
+        printf("Without an argument, shows general help. With a command name,\n");
+        printf("shows detailed help for that command. Package-manager subcommands\n");
+        printf("(init, install, update, remove, list, info, outdated, why, lock,\n");
+        printf("cache, doctor) delegate to the integrated lampm help.\n");
+    } else if (strcmp(command, "version") == 0) {
+        printf("version — Print the Lamo compiler version and exit.\n\n");
+        printf("Usage: %s version [--verbose]\n\n", prog);
+        printf("With --verbose, also prints the integrated lampm version and the\n");
+        printf("C compiler that will be used.\n");
+    } else {
+        fprintf(stderr, "no help available for `%s`\n", command);
+    }
 }
 
 static char* read_file(const char* path) {
@@ -472,40 +579,376 @@ static char* read_file(const char* path) {
     return content;
 }
 
+/* lamo_cc: return the C compiler to use for `run`/`build`. Honors the
+ * LAMO_CC environment variable (which can be set to "clang", "gcc-12",
+ * "/usr/local/bin/cc", etc.). Returns "gcc" by default. */
+static const char* lamo_cc(void) {
+    const char* env = getenv("LAMO_CC");
+    if (env && env[0] != '\0') {
+        return env;
+    }
+    return "gcc";
+}
+
+/* command_new: scaffold a new Lamo project. */
+static int command_new(int argc, char** argv) {
+    const char* project_name = NULL;
+    char* main_path = NULL;
+    char* gitignore_path = NULL;
+    char* manifest_path = NULL;
+    FILE* mainf = NULL;
+    FILE* gi = NULL;
+    int i;
+
+    for (i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            print_command_help(argv[0], "new");
+            return EXIT_SUCCESS_CODE;
+        }
+        if (argv[i][0] == '-') {
+            fprintf(stderr, "unknown option: %s\n", argv[i]);
+            return EXIT_COMPILE_ERROR;
+        }
+        if (!project_name) {
+            project_name = argv[i];
+        } else {
+            fprintf(stderr, "unexpected extra argument: %s\n", argv[i]);
+            return EXIT_COMPILE_ERROR;
+        }
+    }
+
+    if (!project_name) {
+        fprintf(stderr, "missing project name. Usage: %s new <project-name>\n", argv[0]);
+        return EXIT_COMPILE_ERROR;
+    }
+
+    /* Validate the name — basic sanity, no path separators. */
+    if (strchr(project_name, '/') != NULL || strchr(project_name, '\\') != NULL) {
+        fprintf(stderr, "invalid project name `%s`: must not contain path separators\n", project_name);
+        return EXIT_COMPILE_ERROR;
+    }
+
+#ifdef _WIN32
+    if (_mkdir(project_name) != 0) {
+#else
+    if (mkdir(project_name, 0755) != 0) {
+#endif
+        fprintf(stderr, "failed to create project directory `%s`: %s\n",
+                project_name, strerror(errno));
+        return EXIT_COMPILE_ERROR;
+    }
+
+#ifdef _WIN32
+    if (_chdir(project_name) != 0) {
+#else
+    if (chdir(project_name) != 0) {
+#endif
+        fprintf(stderr, "failed to enter project directory: %s\n", strerror(errno));
+        return EXIT_COMPILE_ERROR;
+    }
+
+    main_path = duplicate_string("main.lamo");
+    mainf = fopen(main_path, "w");
+    if (!mainf) {
+        fprintf(stderr, "failed to write %s: %s\n", main_path, strerror(errno));
+        free(main_path);
+        free(gitignore_path);
+        free(manifest_path);
+        return EXIT_COMPILE_ERROR;
+    }
+    fprintf(mainf, "// %s — entry point\n", project_name);
+    fprintf(mainf, "fn main() {\n");
+    fprintf(mainf, "    print(\"Hello from %s!\");\n", project_name);
+    fprintf(mainf, "    return 0;\n");
+    fprintf(mainf, "}\n");
+    fprintf(mainf, "\n");
+    fprintf(mainf, "main();\n");
+    fclose(mainf);
+
+    gitignore_path = duplicate_string(".gitignore");
+    gi = fopen(gitignore_path, "w");
+    if (gi) {
+        fprintf(gi, "# Lamo project artifacts\n");
+        fprintf(gi, "lamo_exec.c\n");
+        fprintf(gi, "lamo_exec\n");
+        fprintf(gi, "lamo_exec.exe\n");
+        fprintf(gi, "lamo_modules/\n");
+        fprintf(gi, "lamo.lock\n");
+        fclose(gi);
+    }
+
+    manifest_path = duplicate_string("lamo.pkg");
+    {
+        FILE* mf = fopen(manifest_path, "w");
+        if (mf) {
+            fprintf(mf, "# Lamo package manifest.\n");
+            fprintf(mf, "name = %s\n", project_name);
+            fprintf(mf, "version = 0.1.0\n");
+            fprintf(mf, "packages_dir = lamo_modules\n\n");
+            fprintf(mf, "[dependencies]\n");
+            fclose(mf);
+        }
+    }
+
+    if (!g_quiet) {
+        printf("Created Lamo project `%s`\n", project_name);
+        printf("  %s/main.lamo     — entry point with a hello-world program\n", project_name);
+        printf("  %s/.gitignore    — ignores lamo_exec* and lamo_modules/\n", project_name);
+        printf("  %s/lamo.pkg      — package manifest (add deps with `lampm install owner/repo`)\n", project_name);
+        printf("\nNext steps:\n");
+        printf("  cd %s\n", project_name);
+        printf("  lamo run main.lamo\n");
+    }
+
+    free(main_path);
+    free(gitignore_path);
+    free(manifest_path);
+    return EXIT_SUCCESS_CODE;
+}
+
+/* command_clean: remove generated build artifacts. */
+static int command_clean(int argc, char** argv) {
+    static const char* artifacts[] = {
+        "lamo_exec.c",
+        "lamo_exec",
+        "lamo_exec.exe",
+        NULL
+    };
+    int i;
+    int removed = 0;
+
+    for (i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            print_command_help(argv[0], "clean");
+            return EXIT_SUCCESS_CODE;
+        }
+        fprintf(stderr, "unexpected argument: %s (clean takes no arguments)\n", argv[i]);
+        return EXIT_COMPILE_ERROR;
+    }
+
+    for (i = 0; artifacts[i] != NULL; i++) {
+        if (unlink(artifacts[i]) == 0) {
+            if (g_verbose) {
+                printf("[verbose] removed %s\n", artifacts[i]);
+            }
+            removed++;
+        }
+    }
+
+    if (!g_quiet) {
+        if (removed == 0) {
+            printf("nothing to clean\n");
+        } else {
+            printf("removed %d artifact(s)\n", removed);
+        }
+    }
+    return EXIT_SUCCESS_CODE;
+}
+
+/* command_repl: interactive read-eval-print loop using the eval module. */
+static int command_repl(int argc, char** argv) {
+    EvalEnv* env;
+    char line[8192];
+    int i;
+
+    /* Parsed AST nodes that must stay alive for the duration of the REPL
+     * session. The eval module stores raw pointers to ASTFnDecl nodes
+     * inside the environment (eval_env_define_fn), so freeing them
+     * between lines would leave dangling pointers. We collect every
+     * parsed node here and free them all at exit. */
+    ASTNode** keep_alive = NULL;
+    size_t keep_alive_count = 0;
+    size_t keep_alive_capacity = 0;
+
+    for (i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            print_command_help(argv[0], "repl");
+            return EXIT_SUCCESS_CODE;
+        }
+        fprintf(stderr, "unexpected argument: %s (repl takes no arguments)\n", argv[i]);
+        return EXIT_COMPILE_ERROR;
+    }
+
+    env = eval_env_new(NULL);
+
+    if (!g_quiet) {
+        printf("Lamo v%s REPL. Type .exit or .quit to leave, .help for commands.\n", VERSION);
+    }
+
+    while (1) {
+        char* p;
+        size_t len;
+        int is_stmt = 0;
+        char* source = NULL;
+        Lexer* lexer = NULL;
+        Parser* parser = NULL;
+        ASTNode* parsed = NULL;
+
+        if (!g_quiet) {
+            fputs("lamo> ", stdout);
+        }
+        fflush(stdout);
+
+        if (!fgets(line, sizeof(line), stdin)) {
+            if (!g_quiet) fputs("\n", stdout);
+            break;
+        }
+
+        /* Trim leading whitespace. */
+        p = line;
+        while (*p && isspace((unsigned char)*p)) p++;
+        /* Trim trailing whitespace. */
+        len = strlen(p);
+        while (len > 0 && isspace((unsigned char)p[len - 1])) {
+            p[--len] = '\0';
+        }
+        if (*p == '\0') continue;
+
+        if (strcmp(p, ".exit") == 0 || strcmp(p, ".quit") == 0) {
+            break;
+        }
+        if (strcmp(p, ".help") == 0) {
+            printf(".exit / .quit  Leave the REPL\n");
+            printf(".help          Show this help\n");
+            printf("\n");
+            printf("Type a Lamo expression to evaluate it (its value is printed),\n");
+            printf("or a statement (let/fn/if/while/for/return/break/continue/import)\n");
+            printf("to execute it. Statements that produce a value (e.g. `let x = 5;`)\n");
+            printf("do not print anything.\n");
+            continue;
+        }
+
+        /* Decide whether to parse as a statement or an expression. */
+        if (strncmp(p, "let ", 4) == 0 || strncmp(p, "fn ", 3) == 0 ||
+            strncmp(p, "if ", 3) == 0 || strncmp(p, "if(", 3) == 0 ||
+            strncmp(p, "while ", 6) == 0 || strncmp(p, "while(", 6) == 0 ||
+            strncmp(p, "for ", 4) == 0 || strncmp(p, "for(", 4) == 0 ||
+            strncmp(p, "return", 6) == 0 ||
+            strcmp(p, "break") == 0 || strcmp(p, "continue") == 0 ||
+            strncmp(p, "import ", 7) == 0) {
+            is_stmt = 1;
+        }
+
+        source = duplicate_string(p);
+        if (!source) break;
+        lexer = lexer_init(source);
+        parser = parser_init(lexer);
+
+        if (is_stmt) {
+            parsed = (ASTNode*)parse_statement(parser);
+        } else {
+            parsed = (ASTNode*)parse_expression(parser);
+        }
+
+        if (parser_had_error(parser)) {
+            /* Errors already printed by the parser. Free what we got. */
+            if (parsed) ast_free(parsed);
+            parsed = NULL;
+        } else if (parsed) {
+            EvalSignal sig = EVAL_SIG_NONE;
+            EvalValue v = is_stmt
+                ? eval_statement(parsed, env, &sig)
+                : eval_expression(parsed, env, &sig);
+            if (sig == EVAL_SIG_ERROR) {
+                fprintf(stderr, "runtime error\n");
+            } else if (!is_stmt && v.type != EVAL_VAL_VOID && v.type != EVAL_VAL_ERROR) {
+                char* s = eval_value_to_string(v);
+                printf("%s\n", s ? s : "");
+                free(s);
+            }
+            eval_value_free(v);
+
+            /* Keep the AST alive for the rest of the session (functions
+             * registered in env point into it). */
+            if (keep_alive_count == keep_alive_capacity) {
+                size_t new_cap = keep_alive_capacity > 0 ? keep_alive_capacity * 2 : 16;
+                ASTNode** resized = realloc(keep_alive, sizeof(ASTNode*) * new_cap);
+                if (!resized) {
+                    /* If realloc fails, free this node immediately to
+                     * avoid a leak; this may cause use-after-free if the
+                     * node was a function declaration that was just
+                     * registered in env, but at least we don't crash on
+                     * the realloc path. */
+                    fprintf(stderr, "warning: out of memory for REPL history; freeing node\n");
+                    ast_free(parsed);
+                    parsed = NULL;
+                } else {
+                    keep_alive = resized;
+                    keep_alive_capacity = new_cap;
+                    keep_alive[keep_alive_count++] = parsed;
+                    /* ownership transferred; don't free below */
+                    parsed = NULL;
+                }
+            } else {
+                keep_alive[keep_alive_count++] = parsed;
+                parsed = NULL;
+            }
+        }
+
+        parser_free(parser);
+        lexer_free(lexer);
+        free(source);
+        if (parsed) ast_free(parsed);
+    }
+
+    /* Free all keep-alive AST nodes. */
+    {
+        size_t j;
+        for (j = 0; j < keep_alive_count; j++) {
+            ast_free(keep_alive[j]);
+        }
+        free(keep_alive);
+    }
+
+    eval_env_free(env);
+    return EXIT_SUCCESS_CODE;
+}
+
 int main(int argc, char** argv) {
     LamoCommand command = COMMAND_RUN;
     const char** input_files = NULL;
     int input_file_count = 0;
     const char* output_path = NULL;
     int arg_index = 1;
+    int i;
+
+    /* Honor LAMO_VERBOSE / LAMO_QUIET env vars. */
+    if (getenv("LAMO_VERBOSE") && getenv("LAMO_VERBOSE")[0] != '\0' &&
+        strcmp(getenv("LAMO_VERBOSE"), "0") != 0) {
+        g_verbose = 1;
+    }
+    if (getenv("LAMO_QUIET") && getenv("LAMO_QUIET")[0] != '\0' &&
+        strcmp(getenv("LAMO_QUIET"), "0") != 0) {
+        g_quiet = 1;
+    }
 
     if (argc < 2) {
         print_usage(argv[0]);
         return EXIT_COMPILE_ERROR;
     }
 
-    if (strcmp(argv[1], "help") == 0 || strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0) {
-        print_usage(argv[0]);
-        return EXIT_SUCCESS_CODE;
-    }
-
-    if (strcmp(argv[1], "version") == 0 || strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-v") == 0) {
-        printf("%s\n", VERSION);
-        return EXIT_SUCCESS_CODE;
-    }
-
-    if (strcmp(argv[1], "run") == 0) {
-        command = COMMAND_RUN;
-        arg_index = 2;
-    } else if (strcmp(argv[1], "build") == 0) {
-        command = COMMAND_BUILD;
-        arg_index = 2;
-    } else if (strcmp(argv[1], "check") == 0) {
-        command = COMMAND_CHECK;
-        arg_index = 2;
-    } else if (strcmp(argv[1], "eval") == 0) {
-        command = COMMAND_EVAL;
-        arg_index = 2;
+    /* Consume leading global flags before the subcommand. */
+    while (arg_index < argc && argv[arg_index][0] == '-' &&
+           strcmp(argv[arg_index], "--") != 0) {
+        if (strcmp(argv[arg_index], "--verbose") == 0) {
+            g_verbose = 1;
+            arg_index++;
+        } else if (strcmp(argv[arg_index], "--quiet") == 0) {
+            g_quiet = 1;
+            arg_index++;
+        } else if (strcmp(argv[arg_index], "--help") == 0 ||
+                   strcmp(argv[arg_index], "-h") == 0) {
+            print_usage(argv[0]);
+            return EXIT_SUCCESS_CODE;
+        } else if (strcmp(argv[arg_index], "--version") == 0 ||
+                   strcmp(argv[arg_index], "-v") == 0) {
+            printf("lamo %s\n", VERSION);
+            if (g_verbose) printf("C compiler: %s\n", lamo_cc());
+            return EXIT_SUCCESS_CODE;
+        } else {
+            fprintf(stderr, "unknown global option: %s\n", argv[arg_index]);
+            return EXIT_COMPILE_ERROR;
+        }
     }
 
     if (arg_index >= argc) {
@@ -513,11 +956,108 @@ int main(int argc, char** argv) {
         return EXIT_COMPILE_ERROR;
     }
 
+    /* Shift argv so the rest of main() can assume the subcommand is at argv[1].
+     * We don't actually move memory — just adjust an offset and recompute.
+     * Simpler approach: from now on, treat argv[arg_index] as the command. */
+    {
+        const char* subcommand = argv[arg_index];
+        int sub_argc = argc - arg_index + 1;
+        char** sub_argv = argv + arg_index - 1;
+
+        /* Reuse the rest of main() by replacing argv[1] semantics.
+         * Easier path: just rewrite argv[1] to be the subcommand and adjust
+         * argv[] pointers. Since we can't easily do that, we proceed with
+         * the original argv but skip past the flags by referencing argv[arg_index]. */
+
+        if (strcmp(subcommand, "help") == 0) {
+            if (argc >= arg_index + 2) {
+                print_command_help(argv[0], argv[arg_index + 1]);
+            } else {
+                print_usage(argv[0]);
+            }
+            return EXIT_SUCCESS_CODE;
+        }
+
+        if (strcmp(subcommand, "version") == 0) {
+            int show_verbose_version = 0;
+            for (i = arg_index + 1; i < argc; i++) {
+                if (strcmp(argv[i], "--verbose") == 0) {
+                    show_verbose_version = 1;
+                }
+            }
+            printf("lamo %s\n", VERSION);
+            if (show_verbose_version || g_verbose) {
+                printf("lampm (integrated) %s\n", LAMPM_VERSION);
+                printf("C compiler: %s\n", lamo_cc());
+            }
+            return EXIT_SUCCESS_CODE;
+        }
+
+        /* Subcommand help: `lamo <command> --help` */
+        for (i = arg_index + 1; i < argc; i++) {
+            if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+                print_command_help(argv[0], subcommand);
+                return EXIT_SUCCESS_CODE;
+            }
+        }
+
+        /* Global flags can also appear after the subcommand. */
+        for (i = arg_index + 1; i < argc; i++) {
+            if (strcmp(argv[i], "--verbose") == 0) {
+                g_verbose = 1;
+            } else if (strcmp(argv[i], "--quiet") == 0) {
+                g_quiet = 1;
+            }
+        }
+
+        /* Package-manager subcommands (init, install, update, remove, list,
+         * info, outdated, why, lock, cache, doctor) are handled by the
+         * integrated lampm module. We hand off the full argv starting at
+         * sub_argv (which has the subcommand at index 1) so lampm_main
+         * sees the same shape it would as a standalone binary. */
+        if (lampm_is_subcommand(subcommand)) {
+            /* Configure lampm with the global flags parsed so far. Pass
+             * -1 for color so lampm's own TTY detection runs. */
+            lampm_configure(g_verbose, g_quiet, -1);
+            return lampm_main(sub_argc, sub_argv);
+        }
+
+        if (strcmp(subcommand, "run") == 0) {
+            command = COMMAND_RUN;
+        } else if (strcmp(subcommand, "build") == 0) {
+            command = COMMAND_BUILD;
+        } else if (strcmp(subcommand, "check") == 0) {
+            command = COMMAND_CHECK;
+        } else if (strcmp(subcommand, "eval") == 0) {
+            command = COMMAND_EVAL;
+        } else if (strcmp(subcommand, "repl") == 0) {
+            return command_repl(sub_argc, sub_argv);
+        } else if (strcmp(subcommand, "new") == 0) {
+            return command_new(sub_argc, sub_argv);
+        } else if (strcmp(subcommand, "clean") == 0) {
+            return command_clean(sub_argc, sub_argv);
+        } else {
+            fprintf(stderr, "unknown command: %s\n\n", subcommand);
+            print_usage(argv[0]);
+            return EXIT_COMPILE_ERROR;
+        }
+
+        /* Now parse the remaining args (files + -o). */
+        arg_index++;
+    }
+
+    /* Skip global flags interleaved with files. */
     while (arg_index < argc) {
+        if (strcmp(argv[arg_index], "--verbose") == 0 ||
+            strcmp(argv[arg_index], "--quiet") == 0) {
+            arg_index++;
+            continue;
+        }
         if (strcmp(argv[arg_index], "-o") == 0) {
             arg_index++;
             if (arg_index >= argc) {
                 fprintf(stderr, "missing output path after -o\n");
+                free(input_files);
                 return EXIT_COMPILE_ERROR;
             }
             output_path = argv[arg_index++];
@@ -874,10 +1414,12 @@ static int compile_sources(const char** input_files, int input_file_count, LamoC
     }
 
     if (command == COMMAND_CHECK) {
-        if (input_file_count == 1) {
-            printf("check passed: %s\n", input_files[0]);
-        } else {
-            printf("check passed: %d file(s)\n", input_file_count);
+        if (!g_quiet) {
+            if (input_file_count == 1) {
+                printf("check passed: %s\n", input_files[0]);
+            } else {
+                printf("check passed: %d file(s)\n", input_file_count);
+            }
         }
         goto cleanup;
     }
@@ -897,6 +1439,7 @@ static int compile_sources(const char** input_files, int input_file_count, LamoC
         int needs_gui;
         int exit_status;
         char binary_with_suffix[1024];
+        const char* cc = lamo_cc();
 
         if (!out) {
             fprintf(stderr, "failed to open %s for writing: %s\n", c_output_path, strerror(errno));
@@ -907,7 +1450,14 @@ static int compile_sources(const char** input_files, int input_file_count, LamoC
         generate_c_code((ASTNode*)program_ast, out);
         fclose(out);
 
+        if (g_verbose) {
+            printf("[verbose] wrote C source: %s\n", c_output_path);
+        }
+
         needs_gui = program_uses_gui(program_ast);
+        if (g_verbose && needs_gui) {
+            printf("[verbose] program uses GUI builtins; will link X11/GDI\n");
+        }
 
         /* Build argv for the C compiler. Using execvp/CreateProcess instead of
          * system() means user-controlled paths (which only the compiler itself
@@ -920,12 +1470,16 @@ static int compile_sources(const char** input_files, int input_file_count, LamoC
         {
             char c_output_local[256];
             snprintf(c_output_local, sizeof(c_output_local), "%s", c_output_path);
+            if (g_verbose) {
+                printf("[verbose] invoking C compiler: %s -Wall -Wextra -std=c99 -o %s %s\n",
+                       cc, binary_with_suffix, c_output_local);
+            }
 #ifdef _WIN32
             (void)needs_gui;
             /* On Windows the GUI runtime is always linked (GDI32 is always
              * present), so we don't gate on needs_gui. */
             char* argv[] = {
-                "gcc", "-Wall", "-Wextra", "-std=c99",
+                (char*)cc, "-Wall", "-Wextra", "-std=c99",
                 "-o", binary_with_suffix, c_output_local,
                 "-lgdi32", "-luser32", "-lws2_32", "-lm",
                 NULL
@@ -934,7 +1488,7 @@ static int compile_sources(const char** input_files, int input_file_count, LamoC
 #else
             if (needs_gui) {
                 char* argv[] = {
-                    "gcc", "-Wall", "-Wextra", "-std=c99",
+                    (char*)cc, "-Wall", "-Wextra", "-std=c99",
                     "-o", binary_with_suffix, c_output_local,
                     "-lX11", "-lm",
                     NULL
@@ -942,7 +1496,7 @@ static int compile_sources(const char** input_files, int input_file_count, LamoC
                 exit_status = run_argv(argv);
             } else {
                 char* argv[] = {
-                    "gcc", "-Wall", "-Wextra", "-std=c99",
+                    (char*)cc, "-Wall", "-Wextra", "-std=c99",
                     "-o", binary_with_suffix, c_output_local,
                     "-lm",
                     NULL
@@ -953,14 +1507,18 @@ static int compile_sources(const char** input_files, int input_file_count, LamoC
         }
 
         if (exit_status != 0) {
-            fprintf(stderr, "backend compilation failed while building %s from %s\n",
-                    binary_with_suffix, c_output_path);
+            fprintf(stderr, "backend compilation failed: %s returned exit code %d while building %s from %s\n",
+                    cc, exit_status, binary_with_suffix, c_output_path);
+            fprintf(stderr, "inspect %s for the generated C source, or run with --verbose for details.\n",
+                    c_output_path);
             exit_code = EXIT_BACKEND_ERROR;
             goto cleanup;
         }
 
         if (command == COMMAND_BUILD) {
-            printf("build succeeded: %s\n", binary_with_suffix);
+            if (!g_quiet) {
+                printf("build succeeded: %s\n", binary_with_suffix);
+            }
             goto cleanup;
         }
 
