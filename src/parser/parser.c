@@ -455,26 +455,41 @@ static ASTNode* parse_primary(Parser* p) {
                 advance_p(p);
                 expect_p(p, TOKEN_COLON, "expected ':' after field name in struct literal");
                 ASTNode* fval = parse_expression(p);
-                /* Grow arrays. */
+                /* Grow arrays. Realloc one at a time and assign back
+                 * immediately, so each variable always holds a valid
+                 * pointer. This avoids -Wuse-after-free: after a
+                 * successful realloc, the old pointer may be invalid. */
                 {
                     char** fn_resized = realloc(field_names, sizeof(char*) * (size_t)(field_count + 1));
-                    ASTNode** fv_resized = realloc(field_values, sizeof(ASTNode*) * (size_t)(field_count + 1));
-                    if (!fn_resized || !fv_resized) {
+                    if (!fn_resized) {
                         parser_error(p, "out of memory while growing struct literal field list");
                         free(fname);
                         ast_free(fval);
                         for (int i = 0; i < field_count; i++) { free(field_names[i]); ast_free(field_values[i]); }
-                        free(fn_resized ? fn_resized : field_names);
-                        free(fv_resized ? fv_resized : field_values);
+                        free(field_names);
+                        free(field_values);
                         free(name);
                         return parser_recover(p);
                     }
                     field_names = fn_resized;
-                    field_values = fv_resized;
-                    field_names[field_count] = fname;
-                    field_values[field_count] = fval;
-                    field_count++;
                 }
+                {
+                    ASTNode** fv_resized = realloc(field_values, sizeof(ASTNode*) * (size_t)(field_count + 1));
+                    if (!fv_resized) {
+                        parser_error(p, "out of memory while growing struct literal field list");
+                        free(fname);
+                        ast_free(fval);
+                        for (int i = 0; i < field_count; i++) { free(field_names[i]); ast_free(field_values[i]); }
+                        free(field_names);
+                        free(field_values);
+                        free(name);
+                        return parser_recover(p);
+                    }
+                    field_values = fv_resized;
+                }
+                field_names[field_count] = fname;
+                field_values[field_count] = fval;
+                field_count++;
                 if (p->current.type == TOKEN_COMMA) advance_p(p);
                 else if (p->current.type == TOKEN_SEMICOLON) advance_p(p);
             }
@@ -844,15 +859,47 @@ ASTNode* parse_statement(Parser* p) {
             path = strdup(p->current.value);
             eat_p(p, TOKEN_STRING);
         } else if (p->current.type == TOKEN_IDENTIFIER) {
-            char* mod_name = strdup(p->current.value);
+            /* Phase 3 (stdlib): accept dotted module names like `import std.io`.
+             * We accumulate the dotted path into `<a>/<b>/<c>.lamo` and use
+             * the LAST component as the default alias (so `import std.io`
+             * becomes `import "std/io.lamo" as io`).
+             *
+             * This is the syntax the standard library uses to expose itself
+             * without colliding with user files: a top-level `std/` directory
+             * holds the standard modules, and the loader knows to look there
+             * when the path starts with `std/`. */
+            char* first = strdup(p->current.value);
+            char* last_segment = strdup(p->current.value);
+            size_t total_len = strlen(first);
             eat_p(p, TOKEN_IDENTIFIER);
-            /* Synthesize "<mod_name>.lamo". */
-            size_t plen = strlen(mod_name) + 6;
+            while (p->current.type == TOKEN_DOT) {
+                eat_p(p, TOKEN_DOT);
+                if (p->current.type != TOKEN_IDENTIFIER) {
+                    parser_error(p, "expected identifier after '.' in import path");
+                    free(first); free(last_segment);
+                    return parser_recover(p);
+                }
+                /* Append "/<next>" to first (which accumulates the path). */
+                {
+                    size_t seg_len = strlen(p->current.value);
+                    char* grown = (char*)realloc(first, total_len + 1 + seg_len + 1);
+                    if (!grown) { free(first); free(last_segment); parser_error(p, "out of memory in import path"); return parser_recover(p); }
+                    first = grown;
+                    first[total_len] = '/';
+                    memcpy(first + total_len + 1, p->current.value, seg_len + 1);
+                    total_len += 1 + seg_len;
+                }
+                free(last_segment);
+                last_segment = strdup(p->current.value);
+                eat_p(p, TOKEN_IDENTIFIER);
+            }
+            /* Synthesize "<path>.lamo". */
+            size_t plen = total_len + 6;
             path = malloc(plen);
-            snprintf(path, plen, "%s.lamo", mod_name);
-            /* Default alias is the module name itself (so `import math`
-             * makes symbols accessible as `math.fn(args)`). */
-            alias = mod_name;  /* will be freed below; we strdup for the AST */
+            snprintf(path, plen, "%s.lamo", first);
+            /* Default alias is the last segment. */
+            alias = last_segment;
+            free(first);
         } else {
             parser_error(p, "expected string path or module name after import");
             return parser_recover(p);
@@ -910,22 +957,33 @@ ASTNode* parse_statement(Parser* p) {
             }
             char* ftype = strdup(p->current.value);
             eat_p(p, TOKEN_IDENTIFIER);
-            /* Grow both arrays. */
+            /* Grow both arrays. Realloc one at a time and assign back
+             * immediately to avoid -Wuse-after-free. */
             {
                 char** fn_r = realloc(field_names, sizeof(char*) * (size_t)(field_count + 1));
-                char** ft_r = realloc(field_types, sizeof(char*) * (size_t)(field_count + 1));
-                if (!fn_r || !ft_r) {
+                if (!fn_r) {
                     parser_error(p, "out of memory while growing struct field list");
                     free(fname); free(ftype); free(name);
                     for (int i = 0; i < field_count; i++) { free(field_names[i]); free(field_types[i]); }
-                    free(fn_r ? fn_r : field_names); free(ft_r ? ft_r : field_types);
+                    free(field_names); free(field_types);
                     return parser_recover(p);
                 }
-                field_names = fn_r; field_types = ft_r;
-                field_names[field_count] = fname;
-                field_types[field_count] = ftype;
-                field_count++;
+                field_names = fn_r;
             }
+            {
+                char** ft_r = realloc(field_types, sizeof(char*) * (size_t)(field_count + 1));
+                if (!ft_r) {
+                    parser_error(p, "out of memory while growing struct field list");
+                    free(fname); free(ftype); free(name);
+                    for (int i = 0; i < field_count; i++) { free(field_names[i]); free(field_types[i]); }
+                    free(field_names); free(field_types);
+                    return parser_recover(p);
+                }
+                field_types = ft_r;
+            }
+            field_names[field_count] = fname;
+            field_types[field_count] = ftype;
+            field_count++;
             /* Fields can be separated by `,` or `;` or just newlines
              * (the spec example shows no separators, just one field per
              * line). We accept all three for flexibility. */
@@ -1067,25 +1125,48 @@ ASTNode* parse_statement(Parser* p) {
              * so the user can write `Red => print("red");` or
              * `Red => { print("red"); print("!"); }`. */
             ASTNode* body = parse_statement(p);
-            /* Grow arrays. */
+            /* Grow arrays. Realloc one at a time and assign back
+             * immediately to avoid -Wuse-after-free. */
             {
                 char** p_r = realloc(patterns, sizeof(char*) * (size_t)(arm_count + 1));
-                int* w_r = realloc(pattern_is_wildcard, sizeof(int) * (size_t)(arm_count + 1));
-                ASTNode** b_r = realloc(bodies, sizeof(ASTNode*) * (size_t)(arm_count + 1));
-                if (!p_r || !w_r || !b_r) {
+                if (!p_r) {
                     parser_error(p, "out of memory while growing match arm list");
                     free(pat); ast_free(body);
                     for (int i = 0; i < arm_count; i++) { free(patterns[i]); ast_free(bodies[i]); }
-                    free(p_r ? p_r : patterns); free(w_r ? w_r : pattern_is_wildcard); free(b_r ? b_r : bodies);
+                    free(patterns); free(pattern_is_wildcard); free(bodies);
                     ast_free(scrutinee);
                     return parser_recover(p);
                 }
-                patterns = p_r; pattern_is_wildcard = w_r; bodies = b_r;
-                patterns[arm_count] = pat;
-                pattern_is_wildcard[arm_count] = is_wild;
-                bodies[arm_count] = body;
-                arm_count++;
+                patterns = p_r;
             }
+            {
+                int* w_r = realloc(pattern_is_wildcard, sizeof(int) * (size_t)(arm_count + 1));
+                if (!w_r) {
+                    parser_error(p, "out of memory while growing match arm list");
+                    free(pat); ast_free(body);
+                    for (int i = 0; i < arm_count; i++) { free(patterns[i]); ast_free(bodies[i]); }
+                    free(patterns); free(pattern_is_wildcard); free(bodies);
+                    ast_free(scrutinee);
+                    return parser_recover(p);
+                }
+                pattern_is_wildcard = w_r;
+            }
+            {
+                ASTNode** b_r = realloc(bodies, sizeof(ASTNode*) * (size_t)(arm_count + 1));
+                if (!b_r) {
+                    parser_error(p, "out of memory while growing match arm list");
+                    free(pat); ast_free(body);
+                    for (int i = 0; i < arm_count; i++) { free(patterns[i]); ast_free(bodies[i]); }
+                    free(patterns); free(pattern_is_wildcard); free(bodies);
+                    ast_free(scrutinee);
+                    return parser_recover(p);
+                }
+                bodies = b_r;
+            }
+            patterns[arm_count] = pat;
+            pattern_is_wildcard[arm_count] = is_wild;
+            bodies[arm_count] = body;
+            arm_count++;
             if (p->current.type == TOKEN_COMMA) advance_p(p);
         }
         expect_p(p, TOKEN_RBRACE, "missing '}' at end of match body");

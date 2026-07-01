@@ -30,7 +30,8 @@
 typedef enum {
     BUILTIN_LANG,
     BUILTIN_GUI,
-    BUILTIN_HTTP
+    BUILTIN_HTTP,
+    BUILTIN_STD
 } BuiltinCategory;
 
 typedef enum {
@@ -55,6 +56,7 @@ static const BuiltinInfo lamo_builtins[] = {
     {"input_str",  1, BUILTIN_LANG, BUILTIN_RET_STRING},
     {"isnumber",   1, BUILTIN_LANG, BUILTIN_RET_BOOL},
     {"isstring",   1, BUILTIN_LANG, BUILTIN_RET_BOOL},
+    {"isarray",    1, BUILTIN_LANG, BUILTIN_RET_BOOL},
     {"exit",       1, BUILTIN_LANG, BUILTIN_RET_INT},
     {"abs",        1, BUILTIN_LANG, BUILTIN_RET_MIRROR_ARG0},
     /* Sprint 3: array builtins. len(arr) returns the element count as int.
@@ -63,6 +65,108 @@ static const BuiltinInfo lamo_builtins[] = {
     {"len",        1, BUILTIN_LANG, BUILTIN_RET_INT},
     {"push",       2, BUILTIN_LANG, BUILTIN_RET_INT},
     {"pop",        1, BUILTIN_LANG, BUILTIN_RET_INT},  /* actually returns the popped value's type, but we report INT conservatively */
+
+    /* ==================================================================== */
+    /* Standard library builtins (BUILTIN_STD)                              */
+    /* These power the std.* modules under std/. They're emitted only when  */
+    /* the program actually uses them (gated by LAMO_NEEDS_STD_RUNTIME).    */
+    /* Names use a __lamo_std_<module>_<fn> prefix to avoid collisions with  */
+    /* user-defined functions; the std/<module>.lamo wrappers expose them    */
+    /* through the namespaced import API (e.g. math.sqrt, fs.readText).      */
+    /* ==================================================================== */
+
+    /* std.math */
+    {"__lamo_std_math_sqrt",    1, BUILTIN_STD, BUILTIN_RET_INT},
+    {"__lamo_std_math_pow",     2, BUILTIN_STD, BUILTIN_RET_INT},
+    {"__lamo_std_math_sin",     1, BUILTIN_STD, BUILTIN_RET_INT},
+    {"__lamo_std_math_cos",     1, BUILTIN_STD, BUILTIN_RET_INT},
+    {"__lamo_std_math_tan",     1, BUILTIN_STD, BUILTIN_RET_INT},
+    {"__lamo_std_math_floor",   1, BUILTIN_STD, BUILTIN_RET_INT},
+    {"__lamo_std_math_ceil",    1, BUILTIN_STD, BUILTIN_RET_INT},
+    {"__lamo_std_math_round",   1, BUILTIN_STD, BUILTIN_RET_INT},
+    {"__lamo_std_math_min",     2, BUILTIN_STD, BUILTIN_RET_INT},
+    {"__lamo_std_math_max",     2, BUILTIN_STD, BUILTIN_RET_INT},
+    {"__lamo_std_math_clamp",   3, BUILTIN_STD, BUILTIN_RET_INT},
+
+    /* std.string */
+    {"__lamo_std_str_length",      1, BUILTIN_STD, BUILTIN_RET_INT},
+    {"__lamo_std_str_upper",       1, BUILTIN_STD, BUILTIN_RET_STRING},
+    {"__lamo_std_str_lower",       1, BUILTIN_STD, BUILTIN_RET_STRING},
+    {"__lamo_std_str_starts_with", 2, BUILTIN_STD, BUILTIN_RET_BOOL},
+    {"__lamo_std_str_ends_with",   2, BUILTIN_STD, BUILTIN_RET_BOOL},
+    {"__lamo_std_str_contains",    2, BUILTIN_STD, BUILTIN_RET_BOOL},
+    {"__lamo_std_str_index_of",    2, BUILTIN_STD, BUILTIN_RET_INT},
+    {"__lamo_std_str_trim",        1, BUILTIN_STD, BUILTIN_RET_STRING},
+    {"__lamo_std_str_substring",   3, BUILTIN_STD, BUILTIN_RET_STRING},
+    {"__lamo_std_str_replace",     3, BUILTIN_STD, BUILTIN_RET_STRING},
+    {"__lamo_std_str_split",       2, BUILTIN_STD, BUILTIN_RET_INT},
+    {"__lamo_std_str_char_at",     2, BUILTIN_STD, BUILTIN_RET_STRING},
+    {"__lamo_std_str_repeat",      2, BUILTIN_STD, BUILTIN_RET_STRING},
+
+    /* std.path */
+    {"__lamo_std_path_join",      2, BUILTIN_STD, BUILTIN_RET_STRING},
+    {"__lamo_std_path_parent",    1, BUILTIN_STD, BUILTIN_RET_STRING},
+    {"__lamo_std_path_filename",  1, BUILTIN_STD, BUILTIN_RET_STRING},
+    {"__lamo_std_path_extension", 1, BUILTIN_STD, BUILTIN_RET_STRING},
+    {"__lamo_std_path_absolute",  1, BUILTIN_STD, BUILTIN_RET_STRING},
+    {"__lamo_std_path_normalize", 1, BUILTIN_STD, BUILTIN_RET_STRING},
+
+    /* std.fs */
+    {"__lamo_std_fs_exists",     1, BUILTIN_STD, BUILTIN_RET_BOOL},
+    {"__lamo_std_fs_is_file",    1, BUILTIN_STD, BUILTIN_RET_BOOL},
+    {"__lamo_std_fs_is_dir",     1, BUILTIN_STD, BUILTIN_RET_BOOL},
+    {"__lamo_std_fs_read_text",  1, BUILTIN_STD, BUILTIN_RET_STRING},
+    {"__lamo_std_fs_write_text", 2, BUILTIN_STD, BUILTIN_RET_INT},
+    {"__lamo_std_fs_append_text",2, BUILTIN_STD, BUILTIN_RET_INT},
+    {"__lamo_std_fs_delete",     1, BUILTIN_STD, BUILTIN_RET_INT},
+    {"__lamo_std_fs_create_dir", 1, BUILTIN_STD, BUILTIN_RET_INT},
+    {"__lamo_std_fs_remove_dir", 1, BUILTIN_STD, BUILTIN_RET_INT},
+    {"__lamo_std_fs_copy",       2, BUILTIN_STD, BUILTIN_RET_INT},
+    {"__lamo_std_fs_move",       2, BUILTIN_STD, BUILTIN_RET_INT},
+    {"__lamo_std_fs_list_files", 1, BUILTIN_STD, BUILTIN_RET_INT},
+    {"__lamo_std_fs_size",       1, BUILTIN_STD, BUILTIN_RET_INT},
+
+    /* std.env */
+    {"__lamo_std_env_get",    1, BUILTIN_STD, BUILTIN_RET_STRING},
+    {"__lamo_std_env_set",    2, BUILTIN_STD, BUILTIN_RET_INT},
+    {"__lamo_std_env_remove", 1, BUILTIN_STD, BUILTIN_RET_INT},
+
+    /* std.os */
+    {"__lamo_std_os_name",      0, BUILTIN_STD, BUILTIN_RET_STRING},
+    {"__lamo_std_os_arch",      0, BUILTIN_STD, BUILTIN_RET_STRING},
+    {"__lamo_std_os_cpu_count", 0, BUILTIN_STD, BUILTIN_RET_INT},
+    {"__lamo_std_os_home",      0, BUILTIN_STD, BUILTIN_RET_STRING},
+    {"__lamo_std_os_temp_dir",  0, BUILTIN_STD, BUILTIN_RET_STRING},
+
+    /* std.time */
+    {"__lamo_std_time_now",      0, BUILTIN_STD, BUILTIN_RET_INT},
+    {"__lamo_std_time_timestamp",0, BUILTIN_STD, BUILTIN_RET_INT},
+    {"__lamo_std_time_sleep",    1, BUILTIN_STD, BUILTIN_RET_INT},
+    {"__lamo_std_time_monotonic",0, BUILTIN_STD, BUILTIN_RET_INT},
+
+    /* std.process */
+    {"__lamo_std_process_pid",  0, BUILTIN_STD, BUILTIN_RET_INT},
+    {"__lamo_std_process_run",  1, BUILTIN_STD, BUILTIN_RET_INT},
+    {"__lamo_std_process_exec", 1, BUILTIN_STD, BUILTIN_RET_STRING},
+    {"__lamo_std_process_exit", 1, BUILTIN_STD, BUILTIN_RET_INT},
+
+    /* std.random */
+    {"__lamo_std_random_seed",   1, BUILTIN_STD, BUILTIN_RET_INT},
+    {"__lamo_std_random_int",    2, BUILTIN_STD, BUILTIN_RET_INT},
+    {"__lamo_std_random_float",  0, BUILTIN_STD, BUILTIN_RET_INT},
+    {"__lamo_std_random_bool",   0, BUILTIN_STD, BUILTIN_RET_BOOL},
+    {"__lamo_std_random_choice", 1, BUILTIN_STD, BUILTIN_RET_INT},
+    {"__lamo_std_random_shuffle",1, BUILTIN_STD, BUILTIN_RET_INT},
+
+    /* std.io (extra I/O builtins; print/input/exit already in LANG) */
+    {"__lamo_std_io_println",  1, BUILTIN_STD, BUILTIN_RET_INT},
+    {"__lamo_std_io_eprint",   1, BUILTIN_STD, BUILTIN_RET_INT},
+    {"__lamo_std_io_read_line",0, BUILTIN_STD, BUILTIN_RET_STRING},
+    {"__lamo_std_io_write",    1, BUILTIN_STD, BUILTIN_RET_INT},
+
+    /* std.net (HTTP client) */
+    {"__lamo_std_net_http_get",  1, BUILTIN_STD, BUILTIN_RET_STRING},
+    {"__lamo_std_net_http_post", 2, BUILTIN_STD, BUILTIN_RET_STRING},
     /* GUI builtins — Windows GDI / X11, gated behind LAMO_NEEDS_GUI_RUNTIME. */
     {"gui_open",          3, BUILTIN_GUI, BUILTIN_RET_INT},
     {"gui_should_close",  0, BUILTIN_GUI, BUILTIN_RET_INT},
@@ -102,6 +206,10 @@ static inline int lamo_builtin_is_gui(const char* name) {
 static inline int lamo_builtin_is_http(const char* name) {
     const BuiltinInfo* b = lamo_builtin_lookup(name);
     return b != NULL && b->category == BUILTIN_HTTP;
+}
+static inline int lamo_builtin_is_std(const char* name) {
+    const BuiltinInfo* b = lamo_builtin_lookup(name);
+    return b != NULL && b->category == BUILTIN_STD;
 }
 
 /* Returns arity (-1 if not a builtin). Replaces semantic.c's

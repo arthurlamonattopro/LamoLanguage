@@ -1,0 +1,352 @@
+// std.collections — Higher-level collection types.
+//
+// Part of the Lamo standard library. Provides List, Stack, Queue,
+// HashMap, and HashSet operations built on top of Lamo's native arrays.
+//
+// API design note: Lamo's static type inference cannot follow struct
+// types across module boundaries (return values from imported functions
+// are typed as UNKNOWN), so the collections API uses module-level
+// functions rather than methods on struct values. The first argument
+// to each function is the collection. This is consistent with how
+// Python's heapq module works, and avoids requiring type annotations
+// at every call site.
+//
+// Internally, collections are represented as plain Lamo arrays:
+//   - List:     [v0, v1, v2, ...]
+//   - Stack:    [bottom, ..., top]    (push/pop from the end)
+//   - Queue:    [front, ..., back]    (enqueue at end, dequeue at front)
+//   - HashMap:  [k0, v0, k1, v1, ...] (flat key/value pairs)
+//   - HashSet:  [v0, v1, ...]         (no duplicates)
+//
+// Usage:
+//   import std.collections as collections
+//   let list = collections.newList()
+//   collections.listPush(list, 10)
+//   collections.listPush(list, 20)
+//   print(collections.listGet(list, 0))   // 10
+//   print(collections.listLen(list))      // 2
+
+// ─── List ────────────────────────────────────────────────────────────
+
+fn newList() {
+    return []
+}
+
+fn listPush(list, value) {
+    push(list, value)
+    return list.len()
+}
+
+fn listPop(list) {
+    return pop(list)
+}
+
+fn listGet(list, i) {
+    return list[i]
+}
+
+fn listSet(list, i, value) {
+    list[i] = value
+    return value
+}
+
+fn listInsert(list, i, value) {
+    let n = list.len()
+    push(list, 0)
+    let j = n
+    while (j > i) {
+        list[j] = list[j - 1]
+        j = j - 1
+    }
+    list[i] = value
+    return list.len()
+}
+
+fn listRemoveAt(list, i) {
+    let n = list.len()
+    let removed = list[i]
+    let j = i
+    while (j < n - 1) {
+        list[j] = list[j + 1]
+        j = j + 1
+    }
+    pop(list)
+    return removed
+}
+
+fn listContains(list, value) {
+    let i = 0
+    while (i < list.len()) {
+        if (list[i] == value) { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+fn listIndexOf(list, value) {
+    let i = 0
+    while (i < list.len()) {
+        if (list[i] == value) { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn listLen(list) {
+    return list.len()
+}
+
+fn listIsEmpty(list) {
+    if (list.len() == 0) { return 1 }
+    return 0
+}
+
+fn listClear(list) {
+    while (list.len() > 0) {
+        pop(list)
+    }
+    return 0
+}
+
+// ─── Stack (LIFO; push/pop from end) ─────────────────────────────────
+
+fn newStack() {
+    return []
+}
+
+fn stackPush(stack, value) {
+    push(stack, value)
+    return stack.len()
+}
+
+fn stackPop(stack) {
+    return pop(stack)
+}
+
+fn stackPeek(stack) {
+    let n = stack.len()
+    if (n == 0) { return 0 }
+    return stack[n - 1]
+}
+
+fn stackLen(stack) {
+    return stack.len()
+}
+
+fn stackIsEmpty(stack) {
+    if (stack.len() == 0) { return 1 }
+    return 0
+}
+
+fn stackClear(stack) {
+    while (stack.len() > 0) {
+        pop(stack)
+    }
+    return 0
+}
+
+// ─── Queue (FIFO; enqueue at end, dequeue at front) ──────────────────
+
+fn newQueue() {
+    return []
+}
+
+fn queueEnqueue(queue, value) {
+    push(queue, value)
+    return queue.len()
+}
+
+fn queueDequeue(queue) {
+    if (queue.len() == 0) { return 0 }
+    let front = queue[0]
+    let i = 0
+    let n = queue.len()
+    while (i < n - 1) {
+        queue[i] = queue[i + 1]
+        i = i + 1
+    }
+    pop(queue)
+    return front
+}
+
+fn queuePeek(queue) {
+    if (queue.len() == 0) { return 0 }
+    return queue[0]
+}
+
+fn queueLen(queue) {
+    return queue.len()
+}
+
+fn queueIsEmpty(queue) {
+    if (queue.len() == 0) { return 1 }
+    return 0
+}
+
+fn queueClear(queue) {
+    while (queue.len() > 0) {
+        pop(queue)
+    }
+    return 0
+}
+
+// ─── HashMap (flat key/value pairs in a single array) ────────────────
+
+fn newHashMap() {
+    return []
+}
+
+fn mapPut(map, key, value) {
+    let i = 0
+    while (i < map.len()) {
+        if (map[i] == key) {
+            map[i + 1] = value
+            return value
+        }
+        i = i + 2
+    }
+    push(map, key)
+    push(map, value)
+    return value
+}
+
+fn mapGet(map, key) {
+    let i = 0
+    while (i < map.len()) {
+        if (map[i] == key) { return map[i + 1] }
+        i = i + 2
+    }
+    return 0
+}
+
+fn mapGetOr(map, key, default) {
+    let i = 0
+    while (i < map.len()) {
+        if (map[i] == key) { return map[i + 1] }
+        i = i + 2
+    }
+    return default
+}
+
+fn mapHas(map, key) {
+    let i = 0
+    while (i < map.len()) {
+        if (map[i] == key) { return 1 }
+        i = i + 2
+    }
+    return 0
+}
+
+fn mapRemove(map, key) {
+    let i = 0
+    while (i < map.len()) {
+        if (map[i] == key) {
+            let j = i
+            let n = map.len()
+            while (j < n - 2) {
+                map[j] = map[j + 2]
+                j = j + 1
+            }
+            pop(map)
+            pop(map)
+            return 1
+        }
+        i = i + 2
+    }
+    return 0
+}
+
+fn mapLen(map) {
+    return map.len() / 2
+}
+
+fn mapKeys(map) {
+    let keys = []
+    let i = 0
+    while (i < map.len()) {
+        push(keys, map[i])
+        i = i + 2
+    }
+    return keys
+}
+
+fn mapValues(map) {
+    let values = []
+    let i = 1
+    while (i < map.len()) {
+        push(values, map[i])
+        i = i + 2
+    }
+    return values
+}
+
+fn mapClear(map) {
+    while (map.len() > 0) {
+        pop(map)
+    }
+    return 0
+}
+
+// ─── HashSet (no duplicates) ─────────────────────────────────────────
+
+fn newHashSet() {
+    return []
+}
+
+fn setAdd(setArr, value) {
+    if (setHas(setArr, value) == 0) {
+        push(setArr, value)
+    }
+    return setArr.len()
+}
+
+fn setHas(setArr, value) {
+    let i = 0
+    while (i < setArr.len()) {
+        if (setArr[i] == value) { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+fn setContains(setArr, value) {
+    return setHas(setArr, value)
+}
+
+fn setRemove(setArr, value) {
+    let i = 0
+    while (i < setArr.len()) {
+        if (setArr[i] == value) {
+            let n = setArr.len()
+            let j = i
+            while (j < n - 1) {
+                setArr[j] = setArr[j + 1]
+                j = j + 1
+            }
+            pop(setArr)
+            return 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn setLen(setArr) {
+    return setArr.len()
+}
+
+fn setIsEmpty(setArr) {
+    if (setArr.len() == 0) { return 1 }
+    return 0
+}
+
+fn setClear(setArr) {
+    while (setArr.len() > 0) {
+        pop(setArr)
+    }
+    return 0
+}
+
+fn setToArray(setArr) {
+    return setArr
+}

@@ -44,7 +44,10 @@ static void print_indent(FILE* out) {
 // identifier; the language has no arbitrary-length identifier limits today).
 // This makes it safe to use multiple user_name() calls in the same fprintf,
 // e.g. fprintf(out, "%s, %s", user_name(a, bufa), user_name(b, bufb)).
-#define LAMO_USER_NAME_MAX 256
+/* LAMO_USER_NAME_MAX must be large enough for the longest user symbol:
+ * the prefix (7 chars) + the longest identifier we might prefix. 512
+ * gives plenty of headroom and silences -Wformat-truncation. */
+#define LAMO_USER_NAME_MAX 512
 
 #if defined(__GNUC__) || defined(__clang__)
 #define LAMO_CGEN_UNUSED __attribute__((unused))
@@ -88,12 +91,15 @@ static void generate_call_arguments(ASTNode** args, int arg_count, FILE* out);
 #define is_gui_builtin(name)    lamo_builtin_is_gui(name)
 #define is_http_builtin(name)   lamo_builtin_is_http(name)
 #define is_lang_builtin(name)   lamo_builtin_is_lang(name)
+#define is_std_builtin(name)    lamo_builtin_is_std(name)
 static void generate_lang_builtin_call_expr(const char* name, ASTNode** args, int arg_count, FILE* out);
 static void generate_gui_call_expr(const char* name, ASTNode** args, int arg_count, FILE* out);
 static void generate_http_call_expr(const char* name, ASTNode** args, int arg_count, FILE* out);
-static void emit_runtime(FILE* out, int needs_gui, int needs_http, int feat_flags);
+static void generate_std_builtin_call_expr(const char* name, ASTNode** args, int arg_count, FILE* out);
+static void emit_runtime(FILE* out, int needs_gui, int needs_http, int needs_std, int feat_flags);
 static int ast_uses_gui(ASTNode* node);
 static int ast_uses_http(ASTNode* node);
+static int ast_uses_std(ASTNode* node);
 
 
 
@@ -148,6 +154,12 @@ static void generate_lang_builtin_call_expr(const char* name, ASTNode** args, in
     }
     if (strcmp(name, "isstring") == 0) {
         fprintf(out, "lamo_isstring_value(");
+        generate_expression_code(args[0], out);
+        fprintf(out, ")");
+        return;
+    }
+    if (strcmp(name, "isarray") == 0) {
+        fprintf(out, "lamo_isarray_value(");
         generate_expression_code(args[0], out);
         fprintf(out, ")");
         return;
@@ -287,6 +299,259 @@ static void generate_http_call_expr(const char* name, ASTNode** args, int arg_co
 }
 
 
+
+/* Standard-library builtins (BUILTIN_STD). These are prefixed with
+ * __lamo_std_ so they cannot collide with user-defined functions or
+ * with the legacy LANG builtins. The std/<module>.lamo wrappers expose
+ * them through the namespaced import API (math.sqrt, fs.readText, ...).
+ *
+ * Each case maps the builtin name to its runtime function and emits
+ * the appropriate value-type coercions (lamo_as_int / lamo_as_float /
+ * lamo_as_cstring) for arguments. The runtime functions return LamoValue
+ * directly, so most cases are one-liners. */
+static void generate_std_builtin_call_expr(const char* name, ASTNode** args, int arg_count, FILE* out) {
+    (void)arg_count;
+
+    /* ----- std.math ----- */
+    if (strcmp(name, "__lamo_std_math_sqrt") == 0) {
+        fprintf(out, "lamo_math_sqrt("); generate_expression_code(args[0], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_math_pow") == 0) {
+        fprintf(out, "lamo_math_pow("); generate_expression_code(args[0], out);
+        fprintf(out, ", "); generate_expression_code(args[1], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_math_sin") == 0) {
+        fprintf(out, "lamo_math_sin("); generate_expression_code(args[0], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_math_cos") == 0) {
+        fprintf(out, "lamo_math_cos("); generate_expression_code(args[0], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_math_tan") == 0) {
+        fprintf(out, "lamo_math_tan("); generate_expression_code(args[0], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_math_floor") == 0) {
+        fprintf(out, "lamo_math_floor("); generate_expression_code(args[0], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_math_ceil") == 0) {
+        fprintf(out, "lamo_math_ceil("); generate_expression_code(args[0], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_math_round") == 0) {
+        fprintf(out, "lamo_math_round("); generate_expression_code(args[0], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_math_min") == 0) {
+        fprintf(out, "lamo_math_min("); generate_expression_code(args[0], out);
+        fprintf(out, ", "); generate_expression_code(args[1], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_math_max") == 0) {
+        fprintf(out, "lamo_math_max("); generate_expression_code(args[0], out);
+        fprintf(out, ", "); generate_expression_code(args[1], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_math_clamp") == 0) {
+        fprintf(out, "lamo_math_clamp("); generate_expression_code(args[0], out);
+        fprintf(out, ", "); generate_expression_code(args[1], out);
+        fprintf(out, ", "); generate_expression_code(args[2], out); fprintf(out, ")"); return;
+    }
+
+    /* ----- std.string ----- */
+    if (strcmp(name, "__lamo_std_str_length") == 0) {
+        fprintf(out, "lamo_str_length("); generate_expression_code(args[0], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_str_upper") == 0) {
+        fprintf(out, "lamo_str_upper("); generate_expression_code(args[0], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_str_lower") == 0) {
+        fprintf(out, "lamo_str_lower("); generate_expression_code(args[0], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_str_starts_with") == 0) {
+        fprintf(out, "lamo_str_starts_with("); generate_expression_code(args[0], out);
+        fprintf(out, ", "); generate_expression_code(args[1], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_str_ends_with") == 0) {
+        fprintf(out, "lamo_str_ends_with("); generate_expression_code(args[0], out);
+        fprintf(out, ", "); generate_expression_code(args[1], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_str_contains") == 0) {
+        fprintf(out, "lamo_str_contains("); generate_expression_code(args[0], out);
+        fprintf(out, ", "); generate_expression_code(args[1], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_str_index_of") == 0) {
+        fprintf(out, "lamo_str_index_of("); generate_expression_code(args[0], out);
+        fprintf(out, ", "); generate_expression_code(args[1], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_str_trim") == 0) {
+        fprintf(out, "lamo_str_trim("); generate_expression_code(args[0], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_str_substring") == 0) {
+        fprintf(out, "lamo_str_substring("); generate_expression_code(args[0], out);
+        fprintf(out, ", "); generate_expression_code(args[1], out);
+        fprintf(out, ", "); generate_expression_code(args[2], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_str_replace") == 0) {
+        fprintf(out, "lamo_str_replace("); generate_expression_code(args[0], out);
+        fprintf(out, ", "); generate_expression_code(args[1], out);
+        fprintf(out, ", "); generate_expression_code(args[2], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_str_split") == 0) {
+        fprintf(out, "lamo_str_split("); generate_expression_code(args[0], out);
+        fprintf(out, ", "); generate_expression_code(args[1], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_str_char_at") == 0) {
+        fprintf(out, "lamo_str_char_at("); generate_expression_code(args[0], out);
+        fprintf(out, ", "); generate_expression_code(args[1], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_str_repeat") == 0) {
+        fprintf(out, "lamo_str_repeat("); generate_expression_code(args[0], out);
+        fprintf(out, ", "); generate_expression_code(args[1], out); fprintf(out, ")"); return;
+    }
+
+    /* ----- std.path ----- */
+    if (strcmp(name, "__lamo_std_path_join") == 0) {
+        fprintf(out, "lamo_path_join("); generate_expression_code(args[0], out);
+        fprintf(out, ", "); generate_expression_code(args[1], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_path_parent") == 0) {
+        fprintf(out, "lamo_path_parent("); generate_expression_code(args[0], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_path_filename") == 0) {
+        fprintf(out, "lamo_path_filename("); generate_expression_code(args[0], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_path_extension") == 0) {
+        fprintf(out, "lamo_path_extension("); generate_expression_code(args[0], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_path_absolute") == 0) {
+        fprintf(out, "lamo_path_absolute("); generate_expression_code(args[0], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_path_normalize") == 0) {
+        fprintf(out, "lamo_path_normalize("); generate_expression_code(args[0], out); fprintf(out, ")"); return;
+    }
+
+    /* ----- std.fs ----- */
+    if (strcmp(name, "__lamo_std_fs_exists") == 0) {
+        fprintf(out, "lamo_fs_exists("); generate_expression_code(args[0], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_fs_is_file") == 0) {
+        fprintf(out, "lamo_fs_is_file("); generate_expression_code(args[0], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_fs_is_dir") == 0) {
+        fprintf(out, "lamo_fs_is_dir("); generate_expression_code(args[0], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_fs_read_text") == 0) {
+        fprintf(out, "lamo_fs_read_text("); generate_expression_code(args[0], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_fs_write_text") == 0) {
+        fprintf(out, "lamo_fs_write_text("); generate_expression_code(args[0], out);
+        fprintf(out, ", "); generate_expression_code(args[1], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_fs_append_text") == 0) {
+        fprintf(out, "lamo_fs_append_text("); generate_expression_code(args[0], out);
+        fprintf(out, ", "); generate_expression_code(args[1], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_fs_delete") == 0) {
+        fprintf(out, "lamo_fs_delete("); generate_expression_code(args[0], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_fs_create_dir") == 0) {
+        fprintf(out, "lamo_fs_create_dir("); generate_expression_code(args[0], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_fs_remove_dir") == 0) {
+        fprintf(out, "lamo_fs_remove_dir("); generate_expression_code(args[0], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_fs_copy") == 0) {
+        fprintf(out, "lamo_fs_copy("); generate_expression_code(args[0], out);
+        fprintf(out, ", "); generate_expression_code(args[1], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_fs_move") == 0) {
+        fprintf(out, "lamo_fs_move("); generate_expression_code(args[0], out);
+        fprintf(out, ", "); generate_expression_code(args[1], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_fs_list_files") == 0) {
+        fprintf(out, "lamo_fs_list_files("); generate_expression_code(args[0], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_fs_size") == 0) {
+        fprintf(out, "lamo_fs_size("); generate_expression_code(args[0], out); fprintf(out, ")"); return;
+    }
+
+    /* ----- std.env ----- */
+    if (strcmp(name, "__lamo_std_env_get") == 0) {
+        fprintf(out, "lamo_env_get("); generate_expression_code(args[0], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_env_set") == 0) {
+        fprintf(out, "lamo_env_set("); generate_expression_code(args[0], out);
+        fprintf(out, ", "); generate_expression_code(args[1], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_env_remove") == 0) {
+        fprintf(out, "lamo_env_remove("); generate_expression_code(args[0], out); fprintf(out, ")"); return;
+    }
+
+    /* ----- std.os ----- */
+    if (strcmp(name, "__lamo_std_os_name") == 0)      { fprintf(out, "lamo_os_name()"); return; }
+    if (strcmp(name, "__lamo_std_os_arch") == 0)      { fprintf(out, "lamo_os_arch()"); return; }
+    if (strcmp(name, "__lamo_std_os_cpu_count") == 0) { fprintf(out, "lamo_os_cpu_count()"); return; }
+    if (strcmp(name, "__lamo_std_os_home") == 0)      { fprintf(out, "lamo_os_home()"); return; }
+    if (strcmp(name, "__lamo_std_os_temp_dir") == 0)  { fprintf(out, "lamo_os_temp_dir()"); return; }
+
+    /* ----- std.time ----- */
+    if (strcmp(name, "__lamo_std_time_now") == 0)       { fprintf(out, "lamo_time_now()"); return; }
+    if (strcmp(name, "__lamo_std_time_timestamp") == 0){ fprintf(out, "lamo_time_timestamp()"); return; }
+    if (strcmp(name, "__lamo_std_time_sleep") == 0) {
+        fprintf(out, "lamo_time_sleep("); generate_expression_code(args[0], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_time_monotonic") == 0){ fprintf(out, "lamo_time_monotonic()"); return; }
+
+    /* ----- std.process ----- */
+    if (strcmp(name, "__lamo_std_process_pid") == 0)  { fprintf(out, "lamo_process_pid()"); return; }
+    if (strcmp(name, "__lamo_std_process_run") == 0) {
+        fprintf(out, "lamo_process_run("); generate_expression_code(args[0], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_process_exec") == 0) {
+        fprintf(out, "lamo_process_exec("); generate_expression_code(args[0], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_process_exit") == 0) {
+        fprintf(out, "(exit(lamo_as_int("); generate_expression_code(args[0], out);
+        fprintf(out, ")), lamo_make_int(0))"); return;
+    }
+
+    /* ----- std.random ----- */
+    if (strcmp(name, "__lamo_std_random_seed") == 0) {
+        fprintf(out, "lamo_random_seed("); generate_expression_code(args[0], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_random_int") == 0) {
+        fprintf(out, "lamo_random_int("); generate_expression_code(args[0], out);
+        fprintf(out, ", "); generate_expression_code(args[1], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_random_float") == 0) { fprintf(out, "lamo_random_float()"); return; }
+    if (strcmp(name, "__lamo_std_random_bool") == 0)  { fprintf(out, "lamo_random_bool()"); return; }
+    if (strcmp(name, "__lamo_std_random_choice") == 0) {
+        fprintf(out, "lamo_random_choice("); generate_expression_code(args[0], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_random_shuffle") == 0) {
+        fprintf(out, "lamo_random_shuffle("); generate_expression_code(args[0], out); fprintf(out, ")"); return;
+    }
+
+    /* ----- std.io ----- */
+    if (strcmp(name, "__lamo_std_io_println") == 0) {
+        fprintf(out, "lamo_io_println("); generate_expression_code(args[0], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_io_eprint") == 0) {
+        fprintf(out, "lamo_io_eprint("); generate_expression_code(args[0], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_io_read_line") == 0) { fprintf(out, "lamo_io_read_line()"); return; }
+    if (strcmp(name, "__lamo_std_io_write") == 0) {
+        fprintf(out, "lamo_io_write("); generate_expression_code(args[0], out); fprintf(out, ")"); return;
+    }
+
+    /* ----- std.net ----- */
+    if (strcmp(name, "__lamo_std_net_http_get") == 0) {
+        fprintf(out, "lamo_net_http_get("); generate_expression_code(args[0], out); fprintf(out, ")"); return;
+    }
+    if (strcmp(name, "__lamo_std_net_http_post") == 0) {
+        fprintf(out, "lamo_net_http_post("); generate_expression_code(args[0], out);
+        fprintf(out, ", "); generate_expression_code(args[1], out); fprintf(out, ")"); return;
+    }
+
+    fprintf(out, "lamo_make_int(0)");
+}
+
+
 // Emits the entire Lamo runtime (value + GUI + HTTP) by writing the pre-built
 // string literal lamo_runtime_source (see lamo_runtime_data.c). The value
 // runtime is always emitted; GUI and HTTP runtimes are gated behind #define
@@ -298,7 +563,7 @@ static void generate_http_call_expr(const char* name, ASTNode** args, int arg_co
 #define FEAT_ARRAYS  (1 << 1)
 #define FEAT_FLOATS  (1 << 2)
 
-static void emit_runtime(FILE* out, int needs_gui, int needs_http, int feat_flags) {
+static void emit_runtime(FILE* out, int needs_gui, int needs_http, int needs_std, int feat_flags) {
     fputs("#define LAMO_NEEDS_VALUE_RUNTIME 1\n", out);
     /* Fine-grained feature flags: let GCC dead-strip unused subsections
      * even at -O0. A program that never touches strings, arrays, or floats
@@ -312,6 +577,9 @@ static void emit_runtime(FILE* out, int needs_gui, int needs_http, int feat_flag
     if (needs_http) {
         fputs("#define LAMO_NEEDS_HTTP_RUNTIME 1\n", out);
     }
+    if (needs_std) {
+        fputs("#define LAMO_NEEDS_STD_RUNTIME 1\n", out);
+    }
     fputs(lamo_runtime_source, out);
     fputs("\n#undef LAMO_NEEDS_VALUE_RUNTIME\n", out);
     if (feat_flags & FEAT_STRINGS) fputs("#undef LAMO_NEEDS_STRING_OPS\n", out);
@@ -322,6 +590,9 @@ static void emit_runtime(FILE* out, int needs_gui, int needs_http, int feat_flag
     }
     if (needs_http) {
         fputs("#undef LAMO_NEEDS_HTTP_RUNTIME\n", out);
+    }
+    if (needs_std) {
+        fputs("#undef LAMO_NEEDS_STD_RUNTIME\n", out);
     }
     fputs("\n", out);
 }
@@ -458,6 +729,10 @@ static int ast_uses_gui(ASTNode* node) {
 
 static int ast_uses_http(ASTNode* node) {
     return ast_uses_builtin(node, lamo_builtin_is_http);
+}
+
+static int ast_uses_std(ASTNode* node) {
+    return ast_uses_builtin(node, lamo_builtin_is_std);
 }
 
 /* ── Feature detection: string, array, float ops ─────────────────────────
@@ -604,6 +879,7 @@ void generate_c_code(ASTNode* node, FILE* out) {
     ASTNode* current;
     int needs_gui_runtime;
     int needs_http_runtime;
+    int needs_std_runtime;
     int feat_flags = 0;
 
     if (!node) {
@@ -615,13 +891,22 @@ void generate_c_code(ASTNode* node, FILE* out) {
     g_program_decls = ((ASTProgram*)node)->declarations;
 
     fprintf(out, "// Generated by Lamo v2 (via AST)\n");
+    /* Phase 3 (stdlib): emit POSIX feature-test macros so the STD runtime
+     * can use setenv, clock_gettime, nanosleep, popen, etc. without
+     * -Wimplicit-function-declaration errors under -std=c99. These
+     * macros must appear before any #include. */
+    fprintf(out, "#define _DEFAULT_SOURCE 1\n");
+    fprintf(out, "#define _POSIX_C_SOURCE 200809L\n");
+    fprintf(out, "#define _BSD_SOURCE 1\n");
+    fprintf(out, "#define _GNU_SOURCE 1\n");
     fprintf(out, "#include <stdio.h>\n");
     fprintf(out, "#include <stdlib.h>\n");
     fprintf(out, "#include <string.h>\n\n");
     needs_gui_runtime = ast_uses_gui(node);
     needs_http_runtime = ast_uses_http(node);
+    needs_std_runtime = ast_uses_std(node);
     ast_detect_features(node, &feat_flags);
-    emit_runtime(out, needs_gui_runtime, needs_http_runtime, feat_flags);
+    emit_runtime(out, needs_gui_runtime, needs_http_runtime, needs_std_runtime, feat_flags);
 
     // 1. Forward declarations de funções definidas pelo usuário.
     //    Phase 2: also forward-declare methods (from impl blocks). Methods
@@ -832,6 +1117,22 @@ static void generate_member_call_code(ASTMemberCall* mc, FILE* out) {
  * Used by both statement and expression positions. The g_program_decls
  * global (set by generate_c_code) is walked to find the struct definition. */
 static void generate_prop_expr_code(ASTPropExpr* pe, FILE* out) {
+    /* Phase 3 (stdlib): module variable access (e.g. `math.PI`).
+     * The semantic pass marked these by storing the alias name on
+     * sema_struct_name. We resolve the alias+prop through the module
+     * registry to get the prefixed global name. */
+    if (g_module_registry && pe->object && pe->object->type == AST_IDENTIFIER) {
+        const char* alias = ((ASTIdentifier*)pe->object)->name;
+        const char* prefixed = lamo_modules_resolve_member(g_module_registry, alias, pe->prop_name);
+        if (prefixed) {
+            /* The loader renamed the imported file's top-level variable
+             * declarations to `lamo_mod_<alias>__<name>` (matching the
+             * function renaming). user_name1() adds the user_ prefix
+             * consistent with regular global variable references. */
+            fprintf(out, "%s", user_name1(prefixed));
+            return;
+        }
+    }
     /* Struct field access? */
     const char* struct_name = pe->object ? pe->object->sema_struct_name : NULL;
     if (!struct_name) struct_name = ((ASTNode*)pe)->sema_struct_name;
@@ -1064,6 +1365,8 @@ static void generate_statement_code(ASTNode* node, FILE* out) {
                 generate_gui_call_expr(call_stmt->name, call_stmt->args, call_stmt->arg_count, out);
             } else if (is_http_builtin(call_stmt->name)) {
                 generate_http_call_expr(call_stmt->name, call_stmt->args, call_stmt->arg_count, out);
+            } else if (is_std_builtin(call_stmt->name)) {
+                generate_std_builtin_call_expr(call_stmt->name, call_stmt->args, call_stmt->arg_count, out);
             } else {
                 fprintf(out, "%s(", user_name1(call_stmt->name));
                 generate_call_arguments(call_stmt->args, call_stmt->arg_count, out);
@@ -1411,6 +1714,8 @@ static void generate_expression_code(ASTNode* node, FILE* out) {
                 generate_gui_call_expr(call_expr->name, call_expr->args, call_expr->arg_count, out);
             } else if (is_http_builtin(call_expr->name)) {
                 generate_http_call_expr(call_expr->name, call_expr->args, call_expr->arg_count, out);
+            } else if (is_std_builtin(call_expr->name)) {
+                generate_std_builtin_call_expr(call_expr->name, call_expr->args, call_expr->arg_count, out);
             } else {
                 fprintf(out, "%s(", user_name1(call_expr->name));
                 generate_call_arguments(call_expr->args, call_expr->arg_count, out);

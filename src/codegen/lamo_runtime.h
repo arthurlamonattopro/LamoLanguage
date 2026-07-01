@@ -779,6 +779,10 @@ static LAMO_UNUSED LamoValue lamo_isstring_value(LamoValue value) {
     return lamo_make_bool(value.type == LAMO_VALUE_STRING);
 }
 
+static LAMO_UNUSED LamoValue lamo_isarray_value(LamoValue value) {
+    return lamo_make_bool(value.type == LAMO_VALUE_ARRAY);
+}
+
 static LAMO_UNUSED LamoValue lamo_abs_value(LamoValue value) {
     if (value.type == LAMO_VALUE_FLOAT) {
         double v = value.float_value;
@@ -1221,5 +1225,1401 @@ static int lamo_http_run_server(int port, int serve_once) {
 }
 
 #endif /* LAMO_NEEDS_HTTP_RUNTIME */
+
+
+
+/* ================================================================== */
+/* 4. STD runtime (only emitted when the program uses std_* builtins) */
+/* ================================================================== */
+#ifdef LAMO_NEEDS_STD_RUNTIME
+
+/* Cross-platform headers. We try to keep this self-contained. */
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <errno.h>
+
+#if defined(_WIN32)
+  #ifndef _WIN32_WINNT
+    #define _WIN32_WINNT 0x0600
+  #endif
+  /* Header order matters on Windows: winsock2.h MUST come before windows.h
+   * to avoid the SOCKET vs. HANDLE redefinition conflict. We also include
+   * <time.h> for time()/clock() and <process.h> for _getpid(). */
+  #include <winsock2.h>
+  #include <ws2tcpip.h>
+  #include <windows.h>
+  #include <direct.h>
+  #include <io.h>
+  #include <process.h>
+  #include <time.h>
+  /* Note: we use the ANSI (char*) versions of the Windows file/env APIs
+   * rather than the wide-char (_w*) versions. The Lamo runtime stores all
+   * strings as UTF-8 char*, so passing them directly to the ANSI APIs is
+   * simpler and works for ASCII paths (the common case). For full UTF-8
+   * path support on Windows, we'd need to convert to UTF-16 before each
+   * call — that's future work. */
+  #define LAMO_PATH_SEP '\\'
+  #define LAMO_PATH_SEP_STR "\\"
+  #define lamo_access _access
+  #define lamo_stat _stat
+  #define lamo_mkdir(path) _mkdir(path)
+  #define lamo_rmdir _rmdir
+  #define lamo_unlink _unlink
+  #define lamo_getenv getenv
+  #define lamo_setenv(name, val) _putenv_s(name, val)
+  #define lamo_unsetenv(name) _putenv_s(name, "")
+  typedef struct _stat lamo_stat_t;
+#else
+  #include <unistd.h>
+  #include <dirent.h>
+  #include <time.h>
+  #include <sys/wait.h>
+  #include <pthread.h>
+  #include <sys/socket.h>
+  #include <netinet/in.h>
+  #include <netdb.h>
+  #include <arpa/inet.h>
+  #define LAMO_PATH_SEP '/'
+  #define LAMO_PATH_SEP_STR "/"
+  #define lamo_access access
+  #define lamo_stat stat
+  #define lamo_mkdir(path) mkdir(path, 0755)
+  #define lamo_rmdir rmdir
+  #define lamo_unlink unlink
+  #define lamo_getenv getenv
+  #define lamo_setenv(name, val) setenv(name, val, 1)
+  #define lamo_unsetenv(name) unsetenv(name)
+  typedef struct stat lamo_stat_t;
+#endif
+
+/* Helper: convert C string (UTF-8) to wide string for Windows API.
+ * On non-Windows, this is a no-op (returns NULL or the input). */
+#if defined(_WIN32)
+static LAMO_UNUSED wchar_t* lamo_utf8_to_wide(const char* utf8) {
+    if (!utf8) return NULL;
+    int needed = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, NULL, 0);
+    if (needed <= 0) return NULL;
+    wchar_t* wide = (wchar_t*)malloc(sizeof(wchar_t) * needed);
+    if (!wide) return NULL;
+    MultiByteToWideChar(CP_UTF8, 0, utf8, -1, wide, needed);
+    return wide;
+}
+static LAMO_UNUSED char* lamo_wide_to_utf8(const wchar_t* wide) {
+    if (!wide) return NULL;
+    int needed = WideCharToMultiByte(CP_UTF8, 0, wide, -1, NULL, 0, NULL, NULL);
+    if (needed <= 0) return NULL;
+    char* utf8 = (char*)malloc(needed);
+    if (!utf8) return NULL;
+    WideCharToMultiByte(CP_UTF8, 0, wide, -1, utf8, needed, NULL, NULL);
+    return utf8;
+}
+#endif
+
+/* Helper: build a LamoValue string from a heap-allocated UTF-8 buffer,
+ * registering it in the arena so it's freed at exit. */
+static LAMO_UNUSED LamoValue lamo_std_string(char* heap_str) {
+    LamoValue v = lamo_make_string(heap_str ? heap_str : "");
+    if (heap_str) {
+        /* Register in arena so it's freed at exit. We re-arena-alloc
+         * and copy, then free the original. */
+        char* arena_copy = lamo_arena_strdup(heap_str);
+        free(heap_str);
+        v.string_value = arena_copy;
+    }
+    return v;
+}
+
+/* ================================================================== */
+/* std.math — math functions beyond what the language offers natively */
+/* ================================================================== */
+
+static LAMO_UNUSED LamoValue lamo_math_sqrt(LamoValue v) {
+    return lamo_make_float(sqrt(lamo_as_float(v)));
+}
+static LAMO_UNUSED LamoValue lamo_math_pow(LamoValue base, LamoValue exp) {
+    return lamo_make_float(pow(lamo_as_float(base), lamo_as_float(exp)));
+}
+static LAMO_UNUSED LamoValue lamo_math_sin(LamoValue v) {
+    return lamo_make_float(sin(lamo_as_float(v)));
+}
+static LAMO_UNUSED LamoValue lamo_math_cos(LamoValue v) {
+    return lamo_make_float(cos(lamo_as_float(v)));
+}
+static LAMO_UNUSED LamoValue lamo_math_tan(LamoValue v) {
+    return lamo_make_float(tan(lamo_as_float(v)));
+}
+static LAMO_UNUSED LamoValue lamo_math_floor(LamoValue v) {
+    return lamo_make_float(floor(lamo_as_float(v)));
+}
+static LAMO_UNUSED LamoValue lamo_math_ceil(LamoValue v) {
+    return lamo_make_float(ceil(lamo_as_float(v)));
+}
+static LAMO_UNUSED LamoValue lamo_math_round(LamoValue v) {
+    return lamo_make_float(round(lamo_as_float(v)));
+}
+static LAMO_UNUSED LamoValue lamo_math_min(LamoValue a, LamoValue b) {
+    if (a.type == LAMO_VALUE_FLOAT || b.type == LAMO_VALUE_FLOAT) {
+        double x = lamo_as_float(a), y = lamo_as_float(b);
+        return lamo_make_float(x < y ? x : y);
+    }
+    long long x = lamo_as_int(a), y = lamo_as_int(b);
+    return lamo_make_int(x < y ? x : y);
+}
+static LAMO_UNUSED LamoValue lamo_math_max(LamoValue a, LamoValue b) {
+    if (a.type == LAMO_VALUE_FLOAT || b.type == LAMO_VALUE_FLOAT) {
+        double x = lamo_as_float(a), y = lamo_as_float(b);
+        return lamo_make_float(x > y ? x : y);
+    }
+    long long x = lamo_as_int(a), y = lamo_as_int(b);
+    return lamo_make_int(x > y ? x : y);
+}
+static LAMO_UNUSED LamoValue lamo_math_clamp(LamoValue v, LamoValue lo, LamoValue hi) {
+    LamoValue result = v;
+    if (lamo_is_truthy(lamo_less(v, lo))) result = lo;
+    else if (lamo_is_truthy(lamo_greater(v, hi))) result = hi;
+    return result;
+}
+
+/* ================================================================== */
+/* std.string — UTF-8 string operations                                */
+/* ================================================================== */
+
+/* Byte length (UTF-8 bytes, not codepoint count — matches what most
+ * users expect for file I/O and string slicing at the byte level). */
+static LAMO_UNUSED LamoValue lamo_str_length(LamoValue v) {
+    const char* s = lamo_as_cstring(v);
+    return lamo_make_int((long long)strlen(s));
+}
+
+static LAMO_UNUSED LamoValue lamo_str_upper(LamoValue v) {
+    const char* s = lamo_as_cstring(v);
+    size_t n = strlen(s);
+    char* out = (char*)lamo_arena_alloc(n + 1);
+    size_t i;
+    for (i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        /* ASCII fast path; non-ASCII bytes are preserved unchanged. */
+        if (c >= 'a' && c <= 'z') out[i] = (char)(c - 32);
+        else out[i] = s[i];
+    }
+    out[n] = '\0';
+    return lamo_make_string(out);
+}
+
+static LAMO_UNUSED LamoValue lamo_str_lower(LamoValue v) {
+    const char* s = lamo_as_cstring(v);
+    size_t n = strlen(s);
+    char* out = (char*)lamo_arena_alloc(n + 1);
+    size_t i;
+    for (i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c >= 'A' && c <= 'Z') out[i] = (char)(c + 32);
+        else out[i] = s[i];
+    }
+    out[n] = '\0';
+    return lamo_make_string(out);
+}
+
+static LAMO_UNUSED LamoValue lamo_str_starts_with(LamoValue s, LamoValue prefix) {
+    const char* a = lamo_as_cstring(s);
+    const char* b = lamo_as_cstring(prefix);
+    size_t la = strlen(a), lb = strlen(b);
+    if (lb > la) return lamo_make_bool(0);
+    return lamo_make_bool(strncmp(a, b, lb) == 0);
+}
+
+static LAMO_UNUSED LamoValue lamo_str_ends_with(LamoValue s, LamoValue suffix) {
+    const char* a = lamo_as_cstring(s);
+    const char* b = lamo_as_cstring(suffix);
+    size_t la = strlen(a), lb = strlen(b);
+    if (lb > la) return lamo_make_bool(0);
+    return lamo_make_bool(strcmp(a + (la - lb), b) == 0);
+}
+
+static LAMO_UNUSED LamoValue lamo_str_contains(LamoValue s, LamoValue needle) {
+    const char* a = lamo_as_cstring(s);
+    const char* b = lamo_as_cstring(needle);
+    if (!*b) return lamo_make_bool(1);
+    return lamo_make_bool(strstr(a, b) != NULL);
+}
+
+static LAMO_UNUSED LamoValue lamo_str_index_of(LamoValue s, LamoValue needle) {
+    const char* a = lamo_as_cstring(s);
+    const char* b = lamo_as_cstring(needle);
+    const char* p = strstr(a, b);
+    if (!p) return lamo_make_int(-1);
+    return lamo_make_int((long long)(p - a));
+}
+
+static LAMO_UNUSED LamoValue lamo_str_trim(LamoValue v) {
+    const char* s = lamo_as_cstring(v);
+    const char* start = s;
+    const char* end = s + strlen(s);
+    while (start < end) {
+        unsigned char c = (unsigned char)*start;
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f')
+            start++;
+        else break;
+    }
+    while (end > start) {
+        unsigned char c = (unsigned char)end[-1];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f')
+            end--;
+        else break;
+    }
+    {
+        size_t len = (size_t)(end - start);
+        char* out = (char*)lamo_arena_alloc(len + 1);
+        memcpy(out, start, len);
+        out[len] = '\0';
+        return lamo_make_string(out);
+    }
+}
+
+static LAMO_UNUSED LamoValue lamo_str_substring(LamoValue s, LamoValue start_v, LamoValue end_v) {
+    const char* str = lamo_as_cstring(s);
+    long long len = (long long)strlen(str);
+    long long start = lamo_as_int(start_v);
+    long long end;
+    size_t out_len;
+    char* out;
+    if (start < 0) start += len;
+    if (start < 0) start = 0;
+    if (start > len) start = len;
+    /* If end_v is negative, treat as "to end of string". */
+    if (end_v.type == LAMO_VALUE_INT && end_v.int_value < 0) {
+        end = len;
+    } else {
+        end = lamo_as_int(end_v);
+        if (end < 0) end += len;
+        if (end < 0) end = 0;
+        if (end > len) end = len;
+    }
+    if (end < start) end = start;
+    out_len = (size_t)(end - start);
+    out = (char*)lamo_arena_alloc(out_len + 1);
+    memcpy(out, str + start, out_len);
+    out[out_len] = '\0';
+    return lamo_make_string(out);
+}
+
+static LAMO_UNUSED LamoValue lamo_str_replace(LamoValue s, LamoValue from, LamoValue to) {
+    const char* src = lamo_as_cstring(s);
+    const char* from_s = lamo_as_cstring(from);
+    const char* to_s = lamo_as_cstring(to);
+    size_t from_len = strlen(from_s);
+    size_t to_len = strlen(to_s);
+    size_t src_len = strlen(src);
+    if (from_len == 0) {
+        /* Empty "from" — return original. */
+        return lamo_make_string(lamo_arena_strdup(src));
+    }
+    /* Count occurrences. */
+    size_t count = 0;
+    const char* p = src;
+    while ((p = strstr(p, from_s)) != NULL) {
+        count++;
+        p += from_len;
+    }
+    /* Allocate output. */
+    size_t out_len = src_len + count * (to_len > from_len ? to_len - from_len : 0);
+    /* If to_len < from_len, out shrinks; the above count handles growth,
+     * for shrinkage we just use src_len as upper bound. */
+    if (to_len < from_len) out_len = src_len;
+    char* out = (char*)lamo_arena_alloc(out_len + 1);
+    char* dst = out;
+    p = src;
+    while (*p) {
+        if (strncmp(p, from_s, from_len) == 0) {
+            memcpy(dst, to_s, to_len);
+            dst += to_len;
+            p += from_len;
+        } else {
+            *dst++ = *p++;
+        }
+    }
+    *dst = '\0';
+    return lamo_make_string(out);
+}
+
+/* split(string, sep) -> array of strings. Empty separator splits into
+ * individual bytes (UTF-8 safe at byte level). */
+static LAMO_UNUSED LamoValue lamo_str_split(LamoValue s, LamoValue sep) {
+    const char* src = lamo_as_cstring(s);
+    const char* sep_s = lamo_as_cstring(sep);
+    size_t sep_len = strlen(sep_s);
+    LamoArray* arr = lamo_array_alloc(4);
+    LamoValue result;
+    const char* start = src;
+    const char* p = src;
+    if (sep_len == 0) {
+        /* Split into individual bytes. */
+        size_t i;
+        for (i = 0; src[i] != '\0'; i++) {
+            char* b = (char*)lamo_arena_alloc(2);
+            b[0] = src[i];
+            b[1] = '\0';
+            lamo_array_push(lamo_make_array(arr), lamo_make_string(b));
+        }
+        return lamo_make_array(arr);
+    }
+    while ((p = strstr(p, sep_s)) != NULL) {
+        size_t len = (size_t)(p - start);
+        char* piece = (char*)lamo_arena_alloc(len + 1);
+        memcpy(piece, start, len);
+        piece[len] = '\0';
+        lamo_array_push(lamo_make_array(arr), lamo_make_string(piece));
+        p += sep_len;
+        start = p;
+    }
+    /* Trailing piece. */
+    {
+        size_t len = strlen(start);
+        char* piece = (char*)lamo_arena_alloc(len + 1);
+        memcpy(piece, start, len);
+        piece[len] = '\0';
+        lamo_array_push(lamo_make_array(arr), lamo_make_string(piece));
+    }
+    result = lamo_make_array(arr);
+    (void)result;
+    return lamo_make_array(arr);
+}
+
+static LAMO_UNUSED LamoValue lamo_str_char_at(LamoValue s, LamoValue idx) {
+    const char* str = lamo_as_cstring(s);
+    long long i = lamo_as_int(idx);
+    long long len = (long long)strlen(str);
+    if (i < 0) i += len;
+    if (i < 0 || i >= len) return lamo_make_string("");
+    {
+        char* b = (char*)lamo_arena_alloc(2);
+        b[0] = str[i];
+        b[1] = '\0';
+        return lamo_make_string(b);
+    }
+}
+
+static LAMO_UNUSED LamoValue lamo_str_repeat(LamoValue s, LamoValue n) {
+    const char* src = lamo_as_cstring(s);
+    long long count = lamo_as_int(n);
+    size_t src_len = strlen(src);
+    if (count < 0) count = 0;
+    size_t out_len = src_len * (size_t)count;
+    char* out = (char*)lamo_arena_alloc(out_len + 1);
+    size_t i;
+    out[0] = '\0';
+    for (i = 0; i < (size_t)count; i++) {
+        memcpy(out + i * src_len, src, src_len);
+    }
+    out[out_len] = '\0';
+    return lamo_make_string(out);
+}
+
+/* ================================================================== */
+/* std.path — path manipulation (string-based, cross-platform)         */
+/* ================================================================== */
+
+static LAMO_UNUSED LamoValue lamo_path_join(LamoValue a, LamoValue b) {
+    const char* p = lamo_as_cstring(a);
+    const char* q = lamo_as_cstring(b);
+    size_t plen = strlen(p);
+    size_t qlen = strlen(q);
+    int need_sep = plen > 0 && p[plen-1] != '/' && p[plen-1] != '\\' && qlen > 0 && q[0] != '/' && q[0] != '\\';
+    char* out = (char*)lamo_arena_alloc(plen + (size_t)need_sep + qlen + 1);
+    memcpy(out, p, plen);
+    if (need_sep) out[plen] = '/';
+    memcpy(out + plen + (size_t)need_sep, q, qlen);
+    out[plen + (size_t)need_sep + qlen] = '\0';
+    return lamo_make_string(out);
+}
+
+static LAMO_UNUSED LamoValue lamo_path_parent(LamoValue v) {
+    const char* p = lamo_as_cstring(v);
+    const char* last_sep = NULL;
+    const char* q;
+    for (q = p; *q; q++) {
+        if (*q == '/' || *q == '\\') last_sep = q;
+    }
+    if (!last_sep) return lamo_make_string("");
+    {
+        size_t len = (size_t)(last_sep - p);
+        char* out = (char*)lamo_arena_alloc(len + 1);
+        memcpy(out, p, len);
+        out[len] = '\0';
+        return lamo_make_string(out);
+    }
+}
+
+static LAMO_UNUSED LamoValue lamo_path_filename(LamoValue v) {
+    const char* p = lamo_as_cstring(v);
+    const char* last_sep = NULL;
+    const char* q;
+    for (q = p; *q; q++) {
+        if (*q == '/' || *q == '\\') last_sep = q;
+    }
+    if (!last_sep) return lamo_make_string(lamo_arena_strdup(p));
+    return lamo_make_string(lamo_arena_strdup(last_sep + 1));
+}
+
+static LAMO_UNUSED LamoValue lamo_path_extension(LamoValue v) {
+    const char* p = lamo_as_cstring(v);
+    const char* last_dot = NULL;
+    const char* last_sep = NULL;
+    const char* q;
+    for (q = p; *q; q++) {
+        if (*q == '/' || *q == '\\') { last_sep = q; last_dot = NULL; }
+        else if (*q == '.') last_dot = q;
+    }
+    if (!last_dot || last_dot == p || (last_sep && last_dot < last_sep)) return lamo_make_string("");
+    return lamo_make_string(lamo_arena_strdup(last_dot));
+}
+
+static LAMO_UNUSED LamoValue lamo_path_absolute(LamoValue v) {
+#if defined(_WIN32)
+    char abs_path[MAX_PATH];
+    DWORD len = GetFullPathNameA(lamo_as_cstring(v), MAX_PATH, abs_path, NULL);
+    if (len == 0 || len >= MAX_PATH) {
+        return lamo_make_string(lamo_arena_strdup(lamo_as_cstring(v)));
+    }
+    return lamo_std_string(lamo_heap_strdup(abs_path));
+#else
+    const char* p = lamo_as_cstring(v);
+    if (p[0] == '/') return lamo_make_string(lamo_arena_strdup(p));
+    {
+        char cwd[4096];
+        if (getcwd(cwd, sizeof(cwd)) == NULL) {
+            return lamo_make_string(lamo_arena_strdup(p));
+        }
+        size_t clen = strlen(cwd);
+        size_t plen = strlen(p);
+        int need_sep = clen > 0 && cwd[clen-1] != '/';
+        char* out = (char*)lamo_arena_alloc(clen + (size_t)need_sep + plen + 1);
+        memcpy(out, cwd, clen);
+        if (need_sep) out[clen] = '/';
+        memcpy(out + clen + (size_t)need_sep, p, plen);
+        out[clen + (size_t)need_sep + plen] = '\0';
+        return lamo_make_string(out);
+    }
+#endif
+}
+
+static LAMO_UNUSED LamoValue lamo_path_normalize(LamoValue v) {
+    /* Simple normalization: collapse multiple separators, resolve "."
+     * and ".." segments. Does NOT touch the filesystem.
+     * Algorithm: split on '/', then walk segments with a stack. */
+    const char* p = lamo_as_cstring(v);
+    size_t plen = strlen(p);
+    /* First pass: collapse repeated separators and build a clean
+     * forward-slash path. */
+    char* cleaned = (char*)lamo_arena_alloc(plen + 2);
+    size_t ci = 0;
+    int is_absolute = (plen > 0 && (p[0] == '/' || p[0] == '\\'));
+    if (is_absolute) { cleaned[ci++] = '/'; }
+    size_t i = 0;
+    /* Skip leading separators. */
+    while (i < plen && (p[i] == '/' || p[i] == '\\')) i++;
+    int last_was_sep = is_absolute;
+    while (i < plen) {
+        char c = p[i];
+        if (c == '/' || c == '\\') {
+            if (!last_was_sep) {
+                cleaned[ci++] = '/';
+                last_was_sep = 1;
+            }
+        } else {
+            cleaned[ci++] = c;
+            last_was_sep = 0;
+        }
+        i++;
+    }
+    /* Strip trailing separator (unless it's the root). */
+    if (ci > 1 && cleaned[ci-1] == '/') ci--;
+    cleaned[ci] = '\0';
+
+    /* Second pass: split into segments and apply . and .. resolution. */
+    /* seg_start[i] / seg_end[i] are offsets into cleaned. */
+    size_t seg_start[256];
+    size_t seg_end[256];
+    int seg_count = 0;
+    size_t j = is_absolute ? 1 : 0;
+    while (j < ci) {
+        size_t start = j;
+        while (j < ci && cleaned[j] != '/') j++;
+        size_t end = j;
+        /* Skip the separator. */
+        if (j < ci) j++;
+        /* Process the segment. */
+        size_t seg_len = end - start;
+        if (seg_len == 1 && cleaned[start] == '.') {
+            /* Skip. */
+        } else if (seg_len == 2 && cleaned[start] == '.' && cleaned[start+1] == '.') {
+            /* Pop the last segment if any. */
+            if (seg_count > 0) seg_count--;
+        } else if (seg_len > 0) {
+            if (seg_count < 256) {
+                seg_start[seg_count] = start;
+                seg_end[seg_count] = end;
+                seg_count++;
+            }
+        }
+    }
+
+    /* Rebuild. */
+    size_t total = is_absolute ? 1 : 0;
+    int k;
+    for (k = 0; k < seg_count; k++) {
+        total += (seg_end[k] - seg_start[k]) + (k > 0 || is_absolute ? 1 : 0);
+    }
+    char* out = (char*)lamo_arena_alloc(total + 1);
+    size_t oi = 0;
+    if (is_absolute) { out[oi++] = '/'; }
+    for (k = 0; k < seg_count; k++) {
+        if (k > 0) out[oi++] = '/';
+        size_t len = seg_end[k] - seg_start[k];
+        memcpy(out + oi, cleaned + seg_start[k], len);
+        oi += len;
+    }
+    out[oi] = '\0';
+    /* Handle empty result: should be "/" if absolute, "" otherwise. */
+    if (oi == 0) {
+        if (is_absolute) {
+            out[0] = '/';
+            out[1] = '\0';
+        } else {
+            out[0] = '\0';
+        }
+    }
+    return lamo_make_string(out);
+}
+
+/* ================================================================== */
+/* std.fs — file system operations                                     */
+/* ================================================================== */
+
+static LAMO_UNUSED LamoValue lamo_fs_exists(LamoValue path) {
+#if defined(_WIN32)
+    int r = lamo_access(lamo_as_cstring(path), 0);
+#else
+    int r = access(lamo_as_cstring(path), F_OK);
+#endif
+    return lamo_make_bool(r == 0);
+}
+
+static LAMO_UNUSED LamoValue lamo_fs_is_file(LamoValue path) {
+    lamo_stat_t st;
+#if defined(_WIN32)
+    int r = lamo_stat(lamo_as_cstring(path), &st);
+#else
+    int r = stat(lamo_as_cstring(path), &st);
+#endif
+    if (r != 0) return lamo_make_bool(0);
+    return lamo_make_bool(S_ISREG(st.st_mode));
+}
+
+static LAMO_UNUSED LamoValue lamo_fs_is_dir(LamoValue path) {
+    lamo_stat_t st;
+#if defined(_WIN32)
+    int r = lamo_stat(lamo_as_cstring(path), &st);
+#else
+    int r = stat(lamo_as_cstring(path), &st);
+#endif
+    if (r != 0) return lamo_make_bool(0);
+    return lamo_make_bool(S_ISDIR(st.st_mode));
+}
+
+static LAMO_UNUSED LamoValue lamo_fs_read_text(LamoValue path) {
+    FILE* f;
+    long size;
+    char* buf;
+    size_t nread;
+f = fopen(lamo_as_cstring(path), "rb");
+    if (!f) {
+        fprintf(stderr, "runtime error: fs.readText: cannot open '%s'\n", lamo_as_cstring(path));
+        return lamo_make_string("");
+    }
+    fseek(f, 0, SEEK_END);
+    size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (size < 0) { fclose(f); return lamo_make_string(""); }
+    buf = (char*)lamo_arena_alloc((size_t)size + 1);
+    nread = fread(buf, 1, (size_t)size, f);
+    fclose(f);
+    buf[nread] = '\0';
+    return lamo_make_string(buf);
+}
+
+static LAMO_UNUSED LamoValue lamo_fs_write_text(LamoValue path, LamoValue content) {
+    FILE* f;
+    const char* s = lamo_as_cstring(content);
+    size_t len = strlen(s);
+    size_t written;
+f = fopen(lamo_as_cstring(path), "wb");
+    if (!f) {
+        fprintf(stderr, "runtime error: fs.writeText: cannot open '%s'\n", lamo_as_cstring(path));
+        return lamo_make_int(0);
+    }
+    written = fwrite(s, 1, len, f);
+    fclose(f);
+    return lamo_make_int(written == len ? 1 : 0);
+}
+
+static LAMO_UNUSED LamoValue lamo_fs_append_text(LamoValue path, LamoValue content) {
+    FILE* f;
+    const char* s = lamo_as_cstring(content);
+    size_t len = strlen(s);
+    size_t written;
+f = fopen(lamo_as_cstring(path), "ab");
+    if (!f) return lamo_make_int(0);
+    written = fwrite(s, 1, len, f);
+    fclose(f);
+    return lamo_make_int(written == len ? 1 : 0);
+}
+
+static LAMO_UNUSED LamoValue lamo_fs_delete(LamoValue path) {
+#if defined(_WIN32)
+    int r = lamo_unlink(lamo_as_cstring(path));
+#else
+    int r = unlink(lamo_as_cstring(path));
+#endif
+    return lamo_make_int(r == 0 ? 1 : 0);
+}
+
+static LAMO_UNUSED LamoValue lamo_fs_create_dir(LamoValue path) {
+#if defined(_WIN32)
+    int r = lamo_mkdir(lamo_as_cstring(path));
+#else
+    int r = mkdir(lamo_as_cstring(path), 0755);
+#endif
+    return lamo_make_int(r == 0 ? 1 : 0);
+}
+
+static LAMO_UNUSED LamoValue lamo_fs_remove_dir(LamoValue path) {
+#if defined(_WIN32)
+    int r = lamo_rmdir(lamo_as_cstring(path));
+#else
+    int r = rmdir(lamo_as_cstring(path));
+#endif
+    return lamo_make_int(r == 0 ? 1 : 0);
+}
+
+static LAMO_UNUSED LamoValue lamo_fs_copy(LamoValue src, LamoValue dst) {
+    FILE* in;
+    FILE* out;
+    int c;
+in = fopen(lamo_as_cstring(src), "rb");
+    if (!in) return lamo_make_int(0);
+out = fopen(lamo_as_cstring(dst), "wb");
+    if (!out) { fclose(in); return lamo_make_int(0); }
+    while ((c = fgetc(in)) != EOF) fputc(c, out);
+    fclose(in);
+    fclose(out);
+    return lamo_make_int(1);
+}
+
+static LAMO_UNUSED LamoValue lamo_fs_move(LamoValue src, LamoValue dst) {
+#if defined(_WIN32)
+    {
+        int r = MoveFileA(lamo_as_cstring(src), lamo_as_cstring(dst));
+        return lamo_make_int(r ? 1 : 0);
+    }
+#else
+    if (rename(lamo_as_cstring(src), lamo_as_cstring(dst)) == 0)
+        return lamo_make_int(1);
+    /* Fall back to copy + delete if rename fails (cross-device). */
+    if (lamo_is_truthy(lamo_fs_copy(src, dst))) {
+        lamo_fs_delete(src);
+        return lamo_make_int(1);
+    }
+    return lamo_make_int(0);
+#endif
+}
+
+static LAMO_UNUSED LamoValue lamo_fs_list_files(LamoValue path) {
+    LamoArray* arr = lamo_array_alloc(8);
+#if defined(_WIN32)
+    {
+        char pattern[1024];
+        WIN32_FIND_DATAA find_data;
+        HANDLE h;
+        char* dir = (char*)lamo_as_cstring(path);
+        snprintf(pattern, sizeof(pattern), "%s\\*", dir);
+        {
+            h = FindFirstFileA(pattern, &find_data);
+        }
+        if (h == INVALID_HANDLE_VALUE) return lamo_make_array(arr);
+        do {
+            char* name;
+            if (strcmp(find_data.cFileName, ".") == 0 ||
+                strcmp(find_data.cFileName, "..") == 0) continue;
+            name = lamo_heap_strdup(find_data.cFileName);
+            if (name) {
+                lamo_array_push(lamo_make_array(arr), lamo_std_string(name));
+            }
+        } while (FindNextFileA(h, &find_data));
+        FindClose(h);
+    }
+#else
+    {
+        DIR* d = opendir(lamo_as_cstring(path));
+        if (!d) return lamo_make_array(arr);
+        struct dirent* entry;
+        while ((entry = readdir(d)) != NULL) {
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+            lamo_array_push(lamo_make_array(arr),
+                            lamo_make_string(lamo_arena_strdup(entry->d_name)));
+        }
+        closedir(d);
+    }
+#endif
+    return lamo_make_array(arr);
+}
+
+static LAMO_UNUSED LamoValue lamo_fs_size(LamoValue path) {
+    lamo_stat_t st;
+#if defined(_WIN32)
+    int r = lamo_stat(lamo_as_cstring(path), &st);
+#else
+    int r = stat(lamo_as_cstring(path), &st);
+#endif
+    if (r != 0) return lamo_make_int(-1);
+    return lamo_make_int((long long)st.st_size);
+}
+
+/* ================================================================== */
+/* std.env — environment variables                                     */
+/* ================================================================== */
+
+static LAMO_UNUSED LamoValue lamo_env_get(LamoValue name) {
+    const char* v = lamo_getenv(lamo_as_cstring(name));
+    if (!v) return lamo_make_string("");
+    return lamo_make_string(lamo_arena_strdup(v));
+}
+
+static LAMO_UNUSED LamoValue lamo_env_set(LamoValue name, LamoValue value) {
+#if defined(_WIN32)
+    int r = _putenv_s(lamo_as_cstring(name), lamo_as_cstring(value));
+    return lamo_make_int(r == 0 ? 1 : 0);
+#else
+    return lamo_make_int(setenv(lamo_as_cstring(name), lamo_as_cstring(value), 1) == 0 ? 1 : 0);
+#endif
+}
+
+static LAMO_UNUSED LamoValue lamo_env_remove(LamoValue name) {
+#if defined(_WIN32)
+    /* On Windows, setting to empty achieves the "remove" effect. */
+    return lamo_env_set(name, lamo_make_string(""));
+#else
+    return lamo_make_int(unsetenv(lamo_as_cstring(name)) == 0 ? 1 : 0);
+#endif
+}
+
+/* ================================================================== */
+/* std.os — operating system info                                      */
+/* ================================================================== */
+
+static LAMO_UNUSED LamoValue lamo_os_name(void) {
+#if defined(_WIN32)
+    return lamo_make_string(lamo_arena_strdup("windows"));
+#elif defined(__APPLE__)
+    return lamo_make_string(lamo_arena_strdup("macos"));
+#elif defined(__linux__)
+    return lamo_make_string(lamo_arena_strdup("linux"));
+#elif defined(__FreeBSD__)
+    return lamo_make_string(lamo_arena_strdup("freebsd"));
+#elif defined(__OpenBSD__)
+    return lamo_make_string(lamo_arena_strdup("openbsd"));
+#else
+    return lamo_make_string(lamo_arena_strdup("unknown"));
+#endif
+}
+
+static LAMO_UNUSED LamoValue lamo_os_arch(void) {
+#if defined(_WIN64) || defined(__x86_64__) || defined(__ppc64__) || defined(__aarch64__)
+    return lamo_make_string(lamo_arena_strdup("x64"));
+#elif defined(_WIN32) || defined(__i386__) || defined(__i486__) || defined(__i586__) || defined(__i686__)
+    return lamo_make_string(lamo_arena_strdup("x86"));
+#elif defined(__arm__)
+    return lamo_make_string(lamo_arena_strdup("arm"));
+#elif defined(__aarch64__)
+    return lamo_make_string(lamo_arena_strdup("arm64"));
+#else
+    return lamo_make_string(lamo_arena_strdup("unknown"));
+#endif
+}
+
+static LAMO_UNUSED LamoValue lamo_os_cpu_count(void) {
+#if defined(_WIN32)
+    SYSTEM_INFO info;
+    GetSystemInfo(&info);
+    return lamo_make_int((long long)info.dwNumberOfProcessors);
+#else
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return lamo_make_int(n > 0 ? n : 1);
+#endif
+}
+
+static LAMO_UNUSED LamoValue lamo_os_home(void) {
+#if defined(_WIN32)
+    const char* h = getenv("USERPROFILE");
+    if (!h) h = getenv("HOMEPATH");
+    if (!h) h = "C:\\";
+    return lamo_make_string(lamo_arena_strdup(h));
+#else
+    const char* h = getenv("HOME");
+    if (!h) h = "/";
+    return lamo_make_string(lamo_arena_strdup(h));
+#endif
+}
+
+static LAMO_UNUSED LamoValue lamo_os_temp_dir(void) {
+#if defined(_WIN32)
+    char buf[MAX_PATH];
+    DWORD len = GetTempPathA(MAX_PATH, buf);
+    if (len == 0 || len >= MAX_PATH) return lamo_make_string(lamo_arena_strdup("."));
+    /* Strip trailing backslash for consistency. */
+    if (len > 0 && buf[len-1] == '\\') buf[len-1] = '\0';
+    return lamo_make_string(lamo_arena_strdup(buf));
+#else
+    const char* t = getenv("TMPDIR");
+    if (!t) t = "/tmp";
+    return lamo_make_string(lamo_arena_strdup(t));
+#endif
+}
+
+/* ================================================================== */
+/* std.time — time functions                                           */
+/* ================================================================== */
+
+static LAMO_UNUSED LamoValue lamo_time_now(void) {
+    /* Returns current time in milliseconds since epoch. */
+#if defined(_WIN32)
+    FILETIME ft;
+    ULARGE_INTEGER li;
+    GetSystemTimeAsFileTime(&ft);
+    li.LowPart = ft.dwLowDateTime;
+    li.HighPart = ft.dwHighDateTime;
+    /* Convert from 100ns intervals since 1601 to ms since 1970. */
+    return lamo_make_int((long long)((li.QuadPart - 116444736000000000ULL) / 10000ULL));
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return lamo_make_int((long long)ts.tv_sec * 1000LL + (long long)ts.tv_nsec / 1000000LL);
+#endif
+}
+
+static LAMO_UNUSED LamoValue lamo_time_timestamp(void) {
+    /* Seconds since epoch. */
+    return lamo_make_int((long long)time(NULL));
+}
+
+static LAMO_UNUSED LamoValue lamo_time_sleep(LamoValue ms) {
+    long long millis = lamo_as_int(ms);
+    if (millis < 0) millis = 0;
+#if defined(_WIN32)
+    Sleep((DWORD)millis);
+#else
+    {
+        struct timespec ts;
+        ts.tv_sec = millis / 1000;
+        ts.tv_nsec = (millis % 1000) * 1000000L;
+        nanosleep(&ts, NULL);
+    }
+#endif
+    return lamo_make_int(0);
+}
+
+/* Monotonic clock for elapsed() measurements. */
+static LAMO_UNUSED LamoValue lamo_time_monotonic(void) {
+#if defined(_WIN32)
+    static LARGE_INTEGER freq = {0};
+    LARGE_INTEGER counter;
+    if (freq.QuadPart == 0) QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&counter);
+    /* Convert to milliseconds. */
+    return lamo_make_int((long long)(counter.QuadPart * 1000 / freq.QuadPart));
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return lamo_make_int((long long)ts.tv_sec * 1000LL + (long long)ts.tv_nsec / 1000000LL);
+#endif
+}
+
+/* ================================================================== */
+/* std.process — process operations                                    */
+/* ================================================================== */
+
+static LAMO_UNUSED LamoValue lamo_process_pid(void) {
+#if defined(_WIN32)
+    return lamo_make_int((long long)GetCurrentProcessId());
+#else
+    return lamo_make_int((long long)getpid());
+#endif
+}
+
+/* run(cmd) — execute a shell command, return exit code. */
+static LAMO_UNUSED LamoValue lamo_process_run(LamoValue cmd) {
+    int r = system(lamo_as_cstring(cmd));
+    return lamo_make_int((long long)r);
+}
+
+/* exec(cmd) — execute a shell command, capture stdout as string. */
+static LAMO_UNUSED LamoValue lamo_process_exec(LamoValue cmd) {
+    FILE* pipe;
+    char* result = NULL;
+    size_t result_len = 0;
+    size_t result_cap = 0;
+    char buf[1024];
+#if defined(_WIN32)
+    pipe = _popen(lamo_as_cstring(cmd), "rb");
+#else
+    pipe = popen(lamo_as_cstring(cmd), "r");
+#endif
+    if (!pipe) return lamo_make_string(lamo_arena_strdup(""));
+    while (fgets(buf, sizeof(buf), pipe) != NULL) {
+        size_t chunk = strlen(buf);
+        if (result_len + chunk + 1 > result_cap) {
+            while (result_len + chunk + 1 > result_cap) {
+                result_cap = result_cap ? result_cap * 2 : 256;
+            }
+            {
+                char* new_result = (char*)realloc(result, result_cap);
+                if (!new_result) { free(result); result = NULL; break; }
+                result = new_result;
+            }
+        }
+        if (result) {
+            memcpy(result + result_len, buf, chunk);
+            result_len += chunk;
+            result[result_len] = '\0';
+        }
+    }
+#if defined(_WIN32)
+    _pclose(pipe);
+#else
+    pclose(pipe);
+#endif
+    if (!result) return lamo_make_string(lamo_arena_strdup(""));
+    {
+        LamoValue v = lamo_std_string(result);
+        return v;
+    }
+}
+
+/* exit_code() - return 0 always, the actual exit is handled by the
+ * existing `exit(n)` builtin. Provided for symmetry with the API spec. */
+static LAMO_UNUSED LamoValue lamo_process_exit(LamoValue code) {
+    exit((int)lamo_as_int(code));
+    return lamo_make_int(0);
+}
+
+/* ================================================================== */
+/* std.random — random number generation                               */
+/* ================================================================== */
+
+/* Simple xorshift64* PRNG, seeded from time + pid. Not cryptographic. */
+static unsigned long long lamo_random_state = 0;
+static int lamo_random_seeded = 0;
+
+static LAMO_UNUSED void lamo_random_seed_if_needed(void) {
+    if (!lamo_random_seeded) {
+        lamo_random_state = (unsigned long long)time(NULL);
+        lamo_random_state ^= (unsigned long long)
+#if defined(_WIN32)
+            GetCurrentProcessId();
+#else
+            getpid();
+#endif
+        lamo_random_state |= 1; /* ensure non-zero */
+        lamo_random_seeded = 1;
+    }
+}
+
+static LAMO_UNUSED LamoValue lamo_random_seed(LamoValue s) {
+    lamo_random_state = (unsigned long long)lamo_as_int(s);
+    if (lamo_random_state == 0) lamo_random_state = 1;
+    lamo_random_seeded = 1;
+    return lamo_make_int(0);
+}
+
+static LAMO_UNUSED unsigned long long lamo_random_next(void) {
+    unsigned long long x = lamo_random_state;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    lamo_random_state = x;
+    return x;
+}
+
+static LAMO_UNUSED LamoValue lamo_random_int(LamoValue lo, LamoValue hi) {
+    long long low = lamo_as_int(lo);
+    long long high = lamo_as_int(hi);
+    long long range, r;
+    lamo_random_seed_if_needed();
+    if (high < low) { long long t = low; low = high; high = t; }
+    range = high - low + 1;
+    if (range <= 0) return lamo_make_int(low);
+    r = (long long)(lamo_random_next() % (unsigned long long)range);
+    return lamo_make_int(low + r);
+}
+
+static LAMO_UNUSED LamoValue lamo_random_float(void) {
+    lamo_random_seed_if_needed();
+    /* Map to [0.0, 1.0). */
+    double v = (double)(lamo_random_next() >> 11) / (double)(1ULL << 53);
+    return lamo_make_float(v);
+}
+
+static LAMO_UNUSED LamoValue lamo_random_bool(void) {
+    lamo_random_seed_if_needed();
+    return lamo_make_bool((int)(lamo_random_next() & 1));
+}
+
+static LAMO_UNUSED LamoValue lamo_random_choice(LamoValue arr) {
+    LamoArray* a;
+    long long idx;
+    if (arr.type != LAMO_VALUE_ARRAY) {
+        lamo_runtime_type_error("random.choice: expected array");
+    }
+    a = arr.array_value;
+    if (!a || a->count == 0) {
+        lamo_runtime_type_error("random.choice: empty array");
+    }
+    lamo_random_seed_if_needed();
+    idx = (long long)(lamo_random_next() % (unsigned long long)a->count);
+    return a->items[idx];
+}
+
+static LAMO_UNUSED LamoValue lamo_random_shuffle(LamoValue arr) {
+    /* Fisher-Yates shuffle, in place. */
+    LamoArray* a;
+    long long i;
+    if (arr.type != LAMO_VALUE_ARRAY) {
+        lamo_runtime_type_error("random.shuffle: expected array");
+    }
+    a = arr.array_value;
+    if (!a) return arr;
+    lamo_random_seed_if_needed();
+    for (i = a->count - 1; i > 0; i--) {
+        long long j = (long long)(lamo_random_next() % (unsigned long long)(i + 1));
+        LamoValue tmp = a->items[i];
+        a->items[i] = a->items[j];
+        a->items[j] = tmp;
+    }
+    return arr;
+}
+
+/* ================================================================== */
+/* std.io — additional I/O builtins                                    */
+/* ================================================================== */
+
+static LAMO_UNUSED LamoValue lamo_io_println(LamoValue v) {
+    lamo_print_value(v);
+    return lamo_make_int(0);
+}
+
+static LAMO_UNUSED LamoValue lamo_io_eprint(LamoValue v) {
+    if (v.type == LAMO_VALUE_STRING) {
+        fprintf(stderr, "%s\n", v.string_value ? v.string_value : "");
+    } else if (v.type == LAMO_VALUE_FLOAT) {
+        fprintf(stderr, "%g\n", v.float_value);
+    } else {
+        fprintf(stderr, "%lld\n", v.int_value);
+    }
+    return lamo_make_int(0);
+}
+
+static LAMO_UNUSED LamoValue lamo_io_read_line(void) {
+    /* Read a line from stdin (without prompt). */
+    return lamo_input_str_value(lamo_make_string(""));
+}
+
+static LAMO_UNUSED LamoValue lamo_io_write(LamoValue v) {
+    /* Print without trailing newline. */
+    if (v.type == LAMO_VALUE_STRING) {
+        printf("%s", v.string_value ? v.string_value : "");
+    } else if (v.type == LAMO_VALUE_FLOAT) {
+        printf("%g", v.float_value);
+    } else if (v.type == LAMO_VALUE_BOOL) {
+        printf("%s", v.int_value ? "true" : "false");
+    } else {
+        printf("%lld", v.int_value);
+    }
+    fflush(stdout);
+    return lamo_make_int(0);
+}
+
+/* ================================================================== */
+/* std.net — HTTP client (simple, blocking)                            */
+/* ================================================================== */
+
+/* http_get(url) -> string (response body, on success; "" on failure). */
+static LAMO_UNUSED LamoValue lamo_net_http_get(LamoValue url_v) {
+    const char* url = lamo_as_cstring(url_v);
+    const char* host_start, *path_start, *port_start;
+    char host[256];
+    char path[2048];
+    int port = 80;
+    /* Parse: http://host[:port]/path */
+    if (strncmp(url, "http://", 7) != 0) {
+        fprintf(stderr, "runtime error: http_get: only http:// is supported (got '%s')\n", url);
+        return lamo_make_string("");
+    }
+    host_start = url + 7;
+    path_start = strchr(host_start, '/');
+    port_start = strchr(host_start, ':');
+    if (port_start && (!path_start || port_start < path_start)) {
+        size_t host_len = (size_t)(port_start - host_start);
+        if (host_len >= sizeof(host)) host_len = sizeof(host) - 1;
+        memcpy(host, host_start, host_len);
+        host[host_len] = '\0';
+        port = atoi(port_start + 1);
+    } else {
+        size_t host_len = path_start ? (size_t)(path_start - host_start) : strlen(host_start);
+        if (host_len >= sizeof(host)) host_len = sizeof(host) - 1;
+        memcpy(host, host_start, host_len);
+        host[host_len] = '\0';
+    }
+    if (path_start) {
+        strncpy(path, path_start, sizeof(path) - 1);
+        path[sizeof(path) - 1] = '\0';
+    } else {
+        strcpy(path, "/");
+    }
+    /* Connect. */
+    {
+#if defined(_WIN32)
+        WSADATA wsa;
+        SOCKET sock;
+        struct sockaddr_in addr;
+        struct hostent* he;
+        /* request buffer must fit: format (~72 chars) + path (2048) + host (256).
+         * 4096 gives plenty of headroom and silences -Wformat-truncation. */
+        char request[4096];
+        char* body;
+        if (WSAStartup(MAKEWORD(2,2), &wsa) != 0) return lamo_make_string("");
+        sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock == INVALID_SOCKET) { WSACleanup(); return lamo_make_string(""); }
+        he = gethostbyname(host);
+        if (!he) { closesocket(sock); WSACleanup(); return lamo_make_string(""); }
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons((unsigned short)port);
+        addr.sin_addr = *((struct in_addr*)he->h_addr);
+        if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+            closesocket(sock); WSACleanup(); return lamo_make_string("");
+        }
+        snprintf(request, sizeof(request),
+                 "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: lamo-http/1.0\r\n\r\n",
+                 path, host);
+        send(sock, request, (int)strlen(request), 0);
+        /* Read response into a heap-growing buffer. */
+        {
+            char* buf = NULL;
+            size_t buf_len = 0, buf_cap = 0;
+            char chunk[4096];
+            int chunk_n;
+            while ((chunk_n = recv(sock, chunk, sizeof(chunk), 0)) > 0) {
+                if (buf_len + chunk_n + 1 > buf_cap) {
+                    while (buf_len + chunk_n + 1 > buf_cap) buf_cap = buf_cap ? buf_cap * 2 : 8192;
+                    buf = (char*)realloc(buf, buf_cap);
+                }
+                memcpy(buf + buf_len, chunk, chunk_n);
+                buf_len += chunk_n;
+            }
+            closesocket(sock); WSACleanup();
+            if (!buf) return lamo_make_string("");
+            buf[buf_len] = '\0';
+            /* Find body (after \r\n\r\n). */
+            body = strstr(buf, "\r\n\r\n");
+            if (!body) { free(buf); return lamo_make_string(""); }
+            body += 4;
+            {
+                LamoValue v = lamo_std_string(strdup(body));
+                free(buf);
+                return v;
+            }
+        }
+#else
+        int sock;
+        struct sockaddr_in addr;
+        struct hostent* he;
+        /* request buffer must fit: format (~72 chars) + path (2048) + host (256).
+         * 4096 gives plenty of headroom and silences -Wformat-truncation. */
+        char request[4096];
+        char chunk[4096];
+        char* buf = NULL;
+        size_t buf_len = 0, buf_cap = 0;
+        int chunk_n;
+        char* body;
+        sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) return lamo_make_string("");
+        he = gethostbyname(host);
+        if (!he) { close(sock); return lamo_make_string(""); }
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons((unsigned short)port);
+        addr.sin_addr = *((struct in_addr*)he->h_addr);
+        if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+            close(sock); return lamo_make_string("");
+        }
+        snprintf(request, sizeof(request),
+                 "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: lamo-http/1.0\r\n\r\n",
+                 path, host);
+        send(sock, request, strlen(request), 0);
+        while ((chunk_n = recv(sock, chunk, sizeof(chunk), 0)) > 0) {
+            if (buf_len + chunk_n + 1 > buf_cap) {
+                while (buf_len + chunk_n + 1 > buf_cap) buf_cap = buf_cap ? buf_cap * 2 : 8192;
+                buf = (char*)realloc(buf, buf_cap);
+            }
+            memcpy(buf + buf_len, chunk, chunk_n);
+            buf_len += chunk_n;
+        }
+        close(sock);
+        if (!buf) return lamo_make_string("");
+        buf[buf_len] = '\0';
+        body = strstr(buf, "\r\n\r\n");
+        if (!body) { free(buf); return lamo_make_string(""); }
+        body += 4;
+        {
+            LamoValue v = lamo_std_string(strdup(body));
+            free(buf);
+            return v;
+        }
+#endif
+    }
+}
+
+/* http_post(url, body) -> string (response body). */
+static LAMO_UNUSED LamoValue lamo_net_http_post(LamoValue url_v, LamoValue body_v) {
+    const char* url = lamo_as_cstring(url_v);
+    const char* body = lamo_as_cstring(body_v);
+    char host[256];
+    char path[2048];
+    int port = 80;
+    const char* host_start, *path_start, *port_start;
+    if (strncmp(url, "http://", 7) != 0) {
+        fprintf(stderr, "runtime error: http_post: only http:// is supported\n");
+        return lamo_make_string("");
+    }
+    host_start = url + 7;
+    path_start = strchr(host_start, '/');
+    port_start = strchr(host_start, ':');
+    if (port_start && (!path_start || port_start < path_start)) {
+        size_t host_len = (size_t)(port_start - host_start);
+        if (host_len >= sizeof(host)) host_len = sizeof(host) - 1;
+        memcpy(host, host_start, host_len);
+        host[host_len] = '\0';
+        port = atoi(port_start + 1);
+    } else {
+        size_t host_len = path_start ? (size_t)(path_start - host_start) : strlen(host_start);
+        if (host_len >= sizeof(host)) host_len = sizeof(host) - 1;
+        memcpy(host, host_start, host_len);
+        host[host_len] = '\0';
+    }
+    if (path_start) {
+        strncpy(path, path_start, sizeof(path) - 1);
+        path[sizeof(path) - 1] = '\0';
+    } else {
+        strcpy(path, "/");
+    }
+    {
+#if defined(_WIN32)
+        /* Similar to GET but with POST and Content-Length. */
+        WSADATA wsa;
+        SOCKET sock;
+        struct sockaddr_in addr;
+        struct hostent* he;
+        char request[4096];
+        if (WSAStartup(MAKEWORD(2,2), &wsa) != 0) return lamo_make_string("");
+        sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock == INVALID_SOCKET) { WSACleanup(); return lamo_make_string(""); }
+        he = gethostbyname(host);
+        if (!he) { closesocket(sock); WSACleanup(); return lamo_make_string(""); }
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons((unsigned short)port);
+        addr.sin_addr = *((struct in_addr*)he->h_addr);
+        if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+            closesocket(sock); WSACleanup(); return lamo_make_string("");
+        }
+        snprintf(request, sizeof(request),
+                 "POST %s HTTP/1.1\r\nHost: %s\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\nConnection: close\r\nUser-Agent: lamo-http/1.0\r\n\r\n%s",
+                 path, host, strlen(body), body);
+        send(sock, request, (int)strlen(request), 0);
+        {
+            char* buf = NULL;
+            size_t buf_len = 0, buf_cap = 0;
+            char chunk[4096];
+            int chunk_n;
+            char* resp_body;
+            while ((chunk_n = recv(sock, chunk, sizeof(chunk), 0)) > 0) {
+                if (buf_len + chunk_n + 1 > buf_cap) {
+                    while (buf_len + chunk_n + 1 > buf_cap) buf_cap = buf_cap ? buf_cap * 2 : 8192;
+                    buf = (char*)realloc(buf, buf_cap);
+                }
+                memcpy(buf + buf_len, chunk, chunk_n);
+                buf_len += chunk_n;
+            }
+            closesocket(sock); WSACleanup();
+            if (!buf) return lamo_make_string("");
+            buf[buf_len] = '\0';
+            resp_body = strstr(buf, "\r\n\r\n");
+            if (!resp_body) { free(buf); return lamo_make_string(""); }
+            resp_body += 4;
+            {
+                LamoValue v = lamo_std_string(strdup(resp_body));
+                free(buf);
+                return v;
+            }
+        }
+#else
+        int sock;
+        struct sockaddr_in addr;
+        struct hostent* he;
+        char* request = NULL;
+        size_t req_len;
+        char* buf = NULL;
+        size_t buf_len = 0, buf_cap = 0;
+        char chunk[4096];
+        int chunk_n;
+        char* resp_body;
+        sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) return lamo_make_string("");
+        he = gethostbyname(host);
+        if (!he) { close(sock); return lamo_make_string(""); }
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons((unsigned short)port);
+        addr.sin_addr = *((struct in_addr*)he->h_addr);
+        if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+            close(sock); return lamo_make_string("");
+        }
+        req_len = strlen(body) + 1024;
+        request = (char*)malloc(req_len);
+        snprintf(request, req_len,
+                 "POST %s HTTP/1.1\r\nHost: %s\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\nConnection: close\r\nUser-Agent: lamo-http/1.0\r\n\r\n%s",
+                 path, host, strlen(body), body);
+        send(sock, request, strlen(request), 0);
+        free(request);
+        while ((chunk_n = recv(sock, chunk, sizeof(chunk), 0)) > 0) {
+            if (buf_len + chunk_n + 1 > buf_cap) {
+                while (buf_len + chunk_n + 1 > buf_cap) buf_cap = buf_cap ? buf_cap * 2 : 8192;
+                buf = (char*)realloc(buf, buf_cap);
+            }
+            memcpy(buf + buf_len, chunk, chunk_n);
+            buf_len += chunk_n;
+        }
+        close(sock);
+        if (!buf) return lamo_make_string("");
+        buf[buf_len] = '\0';
+        resp_body = strstr(buf, "\r\n\r\n");
+        if (!resp_body) { free(buf); return lamo_make_string(""); }
+        resp_body += 4;
+        {
+            LamoValue v = lamo_std_string(strdup(resp_body));
+            free(buf);
+            return v;
+        }
+#endif
+    }
+}
+
+#endif /* LAMO_NEEDS_STD_RUNTIME */
 
 #endif /* LAMO_RUNTIME_H */

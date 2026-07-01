@@ -26,6 +26,9 @@
 #include <limits.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 #endif
 #include "lexer.h"
 #include "parser.h"
@@ -430,6 +433,110 @@ static char* resolve_import_path(const char* importing_file, const char* import_
     char* joined;
     char* normalized;
 
+    /* Phase 3 (stdlib): if the import path starts with "std/" (case-sensitive),
+     * we treat it as a standard-library import. We look in several candidate
+     * locations, in order:
+     *   1. $LAMO_STD_DIR/<import_path>      (env override, dev/CI use)
+     *   2. <bindir>/std/<import_path>       (shipped alongside the binary)
+     *   3. <bindir>/../std/<import_path>    (development layout)
+     *   4. <bindir>/../share/lamo/std/<import_path>  (system install)
+     *   5. ./std/<import_path>              (current working directory)
+     *   6. <importing_file_dir>/std/<import_path>  (local std/ override)
+     * The first existing file wins. If none exist, we fall back to the
+     * default relative-path resolution below so the user gets a clear
+     * "file not found" error from the loader. */
+    if (import_path && strncmp(import_path, "std/", 4) == 0) {
+        const char* env_std = getenv("LAMO_STD_DIR");
+        /* Compute bindir (directory of the currently-running executable). */
+        char bindir[4096];
+#ifdef _WIN32
+        DWORD n = GetModuleFileNameA(NULL, bindir, sizeof(bindir));
+        if (n > 0 && n < sizeof(bindir)) {
+            char* slash = strrchr(bindir, '\\');
+            if (!slash) slash = strrchr(bindir, '/');
+            if (slash) *slash = '\0';
+            else { bindir[0] = '.'; bindir[1] = '\0'; }
+        } else {
+            strcpy(bindir, ".");
+        }
+#elif defined(__APPLE__)
+        char pathbuf[4096];
+        uint32_t bufsize = sizeof(pathbuf);
+        if (_NSGetExecutablePath(pathbuf, &bufsize) == 0) {
+            char* slash = strrchr(pathbuf, '/');
+            if (slash) {
+                size_t dir_len = (size_t)(slash - pathbuf);
+                if (dir_len >= sizeof(bindir)) dir_len = sizeof(bindir) - 1;
+                memcpy(bindir, pathbuf, dir_len);
+                bindir[dir_len] = '\0';
+            } else {
+                strcpy(bindir, ".");
+            }
+        } else {
+            strcpy(bindir, ".");
+        }
+#else
+        char exe_path[4096];
+        ssize_t link_len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+        if (link_len > 0) {
+            exe_path[link_len] = '\0';
+            char* slash = strrchr(exe_path, '/');
+            if (slash) {
+                size_t dir_len = (size_t)(slash - exe_path);
+                if (dir_len >= sizeof(bindir)) dir_len = sizeof(bindir) - 1;
+                memcpy(bindir, exe_path, dir_len);
+                bindir[dir_len] = '\0';
+            } else {
+                strcpy(bindir, ".");
+            }
+        } else {
+            strcpy(bindir, ".");
+        }
+#endif
+
+        /* List of candidate directories. */
+        const char* candidates[8];
+        int n_candidates = 0;
+        if (env_std && *env_std) candidates[n_candidates++] = env_std;
+        {
+            static char c1[4200];
+            snprintf(c1, sizeof(c1), "%s/std", bindir);
+            candidates[n_candidates++] = c1;
+        }
+        {
+            static char c2[4200];
+            snprintf(c2, sizeof(c2), "%s/../std", bindir);
+            candidates[n_candidates++] = c2;
+        }
+        {
+            static char c3[4200];
+            snprintf(c3, sizeof(c3), "%s/../share/lamo/std", bindir);
+            candidates[n_candidates++] = c3;
+        }
+        candidates[n_candidates++] = "./std";
+        if (directory && *directory) {
+            static char c5[4200];
+            snprintf(c5, sizeof(c5), "%s/std", directory);
+            candidates[n_candidates++] = c5;
+        }
+
+        {
+            int i;
+            for (i = 0; i < n_candidates; i++) {
+                char full[4200];
+                FILE* probe;
+                snprintf(full, sizeof(full), "%s/%s", candidates[i], import_path + 4);
+                probe = fopen(full, "rb");
+                if (probe) {
+                    fclose(probe);
+                    return normalize_path(full);
+                }
+            }
+        }
+        /* If nothing found, fall through to default resolution so the
+         * user gets a clear error pointing at the import statement. */
+    }
+
     if (!directory) {
         return NULL;
     }
@@ -620,6 +727,19 @@ static void rewrite_member_refs_recursive(ASTNode* node, const LamoModuleEntry* 
                 for (int i = 0; i < mc->arg_count; i++) {
                     rewrite_member_refs_recursive(mc->args[i], entry);
                 }
+                break;
+            }
+            /* Phase 3 (stdlib): handle AST_PLACE_ASSIGN_STMT (e.g.
+             * `arr[i] = value` and `obj.field = value`) so that references
+             * to module members inside these assignment targets and values
+             * are correctly rewritten. Without this, a function body that
+             * does `_timer_labels[j] = _timer_labels[j + 1]` would not
+             * have its `_timer_labels` references renamed, causing
+             * "undeclared variable" errors at semantic time. */
+            case AST_PLACE_ASSIGN_STMT: {
+                ASTPlaceAssignStmt* pa = (ASTPlaceAssignStmt*)cur;
+                rewrite_member_refs_recursive(pa->target, entry);
+                rewrite_member_refs_recursive(pa->value, entry);
                 break;
             }
             /* Leaves: AST_INT_LITERAL, AST_FLOAT_LITERAL, AST_STRING_LITERAL,
@@ -1242,7 +1362,12 @@ static int command_test(int argc, char** argv) {
     char test_script[4096];
     int i;
     int exit_status;
+#ifndef _WIN32
+    /* POSIX uses sh + run_tests.sh via run_argv(). Windows uses system()
+     * with PowerShell, so it doesn't need this array. Declaring it
+     * unconditionally would trigger -Wunused-variable on Windows. */
     char* argv_list[4];
+#endif
 
     for (i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {

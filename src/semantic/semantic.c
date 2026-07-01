@@ -541,7 +541,13 @@ static LamoType annotation_to_type_with_ctx(SemanticContext* ctx, const char* an
 }
 
 /* Legacy wrapper that doesn't take a context — kept for compatibility with
- * any callers that don't have a SemanticContext. Loses struct-name resolution. */
+ * any callers that don't have a SemanticContext. Loses struct-name resolution.
+ * Currently unused (the with_ctx variant is the one actually called), but
+ * kept as a public-ish API for future use. The __attribute__((unused)) silences
+ * -Wunused-function without removing the function. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((unused))
+#endif
 static LamoType annotation_to_type(const char* annotation) {
     return annotation_to_type_with_ctx(NULL, annotation);
 }
@@ -1386,11 +1392,21 @@ static LamoType semantic_infer_expression(SemanticContext* ctx, ASTNode* node) {
                         semantic_error_at(ctx, node->line, node->column, message);
                     }
                 } else {
-                    char message[256];
-                    snprintf(message, sizeof(message),
-                             "arrays have no method '%s' (valid: push, pop, len)",
-                             mc->member_name);
-                    semantic_error_at(ctx, node->line, node->column, message);
+                    /* Phase 3 (stdlib): when the object's type is UNKNOWN
+                     * (e.g. returned by a module call we can't statically
+                     * resolve), don't error on unknown methods — the actual
+                     * struct method dispatch happens at runtime via the
+                     * codegen. Only error if we KNOW it's an array. */
+                    if (obj_type == LAMO_TYPE_ARRAY) {
+                        char message[256];
+                        snprintf(message, sizeof(message),
+                                 "arrays have no method '%s' (valid: push, pop, len)",
+                                 mc->member_name);
+                        semantic_error_at(ctx, node->line, node->column, message);
+                    }
+                    /* For UNKNOWN objects, accept and let runtime/codegen
+                     * handle it. Mark the node so codegen knows to attempt
+                     * struct method dispatch. */
                 }
                 /* Visit args. */
                 for (int i = 0; i < mc->arg_count; i++) {
@@ -1471,6 +1487,24 @@ static LamoType semantic_infer_expression(SemanticContext* ctx, ASTNode* node) {
         }
         case AST_PROP_EXPR: {
             ASTPropExpr* pe = (ASTPropExpr*)node;
+            /* Phase 3 (stdlib): if the object is a registered module alias
+             * and the property is a registered member (variable), accept
+             * the access. This is what makes `math.PI` work after
+             * `import std.math as math`. The codegen will emit a reference
+             * to the prefixed global `lamo_mod_<alias>__<member>`. */
+            if (pe->object && pe->object->type == AST_IDENTIFIER) {
+                const char* alias = ((ASTIdentifier*)pe->object)->name;
+                if (ctx->module_resolve && ctx->module_resolve(alias, pe->prop_name, ctx->module_user_data)) {
+                    /* It's a module variable. Mark the node so codegen can
+                     * find the alias without re-doing the lookup. We store
+                     * the alias on sema_struct_name (a string ptr field
+                     * already on every AST node) as a side channel — the
+                     * codegen will recognize this convention for prop_expr
+                     * nodes only. */
+                    node->sema_struct_name = alias;
+                    return LAMO_TYPE_UNKNOWN;
+                }
+            }
             LamoType obj_type = semantic_infer_expression(ctx, pe->object);
             const char* obj_struct_name = NULL;
             if (pe->object->type == AST_IDENTIFIER) {

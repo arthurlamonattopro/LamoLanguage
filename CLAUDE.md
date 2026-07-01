@@ -140,3 +140,38 @@ a hint to a new error site.
 - `user_name1()` returns a pointer into a 4-entry ring buffer; safe for up to
   4 simultaneous uses in the same C expression. Use `user_name()` with an
   explicit buffer for cases needing more.
+
+### Standard Library (Phase 3)
+
+The `std/` directory ships 14 Lamo modules (io, fs, path, string, math,
+random, time, collections, process, env, os, net, json, testing, debug)
+plus an `examples/` and `tests/` subdirectory. Modules are imported via
+`import std.<module>` (dotted syntax), which the parser synthesizes into
+the path `std/<module>.lamo` with `<module>` as the default alias.
+
+The loader (`lamo_v2.c::resolve_import_path`) resolves `std/...` paths
+against a list of candidate directories (env override, bindir, system
+install, cwd, local file dir). The first match wins.
+
+C-backed builtins power the OS-touching modules (fs, env, os, time,
+process, net, random, plus math/string for performance). They are
+registered in `src/builtins.h` under the `BUILTIN_STD` category with
+the `__lamo_std_<module>_<fn>` naming convention. The codegen dispatch
+lives in `generate_std_builtin_call_expr` in `src/codegen/codegen.c`.
+The C implementations live in `src/codegen/lamo_runtime.h` under
+`#ifdef LAMO_NEEDS_STD_RUNTIME` (set by `emit_runtime()` when the
+program uses any STD builtin).
+
+To add a new C-backed builtin:
+1. Add the implementation to the STD section of `lamo_runtime.h`.
+2. Run `python3 scripts/embed_runtime.py` to regenerate
+   `lamo_runtime_data.c`.
+3. Register the builtin in `src/builtins.h` (category `BUILTIN_STD`).
+4. Add the codegen case in `generate_std_builtin_call_expr` in
+   `src/codegen/codegen.c`.
+5. Add a thin Lamo wrapper in `std/<module>.lamo`.
+6. Write a test in `std/tests/test_<module>.lamo`.
+
+Pure-Lamo modules (math constants, collections, testing, debug, json,
+path helpers) don't need any compiler changes — just create the `.lamo`
+file.

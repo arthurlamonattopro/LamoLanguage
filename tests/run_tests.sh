@@ -35,6 +35,7 @@ TESTS_DIR="$(cd "$(dirname "$0")" && pwd)"
 VALID_DIR="$TESTS_DIR/valid"
 INVALID_DIR="$TESTS_DIR/invalid"
 RUNTIME_DIR="$TESTS_DIR/runtime"
+STD_TESTS_DIR="$TESTS_DIR/../std/tests"
 
 TMP_DIR="$(mktemp -d 2>/dev/null || mktemp -d /tmp/lamo.XXXXXX)"
 trap 'rm -rf "$TMP_DIR"' EXIT INT TERM
@@ -152,6 +153,41 @@ if [ -d "$RUNTIME_DIR" ]; then
                 printf "  FAIL  %s (timed out after 10s)\n" "$name"
             else
                 record_fail "runtime/$name (run failed)"
+                printf "  FAIL  %s (run failed)\n" "$name"
+                sed 's/^/        | /' "$TMP_DIR/err" >&2
+            fi
+        fi
+    done
+fi
+
+# ---------------------------------------------------------------------------
+# 4. Standard library tests: must `lamo run` and exit 0 (the test files
+#    use std.testing internally and print PASS/FAIL lines themselves;
+#    they exit non-zero if any test failed).
+# ---------------------------------------------------------------------------
+echo
+echo "== Standard library tests (std/tests/*.lamo) =="
+if [ -d "$STD_TESTS_DIR" ]; then
+    for src in "$STD_TESTS_DIR"/*.lamo; do
+        [ -e "$src" ] || continue
+        name=$(basename "$src")
+        if run_with_timeout "$LAMO" run "$src" >"$TMP_DIR/actual" 2>"$TMP_DIR/err"; then
+            # Check that no failures were reported in the output.
+            if grep -q "0 failed" "$TMP_DIR/actual"; then
+                record_pass
+                printf "  PASS  %s\n" "$name"
+            else
+                record_fail "std/$name (test failures reported)"
+                printf "  FAIL  %s (test failures reported)\n" "$name"
+                sed 's/^/        | /' "$TMP_DIR/actual" >&2
+            fi
+        else
+            rc=$?
+            if [ "$rc" = 124 ]; then
+                record_fail "std/$name (timed out after 10s)"
+                printf "  FAIL  %s (timed out after 10s)\n" "$name"
+            else
+                record_fail "std/$name (run failed)"
                 printf "  FAIL  %s (run failed)\n" "$name"
                 sed 's/^/        | /' "$TMP_DIR/err" >&2
             fi

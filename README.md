@@ -51,7 +51,8 @@ Implemented in semantics:
 
 Not implemented yet:
 
-- a standard runtime/library design
+- ~~a standard runtime/library design~~ — **implemented** in Phase 3 (see
+  the [Standard Library](#standard-library-std) section below)
 - AST-based pretty-printer in `lamo fmt` (the current formatter only
   normalizes whitespace, line endings, and trailing newlines)
 - generics / traits
@@ -71,9 +72,11 @@ Current syntax supported by the compiler includes:
 - assignment with `=`, `+=`, `-=`, `++`, `--`
 - integer, string, and boolean literals
 - function calls
-- builtins such as `print`, `input` (int), `input_int`, `input_str`, `isnumber`, `isstring`, `exit`, and `abs`
+- builtins such as `print`, `input` (int), `input_int`, `input_str`, `isnumber`, `isstring`, `isarray`, `exit`, and `abs`
 - Windows GUI builtins: `gui_open`, `gui_should_close`, `gui_begin_frame`, `gui_draw_rect`, `gui_draw_text`, `gui_end_frame`, and `gui_close`
 - HTTP server builtins: `http_route`, `http_serve`, and `http_serve_once`
+- **Phase 3 (standard library)**: dotted module imports `import std.io`,
+  `import std.math as math`, etc. — see [Standard Library](#standard-library-std) below
 
 ### Truthiness
 
@@ -567,6 +570,67 @@ The tests cover:
 - invalid semantic cases (including type errors like `"abc" * 3`)
 - end-to-end compile-and-run behavior with stdout comparison
 - CRLF and LF source handling
+- **standard library tests** (`std/tests/*.lamo`) — 15 test files covering
+  every std module, run automatically as part of `make test`
+
+## Standard Library (std/)
+
+Lamo ships with a complete standard library under `std/`. It is
+automatically available to every program via the dotted import syntax —
+no installation required:
+
+```lamo
+import std.io              // alias `io` (default: last segment)
+import std.math as math    // explicit alias
+import std.fs as fs
+
+io.println("Hello, std!")
+io.println("sqrt(16) = " + math.sqrt(16))
+
+if (fs.exists("config.txt")) {
+    io.println(fs.readText("config.txt"))
+}
+```
+
+### Available Modules
+
+| Module              | Description                                                  |
+|---------------------|--------------------------------------------------------------|
+| `std.io`            | Console I/O — `println`, `eprint`, `readLine`, `write`       |
+| `std.fs`            | File system — `exists`, `readText`, `writeText`, `listFiles` |
+| `std.path`          | Path manipulation — `join`, `parent`, `filename`, `normalize`|
+| `std.string`        | UTF-8 strings — `length`, `split`, `trim`, `replace`, `upper`|
+| `std.math`          | Math — `sqrt`, `pow`, `sin`, `floor`, `PI`, `E`, `TAU`       |
+| `std.random`        | PRNG — `int`, `float`, `bool`, `choice`, `shuffle`, `seed`   |
+| `std.time`          | Time — `now`, `sleep`, `monotonic`, `timestamp`              |
+| `std.collections`   | List, Stack, Queue, HashMap, HashSet                         |
+| `std.process`       | Process — `run`, `exec`, `currentPid`, `exit`                |
+| `std.env`           | Environment variables — `get`, `set`, `remove`, `has`        |
+| `std.os`            | OS info — `name`, `arch`, `cpuCount`, `home`, `tempDir`      |
+| `std.net`           | HTTP client — `get`, `post`                                  |
+| `std.json`          | JSON — `parse`, `stringify`                                  |
+| `std.testing`       | Test framework — `begin`, `end`, `assertEqual`, `summary`    |
+| `std.debug`         | Debugging — `log`, `dump`, `time`, `timeEnd`, `trace`        |
+
+See [std/README.md](./std/README.md) for the full module reference and
+implementation notes. Each module also has its own `.md` file with a
+function reference and runnable examples in `std/examples/`.
+
+### How std/ Resolution Works
+
+When the loader sees `import std.io`, it looks for `std/io.lamo` in:
+
+1. `$LAMO_STD_DIR/io.lamo` (env override, dev/CI use)
+2. `<bindir>/std/io.lamo` (shipped alongside the compiler binary)
+3. `<bindir>/../std/io.lamo` (development layout — this is what `make`
+   produces: the `lamo` binary sits at the repo root, and `std/` is
+   right next to it)
+4. `<bindir>/../share/lamo/std/io.lamo` (system install)
+5. `./std/io.lamo` (current working directory)
+6. `<importing_file_dir>/std/io.lamo` (local override)
+
+The first match wins. This lets users override individual stdlib modules
+by placing files in `./std/` next to their program.
 
 ## Repository Layout
 
@@ -587,6 +651,7 @@ The tests cover:
 - [tests/invalid/](./tests/invalid) — programs that must fail `check`
 - [tests/runtime/](./tests/runtime) — programs that must `run` and match expected stdout
 - [tests/fixtures/](./tests/fixtures) — helper files imported by other tests (e.g. the module-alias helper)
+- [std/](./std) — official standard library (Phase 3): 14 modules covering io, fs, path, string, math, random, time, collections, process, env, os, net, json, testing, and debug. See [std/README.md](./std/README.md).
 
 ## Contributor Note
 
