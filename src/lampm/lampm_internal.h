@@ -183,11 +183,13 @@ int command_update(int argc, char** argv);
 int command_remove(int argc, char** argv);
 int command_list(int argc, char** argv);
 int command_info(int argc, char** argv);
-int command_outdated(int argc, char** argv);
 int command_doctor(int argc, char** argv);
 int command_cache(int argc, char** argv);
 int command_lock(int argc, char** argv);
-int command_why(int argc, char** argv);
+/* 2.3.0 scope reduction: command_outdated() and command_why() were
+ * removed. command_why is kept as a stub that returns an error
+ * pointing users at `info` (in case any external code links against
+ * it), but lampm_main no longer dispatches to either. */
 /* Note: named lampm_print_usage / lampm_print_command_help (not
  * print_usage / print_command_help) to avoid a link-time collision with
  * src/cli/help.c's print_usage / print_command_help, which is a

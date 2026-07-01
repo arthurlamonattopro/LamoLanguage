@@ -13,11 +13,18 @@
  *     lamo remove <alias>
  *     lamo list
  *     lamo info <alias>
- *     lamo outdated
- *     lamo why <alias>
  *     lamo lock
  *     lamo cache <clean|list>
  *     lamo doctor
+ *
+ * Scope reduction (2.3.0): the `why` and `outdated` subcommands were
+ * removed. `why` was a pure alias for `info` (no unique behavior — a
+ * maintenance cost with no user benefit). `outdated` did a network
+ * fetch per dep to compare local HEAD against origin/HEAD; that's
+ * fragile (depends on `git fetch` succeeding) and easy to do manually
+ * via `lamo info <alias>` + a quick `git log` inspection. Cutting
+ * both keeps the command surface focused on what the package manager
+ * actually needs to do well (install, update, remove, list, lock).
  *
  * Implementation lives in src/lampm/lampm.c. The function below behaves
  * exactly like a `main()` for those subcommands: it receives the full argv
@@ -43,8 +50,8 @@ void lampm_configure(int verbose, int quiet, int color);
 
 /*
  * lampm_is_subcommand: returns 1 if `name` is one of the package-manager
- * subcommands (init, install, update, remove, list, info, outdated, why,
- * lock, cache, doctor). Returns 0 otherwise.
+ * subcommands (init, install, update, remove, list, info, lock, cache,
+ * doctor). Returns 0 otherwise.
  */
 int lampm_is_subcommand(const char* name);
 

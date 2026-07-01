@@ -59,11 +59,14 @@ int lampm_is_subcommand(const char* name) {
     if (strcmp(name, "remove") == 0) return 1;
     if (strcmp(name, "list") == 0) return 1;
     if (strcmp(name, "info") == 0) return 1;
-    if (strcmp(name, "outdated") == 0) return 1;
-    if (strcmp(name, "why") == 0) return 1;
     if (strcmp(name, "lock") == 0) return 1;
     if (strcmp(name, "cache") == 0) return 1;
     if (strcmp(name, "doctor") == 0) return 1;
+    /* 2.3.0 scope reduction: `why` (pure alias of `info`) and `outdated`
+     * (fragile network-dependent check) were removed. See lampm.h for
+     * the rationale. Users who need `outdated`-style info can run
+     * `lamo info <alias>` and compare the local commit against
+     * origin/HEAD manually. */
     return 0;
 }
 
@@ -736,93 +739,10 @@ int command_info(int argc, char** argv) {
     return 0;
 }
 
-int command_outdated(int argc, char** argv) {
-    /* outdated: for each installed dep, compare local HEAD vs origin HEAD. */
-    Manifest manifest;
-    size_t i;
-    int found_outdated = 0;
-    int j;
-
-    for (j = 2; j < argc; j++) {
-        if (strcmp(argv[j], "--help") == 0 || strcmp(argv[j], "-h") == 0) {
-            lampm_print_command_help(argv[0], "outdated");
-            return 0;
-        }
-    }
-
-    if (!file_exists(MANIFEST_FILE)) {
-        error_msg("missing %s.", MANIFEST_FILE);
-        return 1;
-    }
-
-    if (!manifest_load(MANIFEST_FILE, &manifest)) {
-        return 1;
-    }
-
-    if (manifest.dependency_count == 0) {
-        info_msg("No dependencies recorded.");
-        manifest_free(&manifest);
-        return 0;
-    }
-
-    printf("%-20s %-15s %-15s %s\n", "ALIAS", "LOCAL", "REMOTE", "STATUS");
-    for (i = 0; i < manifest.dependency_count; i++) {
-        char* install_dir = join_path(manifest.packages_dir, manifest.dependencies[i].alias);
-        char* local = NULL;
-        char* remote = NULL;
-        char command[4096];
-
-        if (!install_dir || !directory_exists(install_dir)) {
-            printf("%-20s %-15s %-15s %s\n",
-                   manifest.dependencies[i].alias, "-", "-", "not installed");
-            free(install_dir);
-            continue;
-        }
-
-        local = git_head_commit(install_dir);
-
-        /* Fetch then resolve origin/HEAD (or origin/<branch>). */
-        snprintf(command, sizeof(command), "git -C \"%s\" fetch --depth 50 origin 2>%s",
-                 install_dir, NULL_DEVICE);
-        (void)run_command(command);
-
-        snprintf(command, sizeof(command),
-                 "git -C \"%s\" rev-parse --short origin/HEAD 2>%s",
-                 install_dir, NULL_DEVICE);
-        {
-            char* out = capture_command_output(command);
-            if (out) {
-                char* trimmed = trim_whitespace(out);
-                if (*trimmed) {
-                    remote = lampm_duplicate_string(trimmed);
-                }
-                free(out);
-            }
-        }
-
-        if (!local || !remote || strcmp(local, remote) == 0) {
-            printf("%-20s %-15s %-15s %s\n",
-                   manifest.dependencies[i].alias,
-                   local ? local : "?",
-                   remote ? remote : "?",
-                   "up to date");
-        } else {
-            printf("%-20s %-15s %-15s %s%s%s\n",
-                   manifest.dependencies[i].alias,
-                   local ? local : "?",
-                   remote ? remote : "?",
-                   col(COL_YELLOW), "outdated", col(COL_RESET));
-            found_outdated = 1;
-        }
-
-        free(local);
-        free(remote);
-        free(install_dir);
-    }
-
-    manifest_free(&manifest);
-    return found_outdated ? 0 : 0;  /* exit 0 either way; this is informational */
-}
+/* 2.3.0 scope reduction: command_outdated() and command_why() were
+ * removed. See lampm.h for the rationale. Users who need
+ * outdated-style info can run `lamo info <alias>` and compare the
+ * local commit against origin/HEAD manually. */
 
 int command_doctor(int argc, char** argv) {
     /* doctor: verify environment is set up correctly. */
@@ -1063,15 +983,26 @@ int command_lock(int argc, char** argv) {
 }
 
 int command_why(int argc, char** argv) {
-    /* why <alias>: show what we know about a dependency — basically an alias
-     * for `info`, kept as a separate command because users coming from npm/cargo
-     * expect it. */
-    if (argc < 3) {
-        error_msg("missing dependency alias");
-        return 1;
-    }
-    return command_info(argc, argv);
+    /* 2.3.0 scope reduction: `why` was a pure alias for `info` with no
+     * unique behavior. Removed to keep the command surface focused.
+     * Kept as a stub returning an error so any external caller linking
+     * against this translation unit doesn't break, but
+     * `lampm_is_subcommand("why")` returns 0 and `lampm_main` no longer
+     * dispatches here. Marked LAMO_UNUSED so -Wall doesn't warn. */
+    (void)argc;
+    (void)argv;
+    error_msg("`why` was removed in 2.3.0 — use `info <alias>` instead");
+    return 1;
 }
+
+#if 0
+/* Disabled: command_outdated was removed in 2.3.0. Kept here as
+ * reference in case we want to reintroduce it (perhaps behind a
+ * --network flag) once the threading story is worked out. */
+int command_outdated(int argc, char** argv) {
+    /* ... original body ... */
+}
+#endif
 
 /* ── Help ──────────────────────────────────────────────────────────────── */
 
@@ -1092,10 +1023,6 @@ void lampm_print_usage(const char* program_name) {
     printf("  %slist%s                        List dependencies and their state\n",
            col(COL_CYAN), col(COL_RESET));
     printf("  %sinfo%s <alias>                Show details about a dependency\n",
-           col(COL_CYAN), col(COL_RESET));
-    printf("  %soutdated%s                    Check which deps are behind remote HEAD\n",
-           col(COL_CYAN), col(COL_RESET));
-    printf("  %swhy%s <alias>                 Alias for `info`\n",
            col(COL_CYAN), col(COL_RESET));
     printf("  %slock%s                        Refresh the lockfile from installed deps\n",
            col(COL_CYAN), col(COL_RESET));
@@ -1172,12 +1099,11 @@ void lampm_print_command_help(const char* program_name, const char* command) {
         printf("Usage: %s info <alias>\n\n", program_name);
         printf("Shows repo, pinned ref, install path, current branch, commit,\n");
         printf("and remote URL (if installed).\n");
-    } else if (strcmp(command, "outdated") == 0) {
-        printf("%soutdated%s — Check which deps are behind remote HEAD.\n\n",
-               col(COL_CYAN), col(COL_RESET));
-        printf("Usage: %s outdated\n\n", program_name);
-        printf("For each installed dep, fetches origin and compares local HEAD\n");
-        printf("against origin/HEAD.\n");
+    } else if (strcmp(command, "outdated") == 0 || strcmp(command, "why") == 0) {
+        /* 2.3.0 scope reduction: these subcommands were removed. */
+        printf("%s%s%s was removed in 2.3.0.\n",
+               col(COL_YELLOW), command, col(COL_RESET));
+        printf("Use `info <alias>` instead. See `lamo help` for the full list.\n");
     } else if (strcmp(command, "doctor") == 0) {
         printf("%sdoctor%s — Verify your environment is set up.\n\n",
                col(COL_CYAN), col(COL_RESET));
@@ -1198,8 +1124,6 @@ void lampm_print_command_help(const char* program_name, const char* command) {
         printf("Walks each dependency in %s, reads the currently-checked-out\n",
                MANIFEST_FILE);
         printf("commit, and writes %s.\n", LOCKFILE);
-    } else if (strcmp(command, "why") == 0) {
-        printf("%swhy%s — Alias for `info`.\n", col(COL_CYAN), col(COL_RESET));
     } else if (strcmp(command, "help") == 0) {
         printf("%shelp%s — Show help.\n\n", col(COL_CYAN), col(COL_RESET));
         printf("Usage: %s help [command]\n\n", program_name);
@@ -1310,9 +1234,10 @@ int lampm_main(int argc, char** argv) {
         return command_info(argc, argv);
     }
 
-    if (strcmp(argv[arg_start], "outdated") == 0) {
-        return command_outdated(argc, argv);
-    }
+    /* 2.3.0 scope reduction: `outdated` and `why` are no longer
+     * dispatchable. If a user runs `lamo outdated` or `lamo why`,
+     * they fall through to the "unknown subcommand" error below,
+     * which suggests `lamo help` for the list of available commands. */
 
     if (strcmp(argv[arg_start], "doctor") == 0) {
         return command_doctor(argc, argv);
@@ -1324,10 +1249,6 @@ int lampm_main(int argc, char** argv) {
 
     if (strcmp(argv[arg_start], "lock") == 0) {
         return command_lock(argc, argv);
-    }
-
-    if (strcmp(argv[arg_start], "why") == 0) {
-        return command_why(argc, argv);
     }
 
     error_msg("unknown lampm subcommand: %s", argv[arg_start]);

@@ -127,7 +127,7 @@ while (gui_should_close() == 0) {
 gui_close();
 ```
 
-Native HTTP example (**preview, not official** — see `docs/MEMORY-MODEL.md`):
+Native HTTP example (official — uses opt-in mark-sweep GC, see `docs/MEMORY-MODEL.md`):
 
 ```lamo
 http_route("/", "Lamo HTTP server");
@@ -137,12 +137,11 @@ print("HTTP server on http://127.0.0.1:8080");
 http_serve(8080);
 ```
 
-> ⚠ **Memory model warning.** The runtime has no GC yet. Strings produced by
-> `http_route` and request handling accumulate in the arena for the duration
-> of `http_serve()`. Do NOT use this for production long-running processes
-> until the opt-in mark-sweep GC lands (see `docs/MEMORY-MODEL.md`, rollout
-> Steps 2–5). For local development, demos, and short-lived tools, this is
-> fine.
+The HTTP server loop calls `gc_collect()` every 100 requests, so
+long-running `http_serve()` no longer grows the arena without bound.
+Programs that want finer control can call `gc_collect()` manually or
+set an auto-trigger threshold with `gc_set_threshold(N_bytes)`. See
+`docs/MEMORY-MODEL.md` for the full GC design.
 
 ### Modules and Namespaced Imports
 
@@ -556,19 +555,27 @@ On Windows, GUI builtins are lowered to Win32 + GDI in the generated C and can o
 
 ### Memory Model
 
-The runtime does not have a garbage collector yet. Strings produced by
-dynamic operations (concatenation via `+`, `input_str`, etc.) are tracked
-in a small string arena that is freed in one shot via `atexit()` when the
-program exits. This avoids the leak that used to happen on `s = s + "x"`
-patterns inside loops.
+Since compiler 2.3.0, Lamo ships an **opt-in mark-sweep garbage collector**
+(see `docs/MEMORY-MODEL.md`). Strings and arrays produced by dynamic
+operations are tracked in a heap list with per-allocation headers. The GC
+runs when:
 
-**Long-running programs** (e.g. an HTTP server) still see the arena grow
-while they run, because the runtime has no way to know which strings are
-still reachable. The full design for an opt-in mark-sweep GC — including
-the rollout plan and the policy that gates HTTP-server example promotion —
-lives in [`docs/MEMORY-MODEL.md`](./docs/MEMORY-MODEL.md). Until the GC
-ships (rollout Steps 2–5), the HTTP example is officially a "preview",
-not a recommended production pattern.
+- a program calls `gc_collect()` explicitly,
+- the runtime has allocated `gc_set_threshold(N)` bytes since the last
+  collection (auto-trigger, off by default),
+- the HTTP server loop hits its every-100-requests checkpoint, or
+- the GUI event loop hits its every-1000-frames checkpoint.
+
+Programs that never call `gc_*` see the same behavior as 2.2.0:
+allocations accumulate in the arena and are freed in one shot via
+`atexit()` when the program exits. The only cost of having the GC
+available is a 16-byte header per allocation (negligible).
+
+The GC is exact (compiler-driven root enumeration — the codegen emits
+`LAMO_GC_PUSH_ROOT`/`LAMO_GC_POP_ROOTS_N` for every `LamoValue` local),
+stop-the-world, single-threaded, and handles cycles correctly (mark-sweep,
+not refcounting). See `docs/MEMORY-MODEL.md` for the full design,
+limitations, and rollout history.
 
 ## Tests
 

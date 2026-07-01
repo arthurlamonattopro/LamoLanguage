@@ -9,6 +9,53 @@
 
 static int indent_level = 0;
 
+/* GC Step 3: scope tracking for root push/pop.
+ *
+ * The codegen emits LAMO_GC_PUSH_ROOT(&v) for every LamoValue parameter
+ * and every LamoValue local declared with `let`. To balance the pushes
+ * with pops, we maintain a compile-time stack of "roots pushed in this
+ * scope". On scope exit (block close `}` or function return), we emit
+ * LAMO_GC_POP_ROOTS_N(count) for the appropriate count.
+ *
+ * The stack is bounded by 64 — that's the maximum nesting depth of
+ * blocks within a single function. Real programs rarely exceed ~10.
+ *
+ * On `return`, we pop ALL active scopes (sum of all entries on the
+ * stack), because every root pushed in the current function must be
+ * balanced before the function returns. */
+#define LAMO_GC_SCOPE_MAX 64
+static int lamo_gc_scope_stack[LAMO_GC_SCOPE_MAX];
+static int lamo_gc_scope_top = 0;
+
+static void lamo_gc_scope_enter(void) {
+    if (lamo_gc_scope_top < LAMO_GC_SCOPE_MAX) {
+        lamo_gc_scope_stack[lamo_gc_scope_top++] = 0;
+    }
+}
+static void lamo_gc_scope_push_root(void) {
+    if (lamo_gc_scope_top > 0) {
+        lamo_gc_scope_stack[lamo_gc_scope_top - 1]++;
+    }
+}
+static int lamo_gc_scope_exit(void) {
+    if (lamo_gc_scope_top > 0) {
+        return lamo_gc_scope_stack[--lamo_gc_scope_top];
+    }
+    return 0;
+}
+static int lamo_gc_scope_total_roots(void) {
+    int total = 0;
+    int i;
+    for (i = 0; i < lamo_gc_scope_top; i++) total += lamo_gc_scope_stack[i];
+    return total;
+}
+/* Reset the scope stack — called at the start of each function (and at
+ * the start of main()) so leftover state from a previous function doesn't
+ * leak into the new one. */
+static void lamo_gc_scope_reset(void) {
+    lamo_gc_scope_top = 0;
+}
+
 /* Sprint 4: module registry pointer. Set via codegen_set_module_registry()
  * before generate_c_code() is called. May be NULL — in that case,
  * AST_MEMBER_CALL nodes emit a defensive `lamo_make_int(0)` (the
@@ -195,6 +242,25 @@ static void generate_lang_builtin_call_expr(const char* name, ASTNode** args, in
         fprintf(out, "lamo_array_pop(");
         generate_expression_code(args[0], out);
         fprintf(out, ")");
+        return;
+    }
+    /* GC builtins — opt-in mark-sweep (see docs/MEMORY-MODEL.md). */
+    if (strcmp(name, "gc_collect") == 0) {
+        fprintf(out, "lamo_make_int(lamo_gc_collect_count())");
+        return;
+    }
+    if (strcmp(name, "gc_set_threshold") == 0) {
+        fprintf(out, "(lamo_gc_set_threshold((size_t)lamo_as_int(");
+        generate_expression_code(args[0], out);
+        fprintf(out, ")), lamo_make_int(0))");
+        return;
+    }
+    if (strcmp(name, "gc_heap_size") == 0) {
+        fprintf(out, "lamo_make_int(lamo_gc_heap_size())");
+        return;
+    }
+    if (strcmp(name, "gc_heap_count") == 0) {
+        fprintf(out, "lamo_make_int(lamo_gc_heap_count())");
         return;
     }
     fprintf(out, "lamo_make_int(0)");
@@ -1022,6 +1088,24 @@ void generate_c_code(ASTNode* node, FILE* out) {
         current = current->next;
     }
 
+    /* GC Step 3: open main()'s top-level scope and register every global
+     * LamoValue as a root. Globals persist for the program's lifetime,
+     * so they stay on the root stack until main() returns. Enum variant
+     * globals hold only ints (lamo_make_int(i)) and don't need to be
+     * roots — they never reference GC-tracked allocations. */
+    lamo_gc_scope_reset();
+    lamo_gc_scope_enter();
+    current = ((ASTProgram*)node)->declarations;
+    while (current) {
+        if (current->type == AST_VAR_DECL) {
+            ASTVarDecl* var_decl = (ASTVarDecl*)current;
+            print_indent(out);
+            fprintf(out, "LAMO_GC_PUSH_ROOT(&%s);\n", user_name1(var_decl->name));
+            lamo_gc_scope_push_root();
+        }
+        current = current->next;
+    }
+
     current = ((ASTProgram*)node)->declarations;
     while (current) {
         if (current->type == AST_VAR_DECL) {
@@ -1037,6 +1121,17 @@ void generate_c_code(ASTNode* node, FILE* out) {
             generate_statement_code(current, out);
         }
         current = current->next;
+    }
+
+    /* GC Step 3: pop all roots (globals + any nested locals from top-level
+     * if/while/for blocks) before main() returns. */
+    {
+        int gc_total = lamo_gc_scope_total_roots();
+        if (gc_total > 0) {
+            print_indent(out);
+            fprintf(out, "LAMO_GC_POP_ROOTS_N(%d);\n", gc_total);
+        }
+        lamo_gc_scope_exit();
     }
 
     indent_level--;
@@ -1209,6 +1304,13 @@ static void generate_statement_code(ASTNode* node, FILE* out) {
             fprintf(out, "LamoValue %s = ", user_name1(var_decl->name));
             generate_expression_code(var_decl->initializer, out);
             fprintf(out, ";\n");
+            /* GC Step 3: register the local as a root so a gc_collect()
+             * inside any called function doesn't free values still
+             * referenced by this local. The matching pop happens at
+             * scope exit (AST_BLOCK close or function return). */
+            print_indent(out);
+            fprintf(out, "LAMO_GC_PUSH_ROOT(&%s);\n", user_name1(var_decl->name));
+            lamo_gc_scope_push_root();
             break;
         }
         case AST_FN_DECL: {
@@ -1243,13 +1345,43 @@ static void generate_statement_code(ASTNode* node, FILE* out) {
              * at the end so the C compiler doesn't warn about control
              * reaching the end of a non-void function. We unwrap the
              * body block (which is always AST_BLOCK for functions) so we
-             * can append the return inside the function's braces. */
+             * can append the return inside the function's braces.
+             *
+             * GC Step 3: at function entry, open a root scope and push
+             * every parameter (and `self` for methods) as a root. At
+             * function exit (the implicit return below, plus any user
+             * `return` statements via AST_RETURN_STMT), pop all roots
+             * pushed in this function. Locals declared inside the body
+             * get pushed by AST_VAR_DECL above and counted in the same
+             * scope; inner blocks (AST_BLOCK) get their own sub-scope
+             * so their locals are popped at block exit. */
+            lamo_gc_scope_reset();
+            lamo_gc_scope_enter();
             if (fn_decl->body && fn_decl->body->type == AST_BLOCK) {
                 ASTBlock* block = (ASTBlock*)fn_decl->body;
                 fprintf(out, "{\n");
                 indent_level++;
+                /* Push params (and self) as roots. */
+                if (is_method) {
+                    print_indent(out);
+                    fprintf(out, "LAMO_GC_PUSH_ROOT(&%s);\n", user_name1("self"));
+                    lamo_gc_scope_push_root();
+                }
+                for (i = 0; i < fn_decl->param_count; i++) {
+                    print_indent(out);
+                    fprintf(out, "LAMO_GC_PUSH_ROOT(&%s);\n", user_name1(fn_decl->params[i]));
+                    lamo_gc_scope_push_root();
+                }
                 for (ASTNode* s = block->statements; s; s = s->next) {
                     generate_statement_code(s, out);
+                }
+                /* GC: pop all roots before the implicit return. */
+                {
+                    int gc_total = lamo_gc_scope_total_roots();
+                    if (gc_total > 0) {
+                        print_indent(out);
+                        fprintf(out, "LAMO_GC_POP_ROOTS_N(%d);\n", gc_total);
+                    }
                 }
                 print_indent(out);
                 fprintf(out, "return lamo_make_int(0);\n");
@@ -1261,12 +1393,20 @@ static void generate_statement_code(ASTNode* node, FILE* out) {
                 fprintf(out, "{\n");
                 indent_level++;
                 if (fn_decl->body) generate_statement_code(fn_decl->body, out);
+                {
+                    int gc_total = lamo_gc_scope_total_roots();
+                    if (gc_total > 0) {
+                        print_indent(out);
+                        fprintf(out, "LAMO_GC_POP_ROOTS_N(%d);\n", gc_total);
+                    }
+                }
                 print_indent(out);
                 fprintf(out, "return lamo_make_int(0);\n");
                 indent_level--;
                 print_indent(out);
                 fprintf(out, "}\n");
             }
+            lamo_gc_scope_exit();
             break;
         }
         case AST_BLOCK: {
@@ -1274,9 +1414,21 @@ static void generate_statement_code(ASTNode* node, FILE* out) {
             ASTNode* current = block->statements;
             fprintf(out, "{\n");
             indent_level++;
+            /* GC Step 3: open a new root scope for this block. Locals
+             * declared inside (via AST_VAR_DECL) are pushed and counted
+             * here; they're popped when the block closes. */
+            lamo_gc_scope_enter();
             while (current) {
                 generate_statement_code(current, out);
                 current = current->next;
+            }
+            /* GC: pop roots pushed for locals declared in this block. */
+            {
+                int gc_n = lamo_gc_scope_exit();
+                if (gc_n > 0) {
+                    print_indent(out);
+                    fprintf(out, "LAMO_GC_POP_ROOTS_N(%d);\n", gc_n);
+                }
             }
             indent_level--;
             print_indent(out);
@@ -1305,10 +1457,20 @@ static void generate_statement_code(ASTNode* node, FILE* out) {
             break;
         }
         case AST_FOR_STMT: {
+            /* GC Step 3: for-loops with a `let` initializer declare a
+             * LamoValue that must be a root for the duration of the body.
+             * We wrap the body in an explicit block (always — even if the
+             * AST has a single-statement body) so we can push/pop the
+             * loop variable as a root inside the block scope. */
             ASTForStmt* for_stmt = (ASTForStmt*)node;
+            int has_let_init = (for_stmt->initializer &&
+                                for_stmt->initializer->type == AST_VAR_DECL);
+            const char* loop_var_name = has_let_init
+                ? ((ASTVarDecl*)for_stmt->initializer)->name
+                : NULL;
             fprintf(out, "for (");
             if (for_stmt->initializer) {
-                if (for_stmt->initializer->type == AST_VAR_DECL) {
+                if (has_let_init) {
                     ASTVarDecl* var_decl = (ASTVarDecl*)for_stmt->initializer;
                     fprintf(out, "LamoValue %s = ", user_name1(var_decl->name));
                     generate_expression_code(var_decl->initializer, out);
@@ -1328,18 +1490,72 @@ static void generate_statement_code(ASTNode* node, FILE* out) {
                 ASTAssignStmt* assign_stmt = (ASTAssignStmt*)for_stmt->increment;
                 generate_assignment_code(assign_stmt->name, assign_stmt->value, assign_stmt->op_type, out);
             }
-            fprintf(out, ") ");
-            generate_statement_code(for_stmt->body, out);
+            /* Open the body block explicitly. This wraps even
+             * single-statement bodies in braces, which is a minor
+             * codegen change but lets us push the loop variable as a
+             * root inside the block scope. */
+            fprintf(out, ") {\n");
+            indent_level++;
+            lamo_gc_scope_enter();
+            if (has_let_init && loop_var_name) {
+                print_indent(out);
+                fprintf(out, "LAMO_GC_PUSH_ROOT(&%s);\n", user_name1(loop_var_name));
+                lamo_gc_scope_push_root();
+            }
+            /* Emit the body. If it's an AST_BLOCK, iterate its statements
+             * directly (we've already opened the block above); otherwise
+             * emit the single statement. */
+            if (for_stmt->body) {
+                if (for_stmt->body->type == AST_BLOCK) {
+                    for (ASTNode* s = ((ASTBlock*)for_stmt->body)->statements; s; s = s->next) {
+                        generate_statement_code(s, out);
+                    }
+                } else {
+                    generate_statement_code(for_stmt->body, out);
+                }
+            }
+            /* GC: pop roots pushed in this iteration's block scope (the
+             * loop variable plus any locals declared in the body). */
+            {
+                int gc_n = lamo_gc_scope_exit();
+                if (gc_n > 0) {
+                    print_indent(out);
+                    fprintf(out, "LAMO_GC_POP_ROOTS_N(%d);\n", gc_n);
+                }
+            }
+            indent_level--;
+            print_indent(out);
+            fprintf(out, "}\n");
             break;
         }
         case AST_RETURN_STMT: {
             ASTReturnStmt* return_stmt = (ASTReturnStmt*)node;
+            /* GC Step 3: pop all roots pushed in the current function
+             * (params + locals + any nested-block locals still live at
+             * this return point) before returning. The pop count is the
+             * sum of all active scopes — see lamo_gc_scope_total_roots().
+             *
+             * We wrap pop+return in a block `{ ... }` so the pair acts
+             * as a single statement when used as the body of an if/else
+             * or match arm. Without the braces, `if (cond) POP; return X;`
+             * would parse as `if (cond) POP;` then `return X;` — the
+             * `return` would be unconditional and the subsequent `else`
+             * would be a syntax error. */
+            int gc_total = lamo_gc_scope_total_roots();
+            if (gc_total > 0) {
+                fprintf(out, "{ LAMO_GC_POP_ROOTS_N(%d); ", gc_total);
+            }
             if (return_stmt->expression) {
                 fprintf(out, "return ");
                 generate_expression_code(return_stmt->expression, out);
-                fprintf(out, ";\n");
+                fprintf(out, ";");
             } else {
-                fprintf(out, "return lamo_make_int(0);\n");
+                fprintf(out, "return lamo_make_int(0);");
+            }
+            if (gc_total > 0) {
+                fprintf(out, " }\n");
+            } else {
+                fprintf(out, "\n");
             }
             break;
         }

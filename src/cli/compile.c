@@ -242,6 +242,28 @@ int compile_sources(const char** input_files, int input_file_count, LamoCommand 
     }
 
     {
+        /* Quick win (todo.md Phase 1): .c emission policy.
+         *
+         * Decision: ALWAYS emit lamo_exec.c to the current directory,
+         * for both `run` and `build` modes. Rationale:
+         *
+         *   1. Debuggability: if compilation fails, the user can inspect
+         *      the generated C to understand what the transpiler produced.
+         *      This is essential for a transpiled language — the .c IS
+         *      the intermediate representation.
+         *   2. Transparency: Lamo's value proposition is "as fast as C,
+         *      because it IS C". Hiding the .c would undermine that.
+         *   3. Consistency: same behavior in run and build modes means
+         *      users don't have to remember two policies.
+         *
+         * The cost (one extra file in the working directory) is minor
+         * and documented. Users who want a clean workflow can:
+         *   - `lamo check` to validate without generating .c
+         *   - `lamo build -o out/bin && rm lamo_exec.c` for clean builds
+         *   - add `lamo_exec.c` to .gitignore (lamo init does this)
+         *
+         * Future: a `--emit-c=no` flag could be added if the noise
+         * becomes a real complaint. Not worth the complexity today. */
         const char* c_output_path = "lamo_exec.c";
         const char* binary_output_path = output_path ? output_path : "lamo_exec";
         FILE* out = fopen(c_output_path, "w");
@@ -325,10 +347,25 @@ int compile_sources(const char** input_files, int input_file_count, LamoCommand 
         }
 
         if (exit_status != 0) {
-            fprintf(stderr, "backend compilation failed: %s returned exit code %d while building %s from %s\n",
-                    cc, exit_status, binary_with_suffix, c_output_path);
-            fprintf(stderr, "inspect %s for the generated C source, or run with --verbose for details.\n",
+            /* Quick win (todo.md Phase 1): surface GCC failures clearly.
+             * The user sees GCC's stderr directly (we use execvp, so the
+             * child inherits stderr), but we add a clear header pointing
+             * at the generated C source and the LAMO_CC override. This
+             * turns "lamo_exec.c:42: error: ..." into:
+             *
+             *   lamo: backend compilation failed (gcc exit code 1)
+             *   lamo: generated C source: lamo_exec.c (inspect for details)
+             *   lamo: if the C compiler is wrong, set LAMO_CC=/path/to/cc
+             *   lamo: rerun with --verbose to see the full cc invocation
+             *
+             * followed by GCC's own error output. */
+            fprintf(stderr, "lamo: backend compilation failed (%s returned exit code %d)\n",
+                    cc, exit_status);
+            fprintf(stderr, "lamo: generated C source: %s (inspect for details)\n",
                     c_output_path);
+            fprintf(stderr, "lamo: if the C compiler is wrong, set LAMO_CC=/path/to/cc (current: %s)\n",
+                    cc);
+            fprintf(stderr, "lamo: rerun with --verbose to see the full cc invocation\n");
             exit_code = EXIT_BACKEND_ERROR;
             goto cleanup;
         }

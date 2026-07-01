@@ -66,6 +66,14 @@ static const BuiltinInfo lamo_builtins[] = {
     {"push",       2, BUILTIN_LANG, BUILTIN_RET_INT},
     {"pop",        1, BUILTIN_LANG, BUILTIN_RET_INT},  /* actually returns the popped value's type, but we report INT conservatively */
 
+    /* GC builtins (BUILTIN_LANG, shadowable). Opt-in mark-sweep GC;
+     * see docs/MEMORY-MODEL.md. Programs that never call these see
+     * zero GC overhead (the per-allocation header is the only cost). */
+    {"gc_collect",       0, BUILTIN_LANG, BUILTIN_RET_INT},     /* run a full mark-sweep; returns live count */
+    {"gc_set_threshold", 1, BUILTIN_LANG, BUILTIN_RET_INT},     /* set auto-trigger threshold in bytes; 0 disables */
+    {"gc_heap_size",     0, BUILTIN_LANG, BUILTIN_RET_INT},     /* live bytes after the last collect */
+    {"gc_heap_count",    0, BUILTIN_LANG, BUILTIN_RET_INT},     /* live allocation count after the last collect */
+
     /* ==================================================================== */
     /* Standard library builtins (BUILTIN_STD)                              */
     /* These power the std.* modules under std/. They're emitted only when  */

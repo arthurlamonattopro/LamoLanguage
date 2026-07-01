@@ -22,8 +22,19 @@
 
 - [x] Standardize compiler exit codes for success, compile failure, and backend failure.
 - [x] Improve the CLI usage text and error messages.
-- [ ] Check whether GCC invocation failures are surfaced clearly to the user.
-- [ ] Decide whether generated C files should always be emitted or only in debug/build mode.
+- [x] **Check whether GCC invocation failures are surfaced clearly to the user.**
+      Done (2.3.0): `compile.c` now emits a clear `lamo: backend compilation
+      failed (gcc exit code N)` header, points at the generated C source,
+      suggests `LAMO_CC` override, and recommends `--verbose` for the full
+      cc invocation. GCC's own stderr still flows through directly.
+- [x] **Decide whether generated C files should always be emitted or only
+      in debug/build mode.** Decision (2.3.0): ALWAYS emit `lamo_exec.c`,
+      for both `run` and `build` modes. Rationale: debuggability (the .c is
+      the IR), transparency (Lamo is "as fast as C because it IS C"),
+      consistency (same policy in both modes). Documented in `compile.c`
+      and `SPEC.md`. Users who want clean workflows can `lamo check` (no
+      .c), add to `.gitignore` (lamo init does this), or `rm lamo_exec.c`
+      after `lamo build`.
 - [x] Make the default Windows build produce `lamo.exe`.
 - [x] Fix `make clean` on Windows.
 
@@ -134,15 +145,50 @@
 ### Memory Model
 
 - [x] Decide whether Lamo will expose manual memory control, ownership rules, or a managed model.
-      **Decision: hybrid — arena by default, opt-in mark-sweep GC planned.**
+      **Decision: hybrid — arena by default, opt-in mark-sweep GC.**
       See `docs/MEMORY-MODEL.md` for the full design and rollout plan.
 - [x] Document who owns allocated runtime values.
 - [x] Make generated code follow the chosen ownership rules (string arena tracked and freed via `atexit`).
-- [ ] **GC rollout Step 2**: add `LamoGcHeader` + `lamo_gc_alloc` + `lamo_gc_collect` skeleton to `lamo_runtime.h`.
-- [ ] **GC rollout Step 3**: codegen emits `LAMO_GC_PUSH_ROOT` / `LAMO_GC_POP_ROOTS_N` for every `LamoValue` local.
-- [ ] **GC rollout Step 4**: wire periodic `gc_collect()` into `http_serve` and the GUI event loop.
-- [ ] **GC rollout Step 5**: re-promote `examples/http_server.lamo` from "preview" to "official" once GC is wired and tested.
-- [ ] **GC rollout Step 6**: add `tests/runtime/gc_basic.lamo` and `tests/runtime/gc_cycle.lamo`.
+- [x] **GC rollout Step 2**: add `LamoGcHeader` + `lamo_gc_alloc` + `lamo_gc_collect` skeleton to `lamo_runtime.h`.
+      Done (2.3.0): every arena allocation now carries a `LamoGcHeader`
+      (size, mark bit, is_array bit, in_use bit, next pointer). The arena
+      (`lamo_string_arena`) tracks payload pointers; the GC heap list
+      (`lamo_gc_heap_head`) tracks headers. `lamo_gc_collect()` implements
+      full mark-sweep: clear marks, walk the root stack marking reachable
+      allocations, sweep freeing unmarked. New builtins: `gc_collect()`,
+      `gc_set_threshold(N)`, `gc_heap_size()`, `gc_heap_count()`.
+- [x] **GC rollout Step 3**: codegen emits `LAMO_GC_PUSH_ROOT` /
+      `LAMO_GC_POP_ROOTS_N` for every `LamoValue` local.
+      Done (2.3.0): `codegen.c` now maintains a compile-time scope stack
+      (`lamo_gc_scope_stack`) tracking roots pushed per scope. At function
+      entry, params (and `self` for methods) are pushed as roots. Each
+      `let`-declared local is pushed after its declaration. Inner blocks
+      (`{}`, `if`, `while`, `for` bodies) get their own sub-scope so
+      their locals are popped at block exit. At every `return` (implicit
+      or user-written), all active roots are popped. The return statement
+      wraps pop+return in a block `{ ... }` so it acts as a single
+      statement when used as an `if`/`match` arm body.
+- [x] **GC rollout Step 4**: wire periodic `gc_collect()` into `http_serve`
+      and the GUI event loop.
+      Done (2.3.0): `lamo_http_run_server` calls `gc_collect()` every 100
+      requests. `lamo_gui_should_close` (both Win32 and X11 backends)
+      calls `gc_collect()` every 1000 frames. The route table in the HTTP
+      runtime is allocated outside the GC heap (plain `malloc`), so routes
+      stay alive across collections.
+- [x] **GC rollout Step 5**: re-promote `examples/http_server.lamo` from
+      "preview" to "official" once GC is wired and tested.
+      Done (2.3.0): the example's preview warning header was replaced with
+      an "official" header documenting the GC hook, concurrency story
+      (single-threaded), and error paths (port in use, malformed request,
+      client disconnect). `docs/SPEC.md` §11.2 updated to match.
+- [x] **GC rollout Step 6**: add `tests/runtime/gc_basic.lamo` and
+      `tests/runtime/gc_cycle.lamo`.
+      Done (2.3.0): `gc_basic.lamo` verifies that allocating garbage in a
+      loop + calling `gc_collect()` reclaims something, and that
+      still-reachable strings survive collection. `gc_cycle.lamo` verifies
+      that two arrays referencing each other (a cycle) are reclaimed after
+      all external references drop — the classic mark-sweep vs refcounting
+      differentiator. Both tests pass.
 
 ## Phase 6: Language Specification
 
@@ -342,3 +388,61 @@ syntax" items that were blocking further language growth.
       plan; PR 1 (generic structs) is the next concrete step. Depends on the
       type-system decision (already shipped). Tagged-union enums are a
       separate prerequisite for `Option<T>` / `Result<T, E>` (PR 5).
+
+## Recently Added (2.3.0 — GC ship, eval/run spec, lampm scope cut, quick wins)
+
+This sprint resolved the five items the user flagged as blocking further
+language growth. The GC is the headline; the rest are cleanup that the
+GC unlock made possible.
+
+- [x] **GC shipped (Steps 2–6 of `docs/MEMORY-MODEL.md`).** Opt-in
+      mark-sweep garbage collector now lives in `src/codegen/lamo_runtime.h`.
+      Every arena allocation carries a `LamoGcHeader` (size, mark, is_array,
+      in_use, next). The codegen emits `LAMO_GC_PUSH_ROOT(&v)` for every
+      `LamoValue` parameter and local, with a compile-time scope stack
+      tracking pushes per scope and emitting matching `LAMO_GC_POP_ROOTS_N(n)`
+      at block exit and function return. The HTTP server loop and the GUI
+      event loop call `gc_collect()` automatically (every 100 requests /
+      1000 frames). New builtins: `gc_collect()`, `gc_set_threshold(N)`,
+      `gc_heap_size()`, `gc_heap_count()`. Programs that never call `gc_*`
+      see zero GC overhead (the per-allocation header is the only cost).
+      `examples/http_server.lamo` re-promoted from "preview" to "official".
+      Tests: `tests/runtime/gc_basic.lamo`, `tests/runtime/gc_cycle.lamo`
+      (the latter verifies cycles are reclaimed — the classic
+      mark-sweep vs refcounting differentiator).
+- [x] **eval/repl vs run divergence formalized (SPEC.md §10.7).** The
+      two execution paths are now formally documented as distinct by
+      design: `run`/`build`/`check` use the full pipeline with
+      `LamoModuleRegistry` support; `eval`/`repl` use the tree-walking
+      interpreter for fast feedback and do NOT load modules. Calling
+      `math.sqrt(x)` in eval/repl produces a clear error pointing at
+      `lamo run`. Bringing the interpreter to full parity would
+      sacrifice the fast-feedback property that justifies having a
+      separate interpreter; we made the limitation explicit and
+      documented instead.
+- [x] **lampm scope reduced.** Cut `why` (pure alias of `info` —
+      maintenance cost with no user benefit) and `outdated` (fragile
+      network-dependent check easy to do manually via `lamo info` +
+      `git log`). `lampm_is_subcommand` returns 0 for both;
+      `lampm_main` no longer dispatches to either. Help text updated.
+      The command surface is now: init, install, update, remove, list,
+      info, lock, cache, doctor (9 commands, down from 11).
+- [x] **Quick win: GCC failure reporting.** `compile.c` now emits a
+      clear `lamo: backend compilation failed (gcc exit code N)` header,
+      points at the generated C source, suggests `LAMO_CC` override,
+      and recommends `--verbose` for the full cc invocation. GCC's own
+      stderr still flows through directly.
+- [x] **Quick win: .c emission policy decided.** Always emit
+      `lamo_exec.c` for both `run` and `build` modes. Rationale:
+      debuggability (the .c is the IR), transparency (Lamo is "as fast
+      as C because it IS C"), consistency. Documented in `compile.c`
+      and `SPEC.md`. Users who want clean workflows can `lamo check`
+      (no .c) or add to `.gitignore` (lamo init does this).
+- [x] **RFC-generics PR 1 NOT started.** Per the user's note: generics
+      add monomorphization, which multiplies the surface of generated
+      code. Starting PR 1 before the GC was at least at Step 3 would
+      have meant changing the memory model and the codegen shape at
+      the same time — a recipe for hard-to-trace bugs. Now that the GC
+      is shipped (Step 6), PR 1 (generic struct declarations + type
+      parameters in field types) is unblocked and is the suggested next
+      sprint.

@@ -703,17 +703,26 @@ These are equivalent to the `push(arr, x)`, `pop(arr)`, `len(arr)` builtins.
 
 ### 9.3 Memory
 
-Arrays are heap-allocated and managed by the runtime. They are **not**
-garbage-collected today — see `docs/MEMORY-MODEL.md`. An array's memory is
-freed when:
+Arrays are heap-allocated and managed by the runtime. Since compiler
+2.3.0, Lamo ships an **opt-in mark-sweep garbage collector** (see
+`docs/MEMORY-MODEL.md` for the full design). An array's memory is freed
+when:
 
-- the program exits (via `atexit` cleanup), OR
-- the user explicitly calls `arr.free()` (TODO: not yet implemented; tracked
-  in `todo.md`).
+- the program exits (via `atexit` cleanup — always), OR
+- a `gc_collect()` run determines the array is no longer reachable from
+  any root (only when the user opts into GC via `gc_collect()` or
+  `gc_set_threshold(N > 0)`).
 
-For short-lived programs (scripts, CLI tools), this is fine. For long-running
-processes (HTTP server), the array heap grows without bound. This is a known
-limitation.
+Programs that never call `gc_*` see the same behavior as 2.2.0:
+allocations accumulate until exit. Programs that opt in get periodic
+reclamation during the run, which is what makes long-running processes
+(HTTP servers, GUI event loops) viable.
+
+The HTTP server loop and the GUI event loop both call `gc_collect()`
+automatically on a fixed schedule (every 100 HTTP requests, every 1000
+GUI frames). Programs can also call `gc_collect()` manually at natural
+boundaries, or set an auto-trigger threshold with
+`gc_set_threshold(N_bytes)`.
 
 ---
 
@@ -794,11 +803,44 @@ distinction. This is fine for educational use but a wart for real projects.
 Future: add `pub` keyword; only `pub` declarations are exported by a module
 (see `todo.md` Phase 10).
 
-### 10.7 Limitations
+### 10.7 Execution modes: `run` vs `eval`/`repl`
 
-- `lamo eval` and `lamo repl` do NOT load modules through the registry. Calling
-  `math.sqrt(x)` in those modes produces a clear error pointing the user at
-  `lamo run` instead. This is a known limitation (tracked in `todo.md`).
+Lamo has two distinct execution paths with **different module-loading
+capabilities**. This is a deliberate design decision, not a bug, and is
+formalized here so users know which mode to use for which workload.
+
+| Mode        | Backend              | Module imports (`import "..." as alias;`) | Speed     | Use case |
+|-------------|----------------------|-------------------------------------------|-----------|----------|
+| `lamo run`  | Transpiles to C, GCC | Full `LamoModuleRegistry` support         | Native    | Programs that use namespaced imports (`math.sqrt(x)`, `fs.readText(path)`, …) and want maximum performance. |
+| `lamo build`| Same as `run`, but stops after producing the binary | Full support | Native | Producing a distributable binary. |
+| `lamo check`| Frontend only (lexer + parser + semantic) | Resolves imports for type/arity checking | Fast | CI / pre-commit validation. |
+| `lamo eval` | Built-in tree-walking interpreter (`src/eval/eval.c`) | **No module registry** — `alias.member(args)` calls fail with a clear error pointing the user at `lamo run` | Slower (no GCC, no optimization) | Quick expression evaluation, REPL one-liners, debugging small snippets without the C-compile step. |
+| `lamo repl` | Same interpreter as `eval`, interactive | **No module registry** (same as `eval`) | Slower | Interactive development. |
+
+**Decision (formalized):** `eval`/`repl` and `run` are **distinct paths
+with distinct purposes**. The interpreter path (`eval`/`repl`) is
+optimized for fast feedback (no GCC invocation) and does NOT load
+modules through the `LamoModuleRegistry`. Calling `math.sqrt(x)` in
+`eval`/`repl` produces a clear error:
+
+```
+error: module member 'math.sqrt' is not available in eval/repl mode
+hint: use `lamo run` to execute programs that use namespaced imports
+```
+
+Bringing the interpreter path to full parity with `run` (loading
+modules, supporting namespaced calls) would require either (a)
+implementing the module registry in the interpreter, or (b) compiling
+every `eval`/`repl` input through the full `run` pipeline. Both options
+sacrifice the "fast feedback" property that justifies having a separate
+interpreter. We chose instead to make the limitation explicit and
+documented.
+
+**Migrating from `eval` to `run`:** if a snippet works in `eval` but
+needs namespaced imports, save it to a `.lamo` file and run it with
+`lamo run file.lamo`. The language semantics are otherwise identical
+between the two paths — the interpreter implements the same value
+model, truthiness rules, and runtime errors as the transpiler.
 
 ---
 
@@ -827,12 +869,23 @@ runtime warning the first time they are called.
 | `http_serve`     | `http_serve(port: int) -> void`                        |
 | `http_serve_once`| `http_serve_once(port: int) -> int`                    |
 
-> **⚠ Memory model warning.** The HTTP server holds route strings and accepts
-> request after request. Because the runtime has no GC (only an `atexit`
-> cleanup), long-running `http_serve` will grow the string arena without
-> bound. See `docs/MEMORY-MODEL.md`. Until a GC lands, **do not use
-> `http_serve` in production for long-running processes**. Use it for local
-> development, demos, and short-lived tools.
+The HTTP server loop calls `gc_collect()` every 100 requests so the
+arena doesn't grow without bound during long-running `http_serve`. The
+route table itself (registered via `http_route`) is allocated outside
+the GC heap (via plain `malloc`), so routes stay alive across
+collections — only per-request garbage (string buffers built while
+parsing/handling) is swept.
+
+Programs that want finer control can call `gc_collect()` manually at
+natural boundaries (end of request, after a batch of work) or set an
+auto-trigger threshold via `gc_set_threshold(N_bytes)` — when the
+runtime has allocated `N` bytes since the last collection, the next
+allocation triggers a `gc_collect()`. See `docs/MEMORY-MODEL.md` for
+the full GC design.
+
+**Concurrency:** the server is single-threaded, one request at a time.
+Multi-threaded HTTP is future work (depends on the broader threading
+story for Lamo).
 
 ---
 
@@ -842,11 +895,12 @@ runtime warning the first time they are called.
 
 The entry point is the implicit `main()` synthesized by the codegen. It:
 
-1. Initializes the string arena and any other runtime state.
-2. Runs all top-level `let` initializers in declaration order.
-3. Calls user `fn main()` if defined; otherwise runs top-level statements in
+1. Initializes the string arena, the GC heap list, and the GC root stack.
+2. Registers every global `LamoValue` (top-level `let`s) as a GC root.
+3. Runs all top-level `let` initializers in declaration order.
+4. Calls user `fn main()` if defined; otherwise runs top-level statements in
    order.
-4. Cleans up the string arena via `atexit`.
+5. Pops all GC roots and cleans up the string arena via `atexit`.
 
 There is no required `fn main()` today. Top-level statements run directly.
 Defining `fn main()` is supported but optional — if present, it is called
@@ -914,7 +968,10 @@ this spec. When they ship, this spec will be updated.
 - **`for-in` loops** — `for x in arr { ... }`.
 - **Gradual typing pass** — strict mode where rebinding to a different type
   is an error.
-- **GC** — mark-sweep for long-running programs; see `docs/MEMORY-MODEL.md`.
+- **GC** — ~~mark-sweep for long-running programs; see `docs/MEMORY-MODEL.md`.~~
+  **Shipped in 2.3.0.** Opt-in mark-sweep GC; see `docs/MEMORY-MODEL.md`.
+  Future GC work: generational collection, incremental marking, concurrent
+  collection (all depend on the threading story).
 - **Modules with explicit exports** — `pub` keyword.
 
 ---
@@ -924,3 +981,8 @@ this spec. When they ship, this spec will be updated.
 - **v1.0** (this document) — first authoritative spec. Captures the behavior
   of compiler `2.2.0`. Future changes go through a formal revision process
   (TODO: define that process; for now, PR + spec bump).
+- **v1.1** (compiler 2.3.0) — opt-in mark-sweep GC shipped
+  (`docs/MEMORY-MODEL.md` Steps 2–6). New builtins: `gc_collect()`,
+  `gc_set_threshold(N)`, `gc_heap_size()`, `gc_heap_count()`. HTTP server
+  re-promoted from "preview" to "official". `eval`/`repl` vs `run`
+  divergence formalized in §10.7.

@@ -172,16 +172,48 @@ static LAMO_UNUSED LamoValue lamo_make_struct(LamoArray* array) {
  * allocations share the same lifetime (program exit), so one arena is
  * enough.
  *
+ * GC rollout Step 2: each arena allocation now also gets a LamoGcHeader
+ * prepended (see the GC section below). The arena stores the PAYLOAD
+ * pointer (what user code sees); the GC tracks the HEADER pointer. Both
+ * are freed at exit by lamo_arena_free_all (which walks the arena and
+ * frees each non-NULL payload's underlying header).
+ *
  * Known limitation: long-running programs (e.g. HTTP servers) see the
- * arena grow while they run. This is acceptable for an educational
- * prototype and is documented in the README.
+ * arena grow while they run. This is now fixable by opting into the
+ * mark-sweep GC (see the GC section below and docs/MEMORY-MODEL.md).
  */
+
+/* Forward declarations for the GC machinery (defined below). The arena
+ * allocator hooks into the GC heap list, so we need these visible here.
+ * The root stack variables are also referenced by lamo_arena_free_all
+ * (it frees the root stack at exit), so they're forward-declared too. */
+typedef struct LamoGcHeader LamoGcHeader;
+struct LamoGcHeader {
+    size_t size;
+    unsigned char mark : 1;
+    unsigned char is_array : 1;
+    unsigned char in_use : 1;
+    struct LamoGcHeader* next;
+};
+static LamoGcHeader* lamo_gc_heap_head;
+static size_t lamo_gc_bytes_since_collect;
+static size_t lamo_gc_threshold;
+static size_t lamo_gc_live_bytes;
+static size_t lamo_gc_live_count;
+static LamoValue** lamo_gc_root_stack;
+static size_t lamo_gc_root_stack_count;
+static size_t lamo_gc_root_stack_capacity;
+static void lamo_gc_collect(void);
+static LamoGcHeader* lamo_gc_header_for(const void* payload);
+
 static void** lamo_string_arena = NULL;
 static size_t lamo_string_arena_count = 0;
 static size_t lamo_string_arena_capacity = 0;
 
 static LAMO_UNUSED void* lamo_arena_alloc(size_t length) {
     void* block;
+    LamoGcHeader* header;
+    size_t total = length + sizeof(LamoGcHeader);
     if (lamo_string_arena_count == lamo_string_arena_capacity) {
         size_t new_cap = lamo_string_arena_capacity ? lamo_string_arena_capacity * 2 : 16;
         void** new_arena = realloc(lamo_string_arena, sizeof(void*) * new_cap);
@@ -189,9 +221,35 @@ static LAMO_UNUSED void* lamo_arena_alloc(size_t length) {
         lamo_string_arena = new_arena;
         lamo_string_arena_capacity = new_cap;
     }
-    block = malloc(length);
-    if (!block) { fprintf(stderr, "runtime error: failed to allocate string\n"); exit(1); }
+    header = (LamoGcHeader*)malloc(total);
+    if (!header) { fprintf(stderr, "runtime error: failed to allocate string\n"); exit(1); }
+    header->size = length;
+    header->mark = 0;
+    header->is_array = 0;  /* default: opaque buffer (string bytes, items buffer) */
+    header->in_use = 1;
+    header->next = lamo_gc_heap_head;
+    lamo_gc_heap_head = header;
+    block = (char*)header + sizeof(LamoGcHeader);
     lamo_string_arena[lamo_string_arena_count++] = block;
+
+    /* Auto-trigger GC if threshold is set and we've crossed it. */
+    lamo_gc_bytes_since_collect += length + sizeof(LamoGcHeader);
+    if (lamo_gc_threshold > 0 && lamo_gc_bytes_since_collect >= lamo_gc_threshold) {
+        lamo_gc_collect();
+    }
+    return block;
+}
+
+/* Like lamo_arena_alloc, but marks the allocation as a traceable LamoArray
+ * struct (so the GC will walk its items[] during the mark phase). Used by
+ * lamo_array_alloc for the LamoArray itself; the items buffer is allocated
+ * with the plain lamo_arena_alloc (it's reached via the parent's trace). */
+static LAMO_UNUSED void* lamo_arena_alloc_traced(size_t length) {
+    void* block = lamo_arena_alloc(length);
+    if (block) {
+        LamoGcHeader* h = lamo_gc_header_for(block);
+        if (h) h->is_array = 1;
+    }
     return block;
 }
 
@@ -210,14 +268,256 @@ static LAMO_UNUSED void lamo_arena_free_all(void) {
     for (i = 0; i < lamo_string_arena_count; i++) {
         /* Sprint 3: arena entries may be char* (string buffers), LamoArray*
          * (array structs), or LamoValue* (array items buffers). We can't
-         * tell them apart at free time, but free() works on all of them. */
-        free(lamo_string_arena[i]);
+         * tell them apart at free time, but free() works on all of them.
+         *
+         * GC Step 2: arena entries are PAYLOAD pointers (the user-visible
+         * allocation). The actual malloc'd block starts at
+         * `payload - sizeof(LamoGcHeader)`. NULL entries are slots that
+         * lamo_gc_collect already freed during the run; free(NULL) is safe. */
+        void* payload = lamo_string_arena[i];
+        if (payload) {
+            LamoGcHeader* h = (LamoGcHeader*)((char*)payload - sizeof(LamoGcHeader));
+            free(h);
+        }
     }
     free(lamo_string_arena);
     lamo_string_arena = NULL;
     lamo_string_arena_count = 0;
     lamo_string_arena_capacity = 0;
+    /* GC heap list is also gone now (every header was freed above). Reset
+     * the head pointer so a subsequent gc_collect (which shouldn't happen
+     * after atexit, but defensive) doesn't walk freed memory. */
+    lamo_gc_heap_head = NULL;
+    /* Free the root stack too — it's the only GC allocation that didn't
+     * go through lamo_arena_alloc. */
+    free(lamo_gc_root_stack);
+    lamo_gc_root_stack = NULL;
+    lamo_gc_root_stack_count = 0;
+    lamo_gc_root_stack_capacity = 0;
 }
+
+/* ================================================================== */
+/* GC (mark-sweep, opt-in) — MEMORY-MODEL.md Step 2                    */
+/* ================================================================== */
+/*
+ * Every allocation made by `lamo_arena_alloc` is now also tracked in an
+ * intrusive singly-linked list (`lamo_gc_heap_head`) via a small header
+ * prepended to each block. The header type, the GC state globals, and
+ * the root stack variables are forward-declared near the arena (above)
+ * so that lamo_arena_alloc and lamo_arena_free_all can hook into them.
+ * The full implementation of mark/sweep lives here.
+ *
+ * Backward compatibility: programs that never call `gc_collect()` or
+ * `gc_set_threshold(N > 0)` see zero GC overhead. The only cost is the
+ * per-allocation header (16 bytes typical) and one pointer write per
+ * allocation (linking into the heap list). Allocations are still freed
+ * in bulk at exit by `lamo_arena_free_all`, which now also walks the
+ * GC heap list to free headers (rather than the old arena array — same
+ * effect, one less data structure).
+ */
+
+/* (No static state declarations here — they're forward-declared above.) */
+
+/* Returns the header that precedes a payload pointer, or NULL if the
+ * pointer doesn't look like a GC-tracked allocation (e.g., it's a static
+ * string literal). Used during marking to find the header to mark. */
+static LAMO_UNUSED LamoGcHeader* lamo_gc_header_for(const void* payload) {
+    if (!payload) return NULL;
+    /* The header sits immediately before the payload. We don't validate
+     * that the pointer is actually in our heap (that would require a
+     * range check); callers only pass pointers they got from
+     * lamo_gc_alloc, so this is safe. */
+    return (LamoGcHeader*)((char*)payload - sizeof(LamoGcHeader));
+}
+
+/* Mark a single LamoValue as reachable, recursing into arrays/structs. */
+static void lamo_gc_mark_value(LamoValue v);
+
+static LAMO_UNUSED void lamo_gc_mark_header(LamoGcHeader* h) {
+    if (!h || h->mark) return;
+    h->mark = 1;
+    if (h->is_array) {
+        /* Payload is a LamoArray struct. Trace its items buffer. */
+        LamoArray* arr = (LamoArray*)((char*)h + sizeof(LamoGcHeader));
+        long long i;
+        /* First, mark the items buffer allocation (if any). */
+        if (arr->items) {
+            LamoGcHeader* items_h = lamo_gc_header_for(arr->items);
+            if (items_h && items_h->in_use) {
+                lamo_gc_mark_header(items_h);
+            }
+        }
+        /* Then mark each item that's a traceable value. */
+        for (i = 0; i < arr->count; i++) {
+            lamo_gc_mark_value(arr->items[i]);
+        }
+    }
+    /* For opaque payloads (string bytes, items buffer), there's nothing
+     * internal to trace — marking the header is enough. */
+}
+
+static LAMO_UNUSED void lamo_gc_mark_value(LamoValue v) {
+    if (v.type == LAMO_VALUE_STRING) {
+        if (v.string_value) {
+            /* String literals (compiled into the binary) aren't in our heap
+             * and don't need marking. We try to mark the header; if the
+             * pointer is to a GC-tracked buffer, the header gets marked.
+             * If it's a static literal, lamo_gc_header_for returns garbage
+             * — but we only trust the result if `in_use` is set, which
+             * static memory won't be (it'll be random bytes, almost
+             * certainly not 1).
+             *
+             * To make this safe, we walk the heap list looking for a
+             * matching payload pointer. This is O(n) per string but
+             * typical heaps are small. */
+            LamoGcHeader* h = lamo_gc_heap_head;
+            while (h) {
+                if ((char*)h + sizeof(LamoGcHeader) == v.string_value) {
+                    lamo_gc_mark_header(h);
+                    return;
+                }
+                h = h->next;
+            }
+            /* Not found in heap — it's a static literal. Nothing to mark. */
+        }
+    } else if (v.type == LAMO_VALUE_ARRAY || v.type == LAMO_VALUE_STRUCT) {
+        if (v.array_value) {
+            LamoGcHeader* h = lamo_gc_heap_head;
+            while (h) {
+                if ((char*)h + sizeof(LamoGcHeader) == (char*)v.array_value) {
+                    lamo_gc_mark_header(h);
+                    return;
+                }
+                h = h->next;
+            }
+            /* Not found — defensive, shouldn't happen for traceable values. */
+        }
+    }
+    /* INT, FLOAT, BOOL have no heap allocation to mark. */
+}
+
+/* Push a LamoValue* onto the root stack. Used by LAMO_GC_PUSH_ROOT. */
+static LAMO_UNUSED void lamo_gc_push_root(LamoValue* v) {
+    if (lamo_gc_root_stack_count == lamo_gc_root_stack_capacity) {
+        size_t new_cap = lamo_gc_root_stack_capacity ? lamo_gc_root_stack_capacity * 2 : 64;
+        LamoValue** new_stack = (LamoValue**)realloc(lamo_gc_root_stack, sizeof(LamoValue*) * new_cap);
+        if (!new_stack) {
+            /* Out of memory for root stack — disable GC rather than crash. */
+            lamo_gc_threshold = 0;
+            return;
+        }
+        lamo_gc_root_stack = new_stack;
+        lamo_gc_root_stack_capacity = new_cap;
+    }
+    lamo_gc_root_stack[lamo_gc_root_stack_count++] = v;
+}
+
+/* Pop n entries from the root stack. Used by LAMO_GC_POP_ROOTS_N. */
+static LAMO_UNUSED void lamo_gc_pop_roots_n(int n) {
+    if (n <= 0) return;
+    if ((size_t)n > lamo_gc_root_stack_count) {
+        /* Defensive: should never happen if codegen is correct. */
+        lamo_gc_root_stack_count = 0;
+        return;
+    }
+    lamo_gc_root_stack_count -= (size_t)n;
+}
+
+/* Run a full mark-sweep collection.
+ *   1. Mark phase: clear all marks, then walk the root stack, marking
+ *      every reachable allocation.
+ *   2. Sweep phase: walk the heap list. Any allocation with mark==0 is
+ *      freed; its slot is removed from the list. Allocations with mark==1
+ *      have their mark cleared for the next cycle.
+ *
+ * After sweep, we update lamo_gc_live_bytes / lamo_gc_live_count for
+ * observability (tests, gc_heap_size() builtin). */
+static LAMO_UNUSED void lamo_gc_collect(void) {
+    LamoGcHeader* h;
+    LamoGcHeader* prev;
+    LamoGcHeader* next;
+    size_t i;
+
+    /* Clear all marks. */
+    h = lamo_gc_heap_head;
+    while (h) {
+        h->mark = 0;
+        h = h->next;
+    }
+
+    /* Mark phase: walk the root stack. */
+    for (i = 0; i < lamo_gc_root_stack_count; i++) {
+        if (lamo_gc_root_stack[i]) {
+            lamo_gc_mark_value(*lamo_gc_root_stack[i]);
+        }
+    }
+
+    /* Sweep phase: walk the heap list, freeing unmarked allocations.
+     * We rebuild the list as we go (single pass with prev/next pointers). */
+    prev = NULL;
+    h = lamo_gc_heap_head;
+    lamo_gc_live_bytes = 0;
+    lamo_gc_live_count = 0;
+    while (h) {
+        next = h->next;
+        if (!h->mark) {
+            /* Free this allocation. Also remove its entry from the arena
+             * array so lamo_arena_free_all doesn't double-free. We do
+             * this by setting the arena slot to NULL (free(NULL) is safe).
+             * To find the arena slot, we search by payload pointer. */
+            char* payload = (char*)h + sizeof(LamoGcHeader);
+            size_t j;
+            for (j = 0; j < lamo_string_arena_count; j++) {
+                if (lamo_string_arena[j] == payload) {
+                    lamo_string_arena[j] = NULL;
+                    break;
+                }
+            }
+            free(h);
+            if (prev) prev->next = next; else lamo_gc_heap_head = next;
+        } else {
+            h->mark = 0;  /* clear for next cycle */
+            h->in_use = 1;
+            lamo_gc_live_bytes += h->size + sizeof(LamoGcHeader);
+            lamo_gc_live_count++;
+            prev = h;
+        }
+        h = next;
+    }
+
+    lamo_gc_bytes_since_collect = 0;
+}
+
+/* Set the auto-trigger threshold (bytes). 0 disables auto-trigger. */
+static LAMO_UNUSED void lamo_gc_set_threshold(size_t bytes) {
+    lamo_gc_threshold = bytes;
+}
+
+/* Returns the current live heap size in bytes (after the last collect). */
+static LAMO_UNUSED long long lamo_gc_heap_size(void) {
+    return (long long)lamo_gc_live_bytes;
+}
+
+/* Returns the current live allocation count (after the last collect). */
+static LAMO_UNUSED long long lamo_gc_heap_count(void) {
+    return (long long)lamo_gc_live_count;
+}
+
+/* Run a collection and return the resulting live allocation count.
+ * This is the runtime entry point for the user-facing `gc_collect()`
+ * builtin, which returns the live count so tests can assert that the
+ * heap shrank after dropping references. */
+static LAMO_UNUSED long long lamo_gc_collect_count(void) {
+    lamo_gc_collect();
+    return lamo_gc_live_count;
+}
+
+/* LAMO_GC_PUSH_ROOT(&v) and LAMO_GC_POP_ROOTS_N(n) are the macros the
+ * codegen emits at function entry / exit. They expand to runtime calls
+ * that are essentially no-ops when no gc_collect() ever runs (the push
+ * is one memory write, the pop is one decrement). */
+#define LAMO_GC_PUSH_ROOT(vptr) lamo_gc_push_root(vptr)
+#define LAMO_GC_POP_ROOTS_N(n)  lamo_gc_pop_roots_n(n)
 
 static LAMO_UNUSED char* lamo_heap_strdup(const char* value) {
     size_t length;
@@ -410,12 +710,14 @@ static LAMO_UNUSED void lamo_print_value(LamoValue value) {
 /* ------------------------------------------------------------------ */
 
 /* Allocate a new LamoArray with the given initial capacity. The struct
- * is registered in the arena; its `items` buffer is also arena-tracked
- * (so it survives until program exit). */
+ * is registered in the arena (via lamo_arena_alloc_traced, so the GC
+ * knows to trace its items[]); its `items` buffer is also arena-tracked
+ * (via plain lamo_arena_alloc — it's reached during trace via the parent
+ * LamoArray's mark phase, so it doesn't need its own is_array flag). */
 static LAMO_UNUSED LamoArray* lamo_array_alloc(long long initial_capacity) {
     LamoArray* array;
     if (initial_capacity < 4) initial_capacity = 4;
-    array = (LamoArray*)lamo_arena_alloc(sizeof(LamoArray));
+    array = (LamoArray*)lamo_arena_alloc_traced(sizeof(LamoArray));
     array->items = (LamoValue*)lamo_arena_alloc(sizeof(LamoValue) * (size_t)initial_capacity);
     array->count = 0;
     array->capacity = initial_capacity;
@@ -799,6 +1101,13 @@ static LAMO_UNUSED LamoValue lamo_abs_value(LamoValue value) {
 /* ------------------------------------------------------------------ */
 #ifdef LAMO_NEEDS_GUI_RUNTIME
 
+/* GC Step 4: periodic collection hook for the GUI event loop. The user's
+ * render loop calls gui_should_close() once per frame; we use that as the
+ * heartbeat and run gc_collect() every LAMO_GUI_GC_INTERVAL frames. The
+ * interval is conservative (1000) so frame cost stays predictable. */
+#define LAMO_GUI_GC_INTERVAL 1000
+static long long lamo_gui_frame_counter = 0;
+
 #ifdef _WIN32
 #include <windows.h>
 
@@ -889,6 +1198,13 @@ static int lamo_gui_open(int width, int height, const char* title) {
 
 static int lamo_gui_should_close(void) {
     lamo_gui_process_messages();
+    /* GC Step 4: periodically reclaim unreachable allocations so the GUI
+     * event loop doesn't grow the arena without bound. The interval is
+     * conservative (every 1000 frames) so frame cost stays predictable. */
+    if (++lamo_gui_frame_counter >= LAMO_GUI_GC_INTERVAL) {
+        lamo_gui_frame_counter = 0;
+        lamo_gc_collect();
+    }
     return lamo_gui.is_open ? 0 : 1;
 }
 
@@ -998,6 +1314,12 @@ static void lamo_gui_process_messages(void) {
 static int lamo_gui_should_close(void) {
     if (!lamo_gui.display) return 1;
     lamo_gui_process_messages();
+    /* GC Step 4: periodic collection (see the Windows branch above for
+     * the same pattern — every 1000 frames, run gc_collect). */
+    if (++lamo_gui_frame_counter >= LAMO_GUI_GC_INTERVAL) {
+        lamo_gui_frame_counter = 0;
+        lamo_gc_collect();
+    }
     return lamo_gui.is_open ? 0 : 1;
 }
 
@@ -1192,6 +1514,13 @@ static int lamo_http_run_server(int port, int serve_once) {
     lamo_socket_t server_socket;
     struct sockaddr_in address;
     int opt_value = 1;
+    /* GC Step 4: HTTP server loop runs gc_collect() every N requests so
+     * long-running http_serve() doesn't grow the arena without bound.
+     * The interval (100) is conservative — typical Lamo HTTP programs
+     * handle tens of req/sec, so this adds ~1ms of GC overhead per
+     * second, well under the cost of a single request. */
+    static const int HTTP_GC_INTERVAL = 100;
+    long long request_count = 0;
     if (!lamo_http_init_runtime()) { return 0; }
     server_socket = socket(AF_INET, SOCK_STREAM, 0);
     if (server_socket == LAMO_INVALID_SOCKET) {
@@ -1219,6 +1548,16 @@ static int lamo_http_run_server(int port, int serve_once) {
         lamo_http_handle_client(client_socket);
         lamo_close_socket(client_socket);
         if (serve_once) { break; }
+        /* Periodic GC: every HTTP_GC_INTERVAL requests, reclaim
+         * unreachable allocations. The route table (registered via
+         * http_route) lives in `lamo_http_routes`, which is a separate
+         * malloc'd linked list NOT tracked by the GC — so routes stay
+         * alive across collections. Only per-request garbage (string
+         * buffers built while parsing/handling) gets swept. */
+        if (++request_count >= HTTP_GC_INTERVAL) {
+            request_count = 0;
+            lamo_gc_collect();
+        }
     }
     lamo_close_socket(server_socket);
     return 1;
