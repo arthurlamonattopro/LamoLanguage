@@ -3,7 +3,9 @@ CC = gcc
 # Both flags are harmless in combination; -O2 lets the compiler inline the
 # many static helpers in lamo_runtime.h, and -g preserves source-level
 # debugging through the AST/codegen pipeline.
-CFLAGS = -Wall -Wextra -std=c99 -O2 -g -Isrc -Isrc/lexer -Isrc/parser -Isrc/ast -Isrc/codegen -Isrc/semantic -Isrc/eval -Isrc/lampm
+# Sprint 5: -Isrc/cli added so the new cli/*.h headers are found after the
+# lamo_v2.c / lampm.c split.
+CFLAGS = -Wall -Wextra -std=c99 -O2 -g -Isrc -Isrc/lexer -Isrc/parser -Isrc/ast -Isrc/codegen -Isrc/semantic -Isrc/eval -Isrc/lampm -Isrc/cli
 
 # Sprint 3 fix: link the compiler itself with -lm, because codegen.c now
 # uses fmod() directly for constant folding of float % expressions. The
@@ -21,7 +23,21 @@ RUNTIME_DATA   = src/codegen/lamo_runtime_data.c
 # LamoPacketManager binary). It now compiles into the main `lamo`
 # executable and is reachable through `lamo install`, `lamo update`, etc.
 # modules.c backs the Sprint 4 namespaced-import feature (`import "..." as alias;`).
-SRCS = src/lamo_v2.c src/lexer/lexer.c src/parser/parser.c src/ast/ast.c src/codegen/codegen.c src/semantic/semantic.c src/eval/eval.c src/lampm/lampm.c src/modules.c $(RUNTIME_DATA)
+#
+# Sprint 5 refactor: lamo_v2.c and lampm.c were split into focused
+# modules under src/cli/ and src/lampm/. The new .c files implement
+# CLI parsing / import resolution / subcommand dispatch / compile
+# pipeline (src/cli/) and string/fs / manifest / lockfile / git helpers
+# (src/lampm/). The slim lamo_v2.c now only contains main() + run_argv();
+# the slim lampm.c only contains lampm_main + per-command handlers.
+SRCS = src/lamo_v2.c \
+       src/cli/cli_options.c src/cli/paths.c src/cli/import_resolver.c \
+       src/cli/commands.c src/cli/compile.c src/cli/help.c \
+       src/lexer/lexer.c src/parser/parser.c src/ast/ast.c \
+       src/codegen/codegen.c src/semantic/semantic.c src/eval/eval.c \
+       src/lampm/lampm.c src/lampm/lampm_util.c src/lampm/lampm_manifest.c \
+       src/lampm/lampm_lockfile.c src/lampm/lampm_git.c \
+       src/modules.c $(RUNTIME_DATA)
 OBJS = $(SRCS:.c=.o)
 
 ifeq ($(OS),Windows_NT)
@@ -54,7 +70,16 @@ $(TARGET): $(OBJS)
 # codegen. We now list the headers each .c file transitively includes, so
 # `make` does the right thing on header edits. Generated lamo_runtime_data.c
 # has no extra deps beyond itself.
-SRCS_DEP_H = src/lexer/lexer.h src/parser/parser.h src/ast/ast.h src/builtins.h src/error_util.h src/semantic/semantic.h src/codegen/codegen.h src/codegen/lamo_runtime_data.h src/codegen/lamo_runtime.h src/eval/eval.h src/lampm/lampm.h src/modules.h
+#
+# Sprint 5: also track the new cli/ and lampm/ internal headers so
+# editing them triggers a rebuild of every .c that includes them.
+SRCS_DEP_H = src/lexer/lexer.h src/parser/parser.h src/ast/ast.h \
+             src/builtins.h src/error_util.h src/semantic/semantic.h \
+             src/codegen/codegen.h src/codegen/lamo_runtime_data.h \
+             src/codegen/lamo_runtime.h src/eval/eval.h \
+             src/lampm/lampm.h src/lampm/lampm_internal.h src/modules.h \
+             src/cli/cli_options.h src/cli/paths.h src/cli/import_resolver.h \
+             src/cli/commands.h src/cli/compile.h src/cli/help.h
 
 %.o: %.c $(SRCS_DEP_H)
 	$(CC) $(CFLAGS) -c $< -o $@

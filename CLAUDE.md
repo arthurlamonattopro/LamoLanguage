@@ -2,6 +2,24 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Authoritative Design Documents
+
+Before changing language behavior, read the relevant doc under `docs/`:
+
+- `docs/SPEC.md` — the language specification. Authoritative for "what the
+  language means". If the compiler disagrees with the spec on spec'd
+  behavior, the compiler is the bug.
+- `docs/TYPE-SYSTEM.md` — the type-system decision (hybrid inference).
+  Read before touching anything in `src/semantic/` or adding type annotations.
+- `docs/MEMORY-MODEL.md` — memory model + GC design + rollout plan. Read
+  before touching `lamo_runtime.h` or any allocation path.
+- `docs/RFC-generics.md` — draft RFC for parametric generics. Read before
+  any work on typed collections, `Option`/`Result`, or generic functions.
+
+The roadmap (`roadmap.md`) tracks *what's done* and *what's next*. The
+spec tracks *what it means*. The TODO (`todo.md`) tracks implementation
+items per phase.
+
 ## Build Commands
 
 ```bash
@@ -74,22 +92,47 @@ Lamo is a transpiled language that compiles to C. The pipeline is:
   version of `lamo_runtime.h`. Regenerate with `python3 scripts/embed_runtime.py`.
 - **src/eval/eval.c** — Tree-walking AST interpreter. Powers `lamo eval`
   and `lamo repl`. Independent of the C codegen backend.
-- **src/lampm/lampm.c** — Integrated package manager. Originally a separate
+- **src/lampm/** — Integrated package manager. Originally a separate
   `lampm` binary (LamoPacketManager repo); now compiled into the main `lamo`
   executable. Reachable through `lamo install`, `lamo update`, `lamo list`,
   etc. The single public entry point is `lampm_main()` (see
   `src/lampm/lampm.h`), which `lamo_v2.c::main()` dispatches to when the
   subcommand is one of the package-manager ones (init, install, update,
-  remove, list, info, outdated, why, lock, cache, doctor).
+  remove, list, info, outdated, why, lock, cache, doctor). The implementation
+  is split across:
+  - `lampm.c` — entry point + all `command_*` handlers + `install_dependency`.
+  - `lampm_internal.h` — shared types (`Manifest`, `Lockfile`, `Dependency`,
+    `LockEntry`) + helper function decls used across the split files.
+  - `lampm_util.c` — string/fs helpers + output helpers (`info_msg`,
+    `success_msg`, `error_msg`, etc.) + the global option vars.
+  - `lampm_manifest.c` — `lamo.pkg` parsing/writing.
+  - `lampm_lockfile.c` — `lamo.lock` parsing/writing.
+  - `lampm_git.c` — git operations + repo-spec parsing.
 - **src/modules.c** + **src/modules.h** — Module registry (Sprint 4) backing
-  the namespaced-import feature. The loader (`lamo_v2.c`) renames top-level
-  declarations of an aliased import to `lamo_mod_<alias>__<name>` and
-  registers them here; the semantic pass and codegen look them up via
-  `lamo_modules_resolve_member()` to resolve `alias.fn(args)` calls.
-- **src/lamo_v2.c** — Entry point: reads files, orchestrates compilation
-  pipeline, handles imports recursively with cycle detection. Also parses
-  global flags (--verbose / --quiet) and dispatches subcommands, including
-  the package-manager ones via `lampm_main()`.
+  the namespaced-import feature. The loader (now in `src/cli/import_resolver.c`)
+  renames top-level declarations of an aliased import to
+  `lamo_mod_<alias>__<name>` and registers them here; the semantic pass and
+  codegen look them up via `lamo_modules_resolve_member()` to resolve
+  `alias.fn(args)` calls.
+- **src/cli/** — CLI layer split out of `lamo_v2.c` for maintainability
+  (the original file was 2563 lines mixing CLI parsing, import resolution,
+  subcommand dispatch, and the compile pipeline). Now:
+  - `cli_options.{h,c}` — global flags (`g_verbose`, `g_quiet`,
+    `g_no_color`), `LamoCommand` enum, `VERSION`.
+  - `paths.{h,c}` — path utilities, `resolve_import_path` (with the
+    `std/` resolution logic), `read_file`, `lamo_cc`, `executable_suffix`.
+  - `import_resolver.{h,c}` — `CompilationState`, the recursive loader
+    (`load_program_recursive_from`), import cycle detection, and module
+    declaration renaming (`rename_module_declarations`).
+  - `commands.{h,c}` — `command_new`, `command_clean`, `command_repl`,
+    `command_test`, `command_fmt`.
+  - `compile.{h,c}` — `compile_sources` + helpers (GUI detection,
+    source-lookup and module-resolution callbacks).
+  - `help.{h,c}` — `print_usage`, `print_command_help`.
+- **src/lamo_v2.c** — Thin CLI entry point (~380 lines): env-var parsing,
+  global-flag parsing, subcommand dispatch. Delegates to `src/cli/*` for
+  everything else, and to `src/lampm/lampm.h::lampm_main()` for
+  package-manager subcommands.
 
 ### Language Features
 

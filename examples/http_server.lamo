@@ -1,6 +1,22 @@
+// ─────────────────────────────────────────────────────────────────────────
+// HTTP server example — PREVIEW, not official.
+//
+// As of compiler 2.2.0, the Lamo runtime has no garbage collector. Strings
+// produced by dynamic operations (concatenation, input_str, etc.) are
+// tracked in a single arena and freed all at once on program exit. This
+// means a long-running http_serve() will grow the arena without bound.
+//
+// DO NOT use this example as a template for production long-running
+// processes until the opt-in mark-sweep GC lands (see
+// docs/MEMORY-MODEL.md, Step 2-Step 5 of the rollout plan).
+//
+// For local development, quick demos, and short-lived tools, this is fine.
+// ─────────────────────────────────────────────────────────────────────────
+
 http_route("/", "Lamo HTTP server");
 http_route("/health", "ok");
 http_route("/about", "experimental builtin server");
 
 print("HTTP server on http://127.0.0.1:8080");
+print("WARNING: arena memory model — see docs/MEMORY-MODEL.md before running for long.");
 http_serve(8080);

@@ -10,6 +10,19 @@ Turn Lamo from an educational transpiler prototype into a small but real program
 - usable tooling
 - a stable compilation pipeline
 
+## Authoritative Design Documents
+
+These live under `docs/` and are the source of truth for their respective
+areas. The roadmap tracks *what's done* and *what's next*; the design docs
+track *what it means*.
+
+- `docs/SPEC.md` — the language specification (syntax, types, semantics,
+  runtime, modules). Authoritative for "what the language means".
+- `docs/TYPE-SYSTEM.md` — type-system decision record (hybrid inference).
+- `docs/MEMORY-MODEL.md` — memory model and GC design + rollout plan.
+- `docs/RFC-generics.md` — draft RFC for parametric generics (not yet
+  implemented).
+
 ## Current State
 
 Today, Lamo already has:
@@ -107,17 +120,18 @@ Objective: give the language a coherent model for values instead of relying on C
 
 ### Tasks
 
-- Decide whether Lamo uses explicit types, inference, or both.
-- Validate arithmetic, comparison, logical, and unary operators by type.
-- Validate function parameter and return types.
-- Define equality semantics.
-- Define condition semantics for booleans and truthiness.
-- Remove the current backend assumption that everything is `int`.
+- [x] Decide whether Lamo uses explicit types, inference, or both.
+      **Decision: hybrid inference — see `docs/TYPE-SYSTEM.md`.**
+- [x] Validate arithmetic, comparison, logical, and unary operators by type.
+- [x] Validate function parameter and return types.
+- [x] Define equality semantics.
+- [x] Define condition semantics for booleans and truthiness.
+- [x] Remove the current backend assumption that everything is `int`.
 
 ### Exit Criteria
 
-- Type errors are reported by Lamo, not leaked through generated C.
-- Builtins and expressions behave according to language rules, not C accidents.
+- [x] Type errors are reported by Lamo, not leaked through generated C.
+- [x] Builtins and expressions behave according to language rules, not C accidents.
 
 ## Phase 4: Build A Minimal Runtime
 
@@ -131,16 +145,23 @@ Objective: support non-trivial programs without abusing raw C assumptions.
 
 ### Tasks
 
-- Define how strings are represented and passed.
-- Support printing string variables reliably.
-- Decide whether string equality is by value.
-- Implement runtime helpers where inline C becomes too brittle.
-- Define behavior for invalid input and unsafe operations.
+- [x] Define how strings are represented and passed.
+      **Arena-allocated `char*`, immutable, passed by pointer.**
+- [x] Support printing string variables reliably.
+- [x] Decide whether string equality is by value.
+- [x] Implement runtime helpers where inline C becomes too brittle.
+- [x] Define behavior for invalid input and unsafe operations.
+- [x] Decide whether Lamo will expose manual memory control, ownership rules,
+      or a managed model. **Decision: hybrid — arena by default, opt-in
+      mark-sweep GC planned. See `docs/MEMORY-MODEL.md` for the full design
+      and a 7-step rollout plan.**
 
 ### Exit Criteria
 
-- Strings are real language values, not just literals that happen to compile.
-- Builtins behave consistently across platforms.
+- [x] Strings are real language values, not just literals that happen to compile.
+- [x] Builtins behave consistently across platforms.
+- [ ] Long-running processes can opt into GC (rollout Step 2–5; tracked in
+      `todo.md` Phase 5).
 
 ## Phase 5: Improve The Language Surface
 
@@ -298,12 +319,16 @@ These should happen during every phase:
 
 If the goal is the fastest meaningful progress, do this next:
 
-1. Tighten parser reliability and frontend diagnostics.
-2. Finish the missing semantic validation gaps and per-file diagnostics.
-3. Introduce real types.
-4. Make builtins and codegen respect those types.
-5. Turn imports/modules into a first-class frontend feature.
-6. Expand runtime and library surface after that.
+1. ~~Tighten parser reliability and frontend diagnostics.~~ (Done — Phase 1.)
+2. ~~Finish the missing semantic validation gaps and per-file diagnostics.~~ (Done — Phase 2.)
+3. ~~Introduce real types.~~ (Done — Phase 3 / `docs/TYPE-SYSTEM.md`.)
+4. ~~Make builtins and codegen respect those types.~~ (Done — Phase 4.)
+5. ~~Turn imports/modules into a first-class frontend feature.~~ (Done — Phase 7 Sprint 4.)
+6. ~~Lock down the language spec before adding more syntax.~~ (Done — `docs/SPEC.md`.)
+7. ~~Resolve the memory model question for long-running processes.~~ (Done — `docs/MEMORY-MODEL.md`; rollout in progress.)
+8. ~~Split the large CLI files into modules for maintainability.~~ (Done — see `src/cli/` and `src/lampm/lampm_internal.h`.)
+9. **Next: ship generics PR 1 (generic structs).** Design is in `docs/RFC-generics.md`; the type-system decision it depends on is already locked.
+10. In parallel: ship GC rollout Steps 2–5 (tracked in `todo.md` Phase 5) so `examples/http_server.lamo` can be re-promoted to "official".
 
 ## Definition Of "Real Language"
 

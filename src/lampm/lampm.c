@@ -1,5 +1,6 @@
 /*
- * lampm.c — Lamo Packet Manager
+ * lampm.c — Entry point and per-subcommand handlers for the integrated
+ * Lamo package manager.
  *
  * Originally a standalone binary (LamoPacketManager/src/main.c). Now
  * compiled into the main `lamo` executable and reachable through the
@@ -21,60 +22,33 @@
  *   - Per-command help: `lamo help <command>` or `lamo <command> --help`.
  *   - ANSI color output (auto-disabled on non-TTY or with --no-color).
  *   - Better diagnostics on git/network failures.
+ *
+ * Refactor (Sprint 5): this file used to be 2400+ lines, mixing string/fs
+ * helpers, manifest parsing, lockfile parsing, git operations, and the
+ * per-subcommand handlers all in one translation unit. It now contains
+ * only:
+ *
+ *   - lampm_main / lampm_is_subcommand / lampm_configure (public API)
+ *   - install_dependency (the shared install logic used by install/update)
+ *   - all command_* handlers (init, install, update, remove, list, info,
+ *     outdated, doctor, cache, lock, why)
+ *   - print_usage / print_command_help
+ *
+ * Everything else has been split into sibling files (see lampm_internal.h
+ * for the full map). The public API in lampm.h is unchanged.
  */
 
 #define _DEFAULT_SOURCE
 #define _POSIX_C_SOURCE 200809L
 
-#include <errno.h>
-#include <stdarg.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/stat.h>
+#include "lampm_internal.h"
 
-#include "lampm.h"
-
-#ifdef _WIN32
-#include <direct.h>
-#include <io.h>
-#include <windows.h>
-#define popen _popen
-#define pclose _pclose
-#define ACCESS _access
-#define MKDIR(path) _mkdir(path)
-#define PATH_SEP '\\'
-#define IS_PATH_TTY(fd) _isatty(fd)
-#define NULL_DEVICE "NUL"
-#else
-#include <dirent.h>
-#include <limits.h>
-#include <unistd.h>
-#define ACCESS access
-#define MKDIR(path) mkdir(path, 0755)
-#define PATH_SEP '/'
-#define IS_PATH_TTY(fd) isatty(fd)
-#define NULL_DEVICE "/dev/null"
-#endif
-
-#define MANIFEST_FILE "lamo.pkg"
-#define LOCKFILE "lamo.lock"
-#define DEFAULT_PACKAGES_DIR "lamo_modules"
-
-/* ── Global options ────────────────────────────────────────────────────── */
-
-typedef struct {
-    int verbose;     /* 0 = default, 1 = verbose */
-    int quiet;       /* 0 = default, 1 = quiet (only errors) */
-    int color;       /* 1 = use ANSI color, 0 = no color */
-} Options;
-
-static Options g_opts = { 0, 0, 1 };
+/* ── Public API ────────────────────────────────────────────────────────── */
 
 void lampm_configure(int verbose, int quiet, int color) {
-    if (verbose >= 0) g_opts.verbose = verbose;
-    if (quiet >= 0) g_opts.quiet = quiet;
-    if (color >= 0) g_opts.color = color;
+    if (verbose >= 0) g_pm_verbose = verbose;
+    if (quiet >= 0) g_pm_quiet = quiet;
+    if (color >= 0) g_pm_color = color;
 }
 
 int lampm_is_subcommand(const char* name) {
@@ -93,1120 +67,10 @@ int lampm_is_subcommand(const char* name) {
     return 0;
 }
 
-/* ── ANSI color helpers ─────────────────────────────────────────────────── */
-
-#define COL_RESET   "\x1b[0m"
-#define COL_RED     "\x1b[31m"
-#define COL_GREEN   "\x1b[32m"
-#define COL_YELLOW  "\x1b[33m"
-#define COL_BLUE    "\x1b[34m"
-#define COL_CYAN    "\x1b[36m"
-#define COL_BOLD    "\x1b[1m"
-#define COL_DIM     "\x1b[2m"
-
-static const char* col(const char* code) {
-    return g_opts.color ? code : "";
-}
-
-static void info_msg(const char* fmt, ...) {
-    va_list ap;
-    if (g_opts.quiet) return;
-    va_start(ap, fmt);
-    fputs(col(COL_CYAN), stdout);
-    vfprintf(stdout, fmt, ap);
-    fputs(col(COL_RESET), stdout);
-    fputc('\n', stdout);
-    va_end(ap);
-}
-
-static void success_msg(const char* fmt, ...) {
-    va_list ap;
-    if (g_opts.quiet) return;
-    va_start(ap, fmt);
-    fputs(col(COL_GREEN), stdout);
-    vfprintf(stdout, fmt, ap);
-    fputs(col(COL_RESET), stdout);
-    fputc('\n', stdout);
-    va_end(ap);
-}
-
-static void verbose_msg(const char* fmt, ...) {
-    va_list ap;
-    if (!g_opts.verbose) return;
-    va_start(ap, fmt);
-    fputs(col(COL_DIM), stdout);
-    vfprintf(stdout, fmt, ap);
-    fputs(col(COL_RESET), stdout);
-    fputc('\n', stdout);
-    va_end(ap);
-}
-
-static void error_msg(const char* fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    fputs(col(COL_RED), stderr);
-    fputs("error: ", stderr);
-    vfprintf(stderr, fmt, ap);
-    fputs(col(COL_RESET), stderr);
-    fputc('\n', stderr);
-    va_end(ap);
-}
-
-/* ── Data types ────────────────────────────────────────────────────────── */
-
-typedef struct {
-    char* alias;
-    char* repo;     /* e.g. "owner/repo" or full URL, no @ref */
-    char* ref;      /* optional: branch/tag/commit (NULL = HEAD) */
-} Dependency;
-
-typedef struct {
-    char* name;
-    char* version;       /* project version (optional, informational) */
-    char* packages_dir;
-    Dependency* dependencies;
-    size_t dependency_count;
-    size_t dependency_capacity;
-} Manifest;
-
-typedef struct {
-    char* alias;
-    char* repo;
-    char* ref;       /* the ref recorded in the lockfile (could be HEAD or pin) */
-    char* commit;    /* the actual commit hash installed */
-} LockEntry;
-
-typedef struct {
-    LockEntry* entries;
-    size_t count;
-    size_t capacity;
-} Lockfile;
-
-/* ── Forward declarations ──────────────────────────────────────────────── */
-
-static void print_usage(const char* program_name);
-static void print_command_help(const char* program_name, const char* command);
-static void manifest_init(Manifest* manifest);
-static void manifest_free(Manifest* manifest);
-static int manifest_load(const char* path, Manifest* manifest);
-static int manifest_write(const char* path, const Manifest* manifest);
-static int manifest_add_or_update_dependency(Manifest* manifest, const char* alias,
-                                              const char* repo, const char* ref);
-static int manifest_remove_dependency(Manifest* manifest, const char* alias);
-static int manifest_find_dependency(const Manifest* manifest, const char* alias);
-static int ensure_manifest_dependency_capacity(Manifest* manifest, size_t required_count);
-static void lockfile_init(Lockfile* lock);
-static void lockfile_free(Lockfile* lock);
-static int lockfile_load(const char* path, Lockfile* lock);
-static int lockfile_write(const char* path, const Lockfile* lock);
-static int lockfile_set(Lockfile* lock, const char* alias, const char* repo,
-                         const char* ref, const char* commit);
-static const LockEntry* lockfile_find(const Lockfile* lock, const char* alias);
-static char* duplicate_string(const char* value);
-static char* trim_whitespace(char* value);
-static char* strip_optional_quotes(char* value);
-static int split_key_value(char* line, char** key, char** value);
-static int file_exists(const char* path);
-static int directory_exists(const char* path);
-static int ensure_directory(const char* path);
-static int remove_directory_recursive(const char* path);
-static char* join_path(const char* base, const char* leaf);
-static char* current_directory_name(void);
-static int parse_repo_spec(const char* raw, char** out_repo, char** out_ref);
-static char* repo_clone_url(const char* repo);
-static char* default_alias_from_repo(const char* repo);
-static int run_command(const char* command);
-static char* capture_command_output(const char* command);
-static char* git_head_commit(const char* directory);
-static int git_checkout(const char* directory, const char* ref);
-static int install_dependency(const Manifest* manifest, const Dependency* dependency,
-                               Lockfile* lock);
-static int command_init(int argc, char** argv);
-static int command_install(int argc, char** argv);
-static int command_update(int argc, char** argv);
-static int command_remove(int argc, char** argv);
-static int command_list(int argc, char** argv);
-static int command_info(int argc, char** argv);
-static int command_outdated(int argc, char** argv);
-static int command_doctor(int argc, char** argv);
-static int command_cache(int argc, char** argv);
-static int command_lock(int argc, char** argv);
-static int command_why(int argc, char** argv);
-
-/* ── String / path helpers ──────────────────────────────────────────────── */
-
-static char* duplicate_string(const char* value) {
-    size_t length;
-    char* copy;
-
-    if (!value) {
-        return NULL;
-    }
-
-    length = strlen(value);
-    copy = malloc(length + 1);
-    if (!copy) {
-        return NULL;
-    }
-
-    memcpy(copy, value, length + 1);
-    return copy;
-}
-
-static char* trim_whitespace(char* value) {
-    char* end;
-
-    while (*value == ' ' || *value == '\t' || *value == '\r' || *value == '\n') {
-        value++;
-    }
-
-    end = value + strlen(value);
-    while (end > value && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r' || end[-1] == '\n')) {
-        end--;
-    }
-
-    *end = '\0';
-    return value;
-}
-
-static char* strip_optional_quotes(char* value) {
-    size_t length = strlen(value);
-
-    if (length >= 2 && value[0] == '"' && value[length - 1] == '"') {
-        value[length - 1] = '\0';
-        return value + 1;
-    }
-
-    return value;
-}
-
-static int split_key_value(char* line, char** key, char** value) {
-    char* separator = strchr(line, '=');
-
-    if (!separator) {
-        return 0;
-    }
-
-    *separator = '\0';
-    *key = trim_whitespace(line);
-    *value = strip_optional_quotes(trim_whitespace(separator + 1));
-    return 1;
-}
-
-static int file_exists(const char* path) {
-    return ACCESS(path, 0) == 0;
-}
-
-static int directory_exists(const char* path) {
-    struct stat info;
-
-    if (stat(path, &info) != 0) {
-        return 0;
-    }
-
-    return (info.st_mode & S_IFDIR) != 0;
-}
-
-static int ensure_directory(const char* path) {
-    if (directory_exists(path)) {
-        return 1;
-    }
-
-    if (MKDIR(path) == 0) {
-        return 1;
-    }
-
-    error_msg("failed to create directory %s: %s", path, strerror(errno));
-    return 0;
-}
-
-static char* join_path(const char* base, const char* leaf) {
-    size_t base_length = strlen(base);
-    size_t leaf_length = strlen(leaf);
-    int needs_separator = base_length > 0 && base[base_length - 1] != '/' && base[base_length - 1] != '\\';
-    char* joined = malloc(base_length + (size_t)needs_separator + leaf_length + 1);
-
-    if (!joined) {
-        return NULL;
-    }
-
-    memcpy(joined, base, base_length);
-    if (needs_separator) {
-        joined[base_length++] = PATH_SEP;
-    }
-    memcpy(joined + base_length, leaf, leaf_length);
-    joined[base_length + leaf_length] = '\0';
-    return joined;
-}
-
-static char* current_directory_name(void) {
-    char buffer[4096];
-    char* separator;
-
-#ifdef _WIN32
-    if (!_getcwd(buffer, sizeof(buffer))) {
-#else
-    if (!getcwd(buffer, sizeof(buffer))) {
-#endif
-        return duplicate_string("lamo-project");
-    }
-
-    separator = strrchr(buffer, '\\');
-    if (!separator) {
-        separator = strrchr(buffer, '/');
-    }
-
-    if (!separator || !separator[1]) {
-        return duplicate_string(buffer);
-    }
-
-    return duplicate_string(separator + 1);
-}
-
-/* ── Manifest ──────────────────────────────────────────────────────────── */
-
-static void manifest_init(Manifest* manifest) {
-    memset(manifest, 0, sizeof(*manifest));
-}
-
-static void manifest_free(Manifest* manifest) {
-    size_t i;
-
-    free(manifest->name);
-    free(manifest->version);
-    free(manifest->packages_dir);
-
-    for (i = 0; i < manifest->dependency_count; i++) {
-        free(manifest->dependencies[i].alias);
-        free(manifest->dependencies[i].repo);
-        free(manifest->dependencies[i].ref);
-    }
-
-    free(manifest->dependencies);
-    manifest_init(manifest);
-}
-
-static int ensure_manifest_dependency_capacity(Manifest* manifest, size_t required_count) {
-    Dependency* resized;
-    size_t new_capacity;
-
-    if (required_count <= manifest->dependency_capacity) {
-        return 1;
-    }
-
-    new_capacity = manifest->dependency_capacity > 0 ? manifest->dependency_capacity * 2 : 4;
-    while (new_capacity < required_count) {
-        new_capacity *= 2;
-    }
-
-    resized = realloc(manifest->dependencies, sizeof(Dependency) * new_capacity);
-    if (!resized) {
-        return 0;
-    }
-
-    manifest->dependencies = resized;
-    manifest->dependency_capacity = new_capacity;
-    return 1;
-}
-
-static int manifest_find_dependency(const Manifest* manifest, const char* alias) {
-    size_t i;
-
-    for (i = 0; i < manifest->dependency_count; i++) {
-        if (strcmp(manifest->dependencies[i].alias, alias) == 0) {
-            return (int)i;
-        }
-    }
-
-    return -1;
-}
-
-static int manifest_add_or_update_dependency(Manifest* manifest, const char* alias,
-                                              const char* repo, const char* ref) {
-    int index = manifest_find_dependency(manifest, alias);
-    char* repo_copy;
-    char* ref_copy;
-
-    if (index >= 0) {
-        repo_copy = duplicate_string(repo);
-        ref_copy = ref ? duplicate_string(ref) : NULL;
-        if (!repo_copy || (ref && !ref_copy)) {
-            free(repo_copy);
-            free(ref_copy);
-            return 0;
-        }
-
-        free(manifest->dependencies[index].repo);
-        free(manifest->dependencies[index].ref);
-        manifest->dependencies[index].repo = repo_copy;
-        manifest->dependencies[index].ref = ref_copy;
-        return 1;
-    }
-
-    if (!ensure_manifest_dependency_capacity(manifest, manifest->dependency_count + 1)) {
-        return 0;
-    }
-
-    {
-        Dependency* d = &manifest->dependencies[manifest->dependency_count];
-        d->alias = duplicate_string(alias);
-        d->repo = duplicate_string(repo);
-        d->ref = ref ? duplicate_string(ref) : NULL;
-        if (!d->alias || !d->repo || (ref && !d->ref)) {
-            free(d->alias);
-            free(d->repo);
-            free(d->ref);
-            d->alias = NULL;
-            d->repo = NULL;
-            d->ref = NULL;
-            return 0;
-        }
-    }
-
-    manifest->dependency_count++;
-    return 1;
-}
-
-static int manifest_remove_dependency(Manifest* manifest, const char* alias) {
-    int index = manifest_find_dependency(manifest, alias);
-    size_t i;
-
-    if (index < 0) {
-        return 0;
-    }
-
-    free(manifest->dependencies[index].alias);
-    free(manifest->dependencies[index].repo);
-    free(manifest->dependencies[index].ref);
-
-    for (i = (size_t)index; i + 1 < manifest->dependency_count; i++) {
-        manifest->dependencies[i] = manifest->dependencies[i + 1];
-    }
-
-    manifest->dependency_count--;
-    return 1;
-}
-
-/* Manifest line syntax: alias = repo[@ref]
- * The @ref part is split off here so callers see a clean (repo, ref) pair. */
-static int manifest_parse_dependency_value(char* value, char** out_repo, char** out_ref) {
-    char* at = strchr(value, '@');
-
-    if (at) {
-        *at = '\0';
-        *out_repo = trim_whitespace(value);
-        *out_ref = trim_whitespace(at + 1);
-        if (**out_ref == '\0') {
-            *out_ref = NULL;
-        }
-    } else {
-        *out_repo = trim_whitespace(value);
-        *out_ref = NULL;
-    }
-
-    return 1;
-}
-
-static int manifest_load(const char* path, Manifest* manifest) {
-    FILE* file = fopen(path, "r");
-    char line[2048];
-    int in_dependencies = 0;
-
-    if (!file) {
-        error_msg("failed to open %s: %s", path, strerror(errno));
-        return 0;
-    }
-
-    manifest_init(manifest);
-
-    while (fgets(line, sizeof(line), file)) {
-        char* trimmed = trim_whitespace(line);
-        char* key;
-        char* value;
-
-        if (*trimmed == '\0' || *trimmed == '#') {
-            continue;
-        }
-
-        if (strcmp(trimmed, "[dependencies]") == 0) {
-            in_dependencies = 1;
-            continue;
-        }
-
-        if (*trimmed == '[') {
-            in_dependencies = 0;
-            continue;
-        }
-
-        if (!split_key_value(trimmed, &key, &value)) {
-            error_msg("invalid manifest line: %s", trimmed);
-            fclose(file);
-            manifest_free(manifest);
-            return 0;
-        }
-
-        if (in_dependencies) {
-            char* repo;
-            char* ref;
-            if (!manifest_parse_dependency_value(value, &repo, &ref)) {
-                error_msg("failed to parse dependency value: %s", value);
-                fclose(file);
-                manifest_free(manifest);
-                return 0;
-            }
-            if (!manifest_add_or_update_dependency(manifest, key, repo, ref)) {
-                error_msg("failed to load dependency from manifest");
-                fclose(file);
-                manifest_free(manifest);
-                return 0;
-            }
-        } else if (strcmp(key, "name") == 0) {
-            free(manifest->name);
-            manifest->name = duplicate_string(value);
-        } else if (strcmp(key, "version") == 0) {
-            free(manifest->version);
-            manifest->version = duplicate_string(value);
-        } else if (strcmp(key, "packages_dir") == 0) {
-            free(manifest->packages_dir);
-            manifest->packages_dir = duplicate_string(value);
-        }
-        /* Unknown keys are silently ignored to allow forward-compatible manifests. */
-    }
-
-    fclose(file);
-
-    if (!manifest->name) {
-        manifest->name = duplicate_string("lamo-project");
-    }
-
-    if (!manifest->packages_dir) {
-        manifest->packages_dir = duplicate_string(DEFAULT_PACKAGES_DIR);
-    }
-
-    if (!manifest->name || !manifest->packages_dir) {
-        manifest_free(manifest);
-        return 0;
-    }
-
-    return 1;
-}
-
-static int manifest_write(const char* path, const Manifest* manifest) {
-    FILE* file = fopen(path, "w");
-    size_t i;
-
-    if (!file) {
-        error_msg("failed to write %s: %s", path, strerror(errno));
-        return 0;
-    }
-
-    fprintf(file, "# Lamo package manifest. Edit by hand or use `lampm install/remove`.\n");
-    fprintf(file, "name = %s\n", manifest->name ? manifest->name : "lamo-project");
-    if (manifest->version) {
-        fprintf(file, "version = %s\n", manifest->version);
-    }
-    fprintf(file, "packages_dir = %s\n\n",
-            manifest->packages_dir ? manifest->packages_dir : DEFAULT_PACKAGES_DIR);
-    fprintf(file, "[dependencies]\n");
-
-    for (i = 0; i < manifest->dependency_count; i++) {
-        if (manifest->dependencies[i].ref) {
-            fprintf(file, "%s = %s@%s\n",
-                    manifest->dependencies[i].alias,
-                    manifest->dependencies[i].repo,
-                    manifest->dependencies[i].ref);
-        } else {
-            fprintf(file, "%s = %s\n",
-                    manifest->dependencies[i].alias,
-                    manifest->dependencies[i].repo);
-        }
-    }
-
-    fclose(file);
-    return 1;
-}
-
-/* ── Lockfile ──────────────────────────────────────────────────────────── */
-
-static void lockfile_init(Lockfile* lock) {
-    memset(lock, 0, sizeof(*lock));
-}
-
-static void lockfile_free(Lockfile* lock) {
-    size_t i;
-    for (i = 0; i < lock->count; i++) {
-        free(lock->entries[i].alias);
-        free(lock->entries[i].repo);
-        free(lock->entries[i].ref);
-        free(lock->entries[i].commit);
-    }
-    free(lock->entries);
-    lockfile_init(lock);
-}
-
-static int lockfile_ensure_capacity(Lockfile* lock, size_t required) {
-    LockEntry* resized;
-    size_t new_capacity;
-
-    if (required <= lock->capacity) {
-        return 1;
-    }
-
-    new_capacity = lock->capacity > 0 ? lock->capacity * 2 : 4;
-    while (new_capacity < required) {
-        new_capacity *= 2;
-    }
-
-    resized = realloc(lock->entries, sizeof(LockEntry) * new_capacity);
-    if (!resized) {
-        return 0;
-    }
-    lock->entries = resized;
-    lock->capacity = new_capacity;
-    return 1;
-}
-
-static const LockEntry* lockfile_find(const Lockfile* lock, const char* alias) {
-    size_t i;
-    for (i = 0; i < lock->count; i++) {
-        if (strcmp(lock->entries[i].alias, alias) == 0) {
-            return &lock->entries[i];
-        }
-    }
-    return NULL;
-}
-
-static int lockfile_set(Lockfile* lock, const char* alias, const char* repo,
-                         const char* ref, const char* commit) {
-    LockEntry* entry = NULL;
-    size_t i;
-    char* repo_copy;
-    char* ref_copy;
-    char* commit_copy;
-
-    for (i = 0; i < lock->count; i++) {
-        if (strcmp(lock->entries[i].alias, alias) == 0) {
-            entry = &lock->entries[i];
-            break;
-        }
-    }
-
-    repo_copy = duplicate_string(repo);
-    ref_copy = ref ? duplicate_string(ref) : duplicate_string("HEAD");
-    commit_copy = commit ? duplicate_string(commit) : NULL;
-
-    if (!repo_copy || !ref_copy || (commit && !commit_copy)) {
-        free(repo_copy);
-        free(ref_copy);
-        free(commit_copy);
-        return 0;
-    }
-
-    if (entry) {
-        free(entry->repo);
-        free(entry->ref);
-        free(entry->commit);
-        entry->repo = repo_copy;
-        entry->ref = ref_copy;
-        entry->commit = commit_copy;
-        return 1;
-    }
-
-    if (!lockfile_ensure_capacity(lock, lock->count + 1)) {
-        free(repo_copy);
-        free(ref_copy);
-        free(commit_copy);
-        return 0;
-    }
-
-    entry = &lock->entries[lock->count++];
-    entry->alias = duplicate_string(alias);
-    entry->repo = repo_copy;
-    entry->ref = ref_copy;
-    entry->commit = commit_copy;
-    return entry->alias != NULL;
-}
-
-static int lockfile_load(const char* path, Lockfile* lock) {
-    FILE* file = fopen(path, "r");
-    char line[2048];
-
-    lockfile_init(lock);
-    if (!file) {
-        return 0;
-    }
-
-    while (fgets(line, sizeof(line), file)) {
-        char* trimmed = trim_whitespace(line);
-        char* key;
-        char* value;
-        char* at;
-        char* ref_start;
-        char* commit_start;
-
-        if (*trimmed == '\0' || *trimmed == '#') {
-            continue;
-        }
-
-        if (!split_key_value(trimmed, &key, &value)) {
-            continue;
-        }
-
-        /* Format: alias = repo @ ref : commit
-         * All of ref/commit are optional; only repo is required. */
-        at = strchr(value, '@');
-        if (at) {
-            *at = '\0';
-            ref_start = trim_whitespace(at + 1);
-        } else {
-            ref_start = NULL;
-        }
-
-        commit_start = strchr(ref_start ? ref_start : value, ':');
-        if (commit_start) {
-            *commit_start = '\0';
-            commit_start = trim_whitespace(commit_start + 1);
-        }
-
-        {
-            char* repo = trim_whitespace(value);
-            char* ref = ref_start;
-            char* commit = commit_start;
-            lockfile_set(lock, key, repo, ref, commit);
-        }
-    }
-
-    fclose(file);
-    return 1;
-}
-
-static int lockfile_write(const char* path, const Lockfile* lock) {
-    FILE* file = fopen(path, "w");
-    size_t i;
-
-    if (!file) {
-        error_msg("failed to write %s: %s", path, strerror(errno));
-        return 0;
-    }
-
-    fprintf(file, "# Lamo lockfile. Auto-generated by `lampm`. Do not edit by hand.\n");
-    fprintf(file, "# Records the exact commit hash installed for each dependency,\n");
-    fprintf(file, "# so `lampm install` (no args) reproduces the same checkout.\n");
-
-    for (i = 0; i < lock->count; i++) {
-        fprintf(file, "%s = %s @ %s",
-                lock->entries[i].alias,
-                lock->entries[i].repo,
-                lock->entries[i].ref ? lock->entries[i].ref : "HEAD");
-        if (lock->entries[i].commit) {
-            fprintf(file, " : %s", lock->entries[i].commit);
-        }
-        fprintf(file, "\n");
-    }
-
-    fclose(file);
-    return 1;
-}
-
-/* ── Repository spec parsing ────────────────────────────────────────────── */
-
-/* parse_repo_spec: accept any of:
- *   owner/repo
- *   owner/repo@ref
- *   github.com/owner/repo
- *   github.com/owner/repo@ref
- *   https://github.com/owner/repo[.git]
- *   https://gitlab.com/owner/repo[.git]
- *   https://bitbucket.org/owner/repo[.git]
- *   git+https://host/path[.git]
- *   git@host:path[.git]
- *
- * On success, *out_repo holds the canonical repo string (with @ref removed)
- * and *out_ref holds the ref (or NULL). Both are heap-allocated; caller frees.
- */
-static int parse_repo_spec(const char* raw, char** out_repo, char** out_ref) {
-    const char* at;
-    const char* ref;
-    char* repo;
-    size_t repo_len;
-    const char* prefix_https = "https://";
-    const char* prefix_git_https = "git+https://";
-    const char* prefix_git_ssh = "git+ssh://";
-    const char* github = "github.com/";
-    const char* gitlab = "gitlab.com/";
-    const char* bitbucket = "bitbucket.org/";
-
-    if (!raw || !*raw) {
-        return 0;
-    }
-
-    /* Split off @ref (but careful: git@host:path also has an @, so only treat
-     * @ as a ref separator when it appears AFTER a path separator or slash). */
-    at = NULL;
-    if (strncmp(raw, "git@", 4) == 0) {
-        /* git@host:path.git@ref — the second @ is the ref. */
-        const char* p = raw + 4;
-        while (*p && *p != ':' && *p != '/') p++;
-        if (*p) {
-            p++;
-            while (*p && *p != '@') p++;
-            if (*p == '@') at = p;
-        }
-    } else {
-        at = strchr(raw, '@');
-    }
-
-    if (at) {
-        repo_len = (size_t)(at - raw);
-        ref = at + 1;
-        if (!*ref) {
-            ref = NULL;
-        }
-    } else {
-        repo_len = strlen(raw);
-        ref = NULL;
-    }
-
-    repo = malloc(repo_len + 1);
-    if (!repo) {
-        return 0;
-    }
-    memcpy(repo, raw, repo_len);
-    repo[repo_len] = '\0';
-
-    /* Strip a trailing .git (we'll re-add it when constructing the clone URL). */
-    if (repo_len > 4 && strcmp(repo + repo_len - 4, ".git") == 0) {
-        repo[repo_len - 4] = '\0';
-    }
-
-    /* If the user passed `owner/repo` (no scheme, no host), default to GitHub. */
-    if (strncmp(repo, prefix_https, strlen(prefix_https)) != 0 &&
-        strncmp(repo, prefix_git_https, strlen(prefix_git_https)) != 0 &&
-        strncmp(repo, prefix_git_ssh, strlen(prefix_git_ssh)) != 0 &&
-        strncmp(repo, "git@", 4) != 0 &&
-        strstr(repo, "github.com/") != repo &&
-        strstr(repo, "gitlab.com/") != repo &&
-        strstr(repo, "bitbucket.org/") != repo) {
-        /* No scheme — assume GitHub shorthand owner/repo. */
-        if (!strchr(repo, '/')) {
-            error_msg("invalid repository spec `%s`: expected owner/repo or a full git URL", raw);
-            free(repo);
-            return 0;
-        }
-        /* Already in canonical owner/repo form. */
-    } else {
-        /* Has a scheme/host — strip down to host/path for storage. */
-        char* stripped = repo;
-        if (strncmp(stripped, prefix_https, strlen(prefix_https)) == 0) {
-            stripped += strlen(prefix_https);
-        } else if (strncmp(stripped, prefix_git_https, strlen(prefix_git_https)) == 0) {
-            stripped += strlen(prefix_git_https);
-        } else if (strncmp(stripped, prefix_git_ssh, strlen(prefix_git_ssh)) == 0) {
-            stripped += strlen(prefix_git_ssh);
-        }
-        /* git@host:path → host/path */
-        if (strncmp(stripped, "git@", 4) == 0) {
-            char* colon = strchr(stripped, ':');
-            if (colon) {
-                memmove(stripped, stripped + 4, (size_t)(colon - stripped) - 4 + 1);
-                /* Now stripped looks like host:path, replace : with / */
-                stripped[colon - stripped - 4] = '/';
-            }
-        }
-
-        /* Move the stripped version to a fresh allocation so the caller can
-         * always free *out_repo. */
-        {
-            char* canonical = duplicate_string(stripped);
-            free(repo);
-            repo = canonical;
-        }
-    }
-
-    (void)github; (void)gitlab; (void)bitbucket;
-
-    *out_repo = repo;
-    *out_ref = ref ? duplicate_string(ref) : NULL;
-    return 1;
-}
-
-static char* repo_clone_url(const char* repo) {
-    /* repo is in canonical form: either "owner/repo" (GitHub shorthand) or
-     * "host/path". Construct the HTTPS clone URL. The shorthand needs
-     * github.com prepended; the full form already has the host. */
-    const char* prefix_https = "https://";
-    const char* github_host = "github.com/";
-    const char* suffix = ".git";
-    size_t length;
-    char* clone_url;
-    int need_host = 0;
-
-    /* If repo is just "owner/repo" (single slash, no scheme/host), we need
-     * to prepend github.com/. Heuristic: if the first segment before the
-     * first slash contains a '.', it's a host (e.g. "gitlab.com/..."); else
-     * it's an owner name and we default to GitHub. */
-    {
-        const char* first_slash = strchr(repo, '/');
-        if (first_slash) {
-            size_t first_seg_len = (size_t)(first_slash - repo);
-            int has_dot = 0;
-            size_t i;
-            for (i = 0; i < first_seg_len; i++) {
-                if (repo[i] == '.') {
-                    has_dot = 1;
-                    break;
-                }
-            }
-            if (!has_dot) {
-                need_host = 1;
-            }
-        }
-    }
-
-    length = strlen(prefix_https) +
-             (need_host ? strlen(github_host) : 0) +
-             strlen(repo) + strlen(suffix);
-    clone_url = malloc(length + 1);
-    if (!clone_url) {
-        return NULL;
-    }
-
-    if (need_host) {
-        sprintf(clone_url, "%s%s%s%s", prefix_https, github_host, repo, suffix);
-    } else {
-        sprintf(clone_url, "%s%s%s", prefix_https, repo, suffix);
-    }
-    return clone_url;
-}
-
-static char* default_alias_from_repo(const char* repo) {
-    /* repo is "owner/repo" or "host/path/.../repo" — take the last component. */
-    const char* slash = strrchr(repo, '/');
-    const char* name = slash ? slash + 1 : repo;
-
-    /* Strip a lamo- prefix if present, for nicer default aliases. */
-    if (strncmp(name, "lamo-", 5) == 0) {
-        return duplicate_string(name + 5);
-    }
-
-    return duplicate_string(name);
-}
-
-/* ── Command execution ──────────────────────────────────────────────────── */
-
-static int run_command(const char* command) {
-    int result = system(command);
-
-    if (result != 0) {
-        error_msg("command failed (exit %d): %s", result, command);
-        return 0;
-    }
-
-    return 1;
-}
-
-static char* capture_command_output(const char* command) {
-    FILE* pipe = popen(command, "r");
-    char buffer[256];
-    char* output = NULL;
-    size_t output_length = 0;
-
-    if (!pipe) {
-        return NULL;
-    }
-
-    while (fgets(buffer, sizeof(buffer), pipe)) {
-        size_t chunk_length = strlen(buffer);
-        char* resized = realloc(output, output_length + chunk_length + 1);
-        if (!resized) {
-            free(output);
-            pclose(pipe);
-            return NULL;
-        }
-
-        output = resized;
-        memcpy(output + output_length, buffer, chunk_length);
-        output_length += chunk_length;
-        output[output_length] = '\0';
-    }
-
-    pclose(pipe);
-
-    return output;
-}
-
-/* git_head_commit: returns the short SHA of HEAD in `directory`, or NULL. */
-static char* git_head_commit(const char* directory) {
-    char command[4096];
-    char* output;
-    char* trimmed;
-
-    /* NULL_DEVICE is "/dev/null" on POSIX, "NUL" on Windows. Using it
-     * instead of the old `2>nul` Windows-ism fixes a real bug: the previous
-     * code wrote a file literally named `nul` on Linux when git emitted
-     * warnings to stderr. */
-    snprintf(command, sizeof(command),
-             "git -C \"%s\" rev-parse --short HEAD 2>%s",
-             directory, NULL_DEVICE);
-    output = capture_command_output(command);
-    if (!output) {
-        return NULL;
-    }
-
-    trimmed = trim_whitespace(output);
-    if (*trimmed == '\0') {
-        free(output);
-        return NULL;
-    }
-
-    {
-        char* commit = duplicate_string(trimmed);
-        free(output);
-        return commit;
-    }
-}
-
-/* git_resolve_ref: returns the short SHA of `ref` in `directory`. */
-#if 0
-static char* git_resolve_ref(const char* directory, const char* ref) {
-    char command[4096];
-    char* output;
-    char* trimmed;
-
-    snprintf(command, sizeof(command),
-             "git -C \"%s\" rev-parse --short %s 2>%s",
-             directory, ref, NULL_DEVICE);
-    output = capture_command_output(command);
-    if (!output) {
-        return NULL;
-    }
-
-    trimmed = trim_whitespace(output);
-    if (*trimmed == '\0') {
-        free(output);
-        return NULL;
-    }
-
-    {
-        char* commit = duplicate_string(trimmed);
-        free(output);
-        return commit;
-    }
-}
-#endif
-
-static int git_checkout(const char* directory, const char* ref) {
-    char command[4096];
-
-    snprintf(command, sizeof(command),
-             "git -C \"%s\" checkout %s 2>%s",
-             directory, ref, NULL_DEVICE);
-    return run_command(command);
-}
-
-/* ── Directory removal (cross-platform) ─────────────────────────────────── */
-
-#ifdef _WIN32
-static int remove_directory_recursive(const char* path) {
-    WIN32_FIND_DATAA entry;
-    HANDLE handle;
-    char pattern[4096];
-
-    snprintf(pattern, sizeof(pattern), "%s\\*", path);
-    handle = FindFirstFileA(pattern, &entry);
-    if (handle == INVALID_HANDLE_VALUE) {
-        return RemoveDirectoryA(path) != 0;
-    }
-
-    do {
-        char* child_path;
-
-        if (strcmp(entry.cFileName, ".") == 0 || strcmp(entry.cFileName, "..") == 0) {
-            continue;
-        }
-
-        child_path = join_path(path, entry.cFileName);
-        if (!child_path) {
-            FindClose(handle);
-            return 0;
-        }
-
-        if (entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            SetFileAttributesA(child_path, FILE_ATTRIBUTE_NORMAL);
-            if (!remove_directory_recursive(child_path)) {
-                free(child_path);
-                FindClose(handle);
-                return 0;
-            }
-        } else {
-            SetFileAttributesA(child_path, FILE_ATTRIBUTE_NORMAL);
-            if (!DeleteFileA(child_path)) {
-                free(child_path);
-                FindClose(handle);
-                return 0;
-            }
-        }
-
-        free(child_path);
-    } while (FindNextFileA(handle, &entry));
-
-    FindClose(handle);
-    SetFileAttributesA(path, FILE_ATTRIBUTE_NORMAL);
-    return RemoveDirectoryA(path) != 0;
-}
-#else
-static int remove_directory_recursive(const char* path) {
-    DIR* directory = opendir(path);
-    struct dirent* entry;
-
-    if (!directory) {
-        return rmdir(path) == 0;
-    }
-
-    while ((entry = readdir(directory)) != NULL) {
-        char* child_path;
-        struct stat info;
-
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
-            continue;
-        }
-
-        child_path = join_path(path, entry->d_name);
-        if (!child_path) {
-            closedir(directory);
-            return 0;
-        }
-
-        if (stat(child_path, &info) != 0) {
-            free(child_path);
-            closedir(directory);
-            return 0;
-        }
-
-        if (S_ISDIR(info.st_mode)) {
-            if (!remove_directory_recursive(child_path)) {
-                free(child_path);
-                closedir(directory);
-                return 0;
-            }
-        } else if (unlink(child_path) != 0) {
-            free(child_path);
-            closedir(directory);
-            return 0;
-        }
-
-        free(child_path);
-    }
-
-    closedir(directory);
-    return rmdir(path) == 0;
-}
-#endif
-
 /* ── Install ───────────────────────────────────────────────────────────── */
 
-static int install_dependency(const Manifest* manifest, const Dependency* dependency,
-                               Lockfile* lock) {
+int install_dependency(const Manifest* manifest, const Dependency* dependency,
+                       Lockfile* lock) {
     char* install_dir;
     char* clone_url;
     char command[4096];
@@ -1328,7 +192,7 @@ static int install_dependency(const Manifest* manifest, const Dependency* depend
 
 /* ── Commands ──────────────────────────────────────────────────────────── */
 
-static int command_init(int argc, char** argv) {
+int command_init(int argc, char** argv) {
     Manifest manifest;
     const char* project_name = NULL;
     char* gitignore_path = NULL;
@@ -1339,7 +203,7 @@ static int command_init(int argc, char** argv) {
 
     for (i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            print_command_help(argv[0], "init");
+            lampm_print_command_help(argv[0], "init");
             return 0;
         }
         if (argv[i][0] == '-') {
@@ -1360,9 +224,9 @@ static int command_init(int argc, char** argv) {
     }
 
     manifest_init(&manifest);
-    manifest.name = project_name ? duplicate_string(project_name) : current_directory_name();
-    manifest.version = duplicate_string("0.1.0");
-    manifest.packages_dir = duplicate_string(DEFAULT_PACKAGES_DIR);
+    manifest.name = project_name ? lampm_duplicate_string(project_name) : current_directory_name();
+    manifest.version = lampm_duplicate_string("0.1.0");
+    manifest.packages_dir = lampm_duplicate_string(DEFAULT_PACKAGES_DIR);
 
     if (!manifest.name || !manifest.packages_dir) {
         manifest_free(&manifest);
@@ -1380,7 +244,7 @@ static int command_init(int argc, char** argv) {
     }
 
     /* Write a .gitignore if one doesn't already exist. */
-    gitignore_path = duplicate_string(".gitignore");
+    gitignore_path = lampm_duplicate_string(".gitignore");
     if (!file_exists(gitignore_path)) {
         gi = fopen(gitignore_path, "w");
         if (gi) {
@@ -1395,7 +259,7 @@ static int command_init(int argc, char** argv) {
     }
 
     /* Scaffold a minimal main.lamo if the directory looks empty. */
-    main_path = duplicate_string("main.lamo");
+    main_path = lampm_duplicate_string("main.lamo");
     if (!file_exists(main_path)) {
         mainf = fopen(main_path, "w");
         if (mainf) {
@@ -1425,7 +289,7 @@ static int command_init(int argc, char** argv) {
     return 0;
 }
 
-static int command_install(int argc, char** argv) {
+int command_install(int argc, char** argv) {
     Manifest manifest;
     Lockfile lock;
     int status = 0;
@@ -1434,7 +298,7 @@ static int command_install(int argc, char** argv) {
 
     for (i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            print_command_help(argv[0], "install");
+            lampm_print_command_help(argv[0], "install");
             return 0;
         }
         if (argv[i][0] == '-') {
@@ -1467,7 +331,7 @@ static int command_install(int argc, char** argv) {
             return 1;
         }
 
-        alias = argc >= 4 ? duplicate_string(argv[3]) : default_alias_from_repo(repo);
+        alias = argc >= 4 ? lampm_duplicate_string(argv[3]) : default_alias_from_repo(repo);
         if (!alias) {
             free(repo);
             free(ref);
@@ -1539,7 +403,7 @@ static int command_install(int argc, char** argv) {
     return status;
 }
 
-static int command_update(int argc, char** argv) {
+int command_update(int argc, char** argv) {
     /* update [alias] — pull latest HEAD for one dep or all deps, ignoring
      * any locked commit. Updates the lockfile afterwards. */
     Manifest manifest;
@@ -1549,7 +413,7 @@ static int command_update(int argc, char** argv) {
 
     for (i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            print_command_help(argv[0], "update");
+            lampm_print_command_help(argv[0], "update");
             return 0;
         }
         if (argv[i][0] == '-') {
@@ -1618,14 +482,14 @@ static int command_update(int argc, char** argv) {
     return status;
 }
 
-static int command_remove(int argc, char** argv) {
+int command_remove(int argc, char** argv) {
     Manifest manifest;
     char* install_dir;
     int i;
 
     for (i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            print_command_help(argv[0], "remove");
+            lampm_print_command_help(argv[0], "remove");
             return 0;
         }
         if (argv[i][0] == '-') {
@@ -1681,14 +545,14 @@ static int command_remove(int argc, char** argv) {
     return 0;
 }
 
-static int command_list(int argc, char** argv) {
+int command_list(int argc, char** argv) {
     Manifest manifest;
     Lockfile lock;
     size_t i;
 
     for (i = 2; i < (size_t)argc; i++) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            print_command_help(argv[0], "list");
+            lampm_print_command_help(argv[0], "list");
             return 0;
         }
     }
@@ -1756,7 +620,7 @@ static int command_list(int argc, char** argv) {
     return 0;
 }
 
-static int command_info(int argc, char** argv) {
+int command_info(int argc, char** argv) {
     Manifest manifest;
     Lockfile lock;
     int index;
@@ -1768,7 +632,7 @@ static int command_info(int argc, char** argv) {
 
     for (i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            print_command_help(argv[0], "info");
+            lampm_print_command_help(argv[0], "info");
             return 0;
         }
         if (argv[i][0] == '-') {
@@ -1823,7 +687,7 @@ static int command_info(int argc, char** argv) {
             if (out) {
                 char* trimmed = trim_whitespace(out);
                 if (*trimmed) {
-                    branch = duplicate_string(trimmed);
+                    branch = lampm_duplicate_string(trimmed);
                 }
                 free(out);
             }
@@ -1837,7 +701,7 @@ static int command_info(int argc, char** argv) {
             if (out) {
                 char* trimmed = trim_whitespace(out);
                 if (*trimmed) {
-                    remote = duplicate_string(trimmed);
+                    remote = lampm_duplicate_string(trimmed);
                 }
                 free(out);
             }
@@ -1872,7 +736,7 @@ static int command_info(int argc, char** argv) {
     return 0;
 }
 
-static int command_outdated(int argc, char** argv) {
+int command_outdated(int argc, char** argv) {
     /* outdated: for each installed dep, compare local HEAD vs origin HEAD. */
     Manifest manifest;
     size_t i;
@@ -1881,7 +745,7 @@ static int command_outdated(int argc, char** argv) {
 
     for (j = 2; j < argc; j++) {
         if (strcmp(argv[j], "--help") == 0 || strcmp(argv[j], "-h") == 0) {
-            print_command_help(argv[0], "outdated");
+            lampm_print_command_help(argv[0], "outdated");
             return 0;
         }
     }
@@ -1930,7 +794,7 @@ static int command_outdated(int argc, char** argv) {
             if (out) {
                 char* trimmed = trim_whitespace(out);
                 if (*trimmed) {
-                    remote = duplicate_string(trimmed);
+                    remote = lampm_duplicate_string(trimmed);
                 }
                 free(out);
             }
@@ -1960,14 +824,14 @@ static int command_outdated(int argc, char** argv) {
     return found_outdated ? 0 : 0;  /* exit 0 either way; this is informational */
 }
 
-static int command_doctor(int argc, char** argv) {
+int command_doctor(int argc, char** argv) {
     /* doctor: verify environment is set up correctly. */
     int problems = 0;
     int j;
 
     for (j = 2; j < argc; j++) {
         if (strcmp(argv[j], "--help") == 0 || strcmp(argv[j], "-h") == 0) {
-            print_command_help(argv[0], "doctor");
+            lampm_print_command_help(argv[0], "doctor");
             return 0;
         }
     }
@@ -2051,7 +915,7 @@ static int command_doctor(int argc, char** argv) {
     }
 }
 
-static int command_cache(int argc, char** argv) {
+int command_cache(int argc, char** argv) {
     /* cache clean: remove the packages_dir.
      * cache list: list contents of packages_dir. */
     Manifest manifest;
@@ -2059,7 +923,7 @@ static int command_cache(int argc, char** argv) {
 
     for (j = 2; j < argc; j++) {
         if (strcmp(argv[j], "--help") == 0 || strcmp(argv[j], "-h") == 0) {
-            print_command_help(argv[0], "cache");
+            lampm_print_command_help(argv[0], "cache");
             return 0;
         }
         if (argv[j][0] == '-') {
@@ -2070,7 +934,7 @@ static int command_cache(int argc, char** argv) {
     }
 
     if (argc < 3) {
-        print_command_help(argv[0], "cache");
+        lampm_print_command_help(argv[0], "cache");
         return 1;
     }
 
@@ -2147,7 +1011,7 @@ static int command_cache(int argc, char** argv) {
     return 0;
 }
 
-static int command_lock(int argc, char** argv) {
+int command_lock(int argc, char** argv) {
     /* lock: refresh the lockfile from the currently-installed deps. */
     Manifest manifest;
     Lockfile lock;
@@ -2156,7 +1020,7 @@ static int command_lock(int argc, char** argv) {
 
     for (j = 2; j < argc; j++) {
         if (strcmp(argv[j], "--help") == 0 || strcmp(argv[j], "-h") == 0) {
-            print_command_help(argv[0], "lock");
+            lampm_print_command_help(argv[0], "lock");
             return 0;
         }
     }
@@ -2198,7 +1062,7 @@ static int command_lock(int argc, char** argv) {
     return 0;
 }
 
-static int command_why(int argc, char** argv) {
+int command_why(int argc, char** argv) {
     /* why <alias>: show what we know about a dependency — basically an alias
      * for `info`, kept as a separate command because users coming from npm/cargo
      * expect it. */
@@ -2211,7 +1075,7 @@ static int command_why(int argc, char** argv) {
 
 /* ── Help ──────────────────────────────────────────────────────────────── */
 
-static void print_usage(const char* program_name) {
+void lampm_print_usage(const char* program_name) {
     printf("Lamo Packet Manager v%s (integrated into `lamo`)\n\n", LAMPM_VERSION);
     printf("%sUsage:%s\n", col(COL_BOLD), col(COL_RESET));
     printf("  %s %s<command>%s [options] [args]\n\n",
@@ -2258,7 +1122,7 @@ static void print_usage(const char* program_name) {
            MANIFEST_FILE, LOCKFILE, DEFAULT_PACKAGES_DIR);
 }
 
-static void print_command_help(const char* program_name, const char* command) {
+void lampm_print_command_help(const char* program_name, const char* command) {
     if (strcmp(command, "init") == 0) {
         printf("%sinit%s — Create a new Lamo project in the current directory.\n\n",
                col(COL_CYAN), col(COL_RESET));
@@ -2356,15 +1220,15 @@ int lampm_main(int argc, char** argv) {
     int i;
 
     /* Auto-disable color if stdout/stderr isn't a TTY. The caller (lamo_v2.c
-     * main) may have already configured g_opts via lampm_configure(); we
+     * main) may have already configured g_pm_* via lampm_configure(); we
      * only force color off here when output isn't a TTY and the user didn't
      * explicitly pass --no-color. */
     if (!IS_PATH_TTY(fileno(stdout)) || !IS_PATH_TTY(fileno(stderr))) {
-        g_opts.color = 0;
+        g_pm_color = 0;
     }
 
     if (argc < 2) {
-        print_usage(argv[0]);
+        lampm_print_usage(argv[0]);
         return 1;
     }
 
@@ -2372,14 +1236,14 @@ int lampm_main(int argc, char** argv) {
     while (arg_start < argc && argv[arg_start][0] == '-' &&
            strcmp(argv[arg_start], "--") != 0) {
         if (strcmp(argv[arg_start], "--verbose") == 0) {
-            g_opts.verbose = 1;
+            g_pm_verbose = 1;
         } else if (strcmp(argv[arg_start], "--quiet") == 0) {
-            g_opts.quiet = 1;
+            g_pm_quiet = 1;
         } else if (strcmp(argv[arg_start], "--no-color") == 0) {
-            g_opts.color = 0;
+            g_pm_color = 0;
         } else if (strcmp(argv[arg_start], "--help") == 0 ||
                    strcmp(argv[arg_start], "-h") == 0) {
-            print_usage(argv[0]);
+            lampm_print_usage(argv[0]);
             return 0;
         } else if (strcmp(argv[arg_start], "--version") == 0 ||
                    strcmp(argv[arg_start], "-v") == 0) {
@@ -2393,26 +1257,26 @@ int lampm_main(int argc, char** argv) {
     }
 
     if (arg_start >= argc) {
-        print_usage(argv[0]);
+        lampm_print_usage(argv[0]);
         return 1;
     }
 
     /* Also accept trailing --verbose / --quiet / --no-color after the command. */
     for (i = arg_start + 1; i < argc; i++) {
         if (strcmp(argv[i], "--verbose") == 0) {
-            g_opts.verbose = 1;
+            g_pm_verbose = 1;
         } else if (strcmp(argv[i], "--quiet") == 0) {
-            g_opts.quiet = 1;
+            g_pm_quiet = 1;
         } else if (strcmp(argv[i], "--no-color") == 0) {
-            g_opts.color = 0;
+            g_pm_color = 0;
         }
     }
 
     if (strcmp(argv[arg_start], "help") == 0) {
         if (arg_start + 1 < argc) {
-            print_command_help(argv[0], argv[arg_start + 1]);
+            lampm_print_command_help(argv[0], argv[arg_start + 1]);
         } else {
-            print_usage(argv[0]);
+            lampm_print_usage(argv[0]);
         }
         return 0;
     }
@@ -2468,6 +1332,6 @@ int lampm_main(int argc, char** argv) {
 
     error_msg("unknown lampm subcommand: %s", argv[arg_start]);
     fprintf(stderr, "\n");
-    print_usage(argv[0]);
+    lampm_print_usage(argv[0]);
     return 1;
 }

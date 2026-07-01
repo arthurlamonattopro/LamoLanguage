@@ -80,10 +80,14 @@
 
 ### Type Model
 
-- [ ] Define a `Type` representation in the compiler.
-- [ ] Decide whether Lamo will use explicit typing, inference, or a mixed model.
+- [x] Define a `Type` representation in the compiler.
+- [x] Decide whether Lamo will use explicit typing, inference, or a mixed model.
+      **Decision: hybrid inference** — see `docs/TYPE-SYSTEM.md` for the full
+      rationale. `let` infers; `fn` annotations are optional but checked when
+      present; struct fields require annotations. Public-API `fn` (when `pub`
+      ships) MUST be fully annotated.
 - [x] Define the initial built-in types: `int` (int64), `float`, `bool`, `string`, `void`.
-- [ ] Attach inferred or declared types to AST nodes after analysis.
+- [x] Attach inferred or declared types to AST nodes after analysis.
 
 ### Type Rules
 
@@ -111,53 +115,80 @@
 
 ### Runtime Basics
 
-- [ ] Decide whether Lamo has a runtime support library.
-- [ ] Create a minimal runtime layer for helper functions if needed.
-- [ ] Define runtime conventions for strings.
-- [ ] Define runtime conventions for booleans.
-- [ ] Define runtime error behavior.
+- [x] Decide whether Lamo has a runtime support library.
+- [x] Create a minimal runtime layer for helper functions if needed.
+- [x] Define runtime conventions for strings.
+- [x] Define runtime conventions for booleans.
+- [x] Define runtime error behavior.
 
 ### Strings
 
-- [ ] Decide whether strings are immutable.
-- [ ] Decide how strings are stored and passed.
+- [x] Decide whether strings are immutable. **Yes — strings are immutable.**
+- [x] Decide how strings are stored and passed. **Arena-allocated `char*`,
+      passed by pointer; copied on assignment to a struct field or when
+      stored in an array.**
 - [x] Support printing string variables reliably.
 - [x] Support string input if the language will allow it.
 - [x] Decide whether string comparison is by value.
 
 ### Memory Model
 
-- [ ] Decide whether Lamo will expose manual memory control, ownership rules, or a managed model.
+- [x] Decide whether Lamo will expose manual memory control, ownership rules, or a managed model.
+      **Decision: hybrid — arena by default, opt-in mark-sweep GC planned.**
+      See `docs/MEMORY-MODEL.md` for the full design and rollout plan.
 - [x] Document who owns allocated runtime values.
 - [x] Make generated code follow the chosen ownership rules (string arena tracked and freed via `atexit`).
+- [ ] **GC rollout Step 2**: add `LamoGcHeader` + `lamo_gc_alloc` + `lamo_gc_collect` skeleton to `lamo_runtime.h`.
+- [ ] **GC rollout Step 3**: codegen emits `LAMO_GC_PUSH_ROOT` / `LAMO_GC_POP_ROOTS_N` for every `LamoValue` local.
+- [ ] **GC rollout Step 4**: wire periodic `gc_collect()` into `http_serve` and the GUI event loop.
+- [ ] **GC rollout Step 5**: re-promote `examples/http_server.lamo` from "preview" to "official" once GC is wired and tested.
+- [ ] **GC rollout Step 6**: add `tests/runtime/gc_basic.lamo` and `tests/runtime/gc_cycle.lamo`.
 
 ## Phase 6: Language Specification
 
-- [ ] Write a small language spec for syntax, scope, evaluation, and imports.
-- [ ] Document variable declaration semantics.
-- [ ] Document function semantics.
-- [ ] Document condition and loop semantics.
-- [ ] Document operator precedence and associativity.
-- [ ] Document builtin behavior.
-- [ ] Document type rules and conversions.
-- [ ] Document runtime error cases.
-- [ ] Document import resolution and duplicate import behavior.
+- [x] Write a small language spec for syntax, scope, evaluation, and imports.
+      **Authoritative spec: `docs/SPEC.md`.**
+- [x] Document variable declaration semantics. (SPEC.md §3.2, §7.1)
+- [x] Document function semantics. (SPEC.md §3.3)
+- [x] Document condition and loop semantics. (SPEC.md §4)
+- [x] Document operator precedence and associativity. (SPEC.md §6.2)
+- [x] Document builtin behavior. (SPEC.md §8, §11)
+- [x] Document type rules and conversions. (SPEC.md §7)
+- [x] Document runtime error cases. (SPEC.md §12)
+- [x] Document import resolution and duplicate import behavior. (SPEC.md §10)
 
 ## Phase 7: Language Features
 
 ### High-Priority Features
 
-- [ ] Decide whether typed variable declarations should be added.
-- [ ] Decide whether typed function signatures should be added.
-- [ ] Add `break`.
-- [ ] Add `continue`.
+- [x] Decide whether typed variable declarations should be added. (Yes — `let x: int = 5`; SPEC.md §3.2, §7.1.)
+- [x] Decide whether typed function signatures should be added. (Yes — `fn f(a: int) -> int`; SPEC.md §3.3, §7.1.)
+- [x] Add `break`. (Shipped Phase 2; SPEC.md §4.5.)
+- [x] Add `continue`. (Shipped Phase 2; SPEC.md §4.5.)
 
 ### Data Structures
 
-- [ ] Design array syntax and semantics.
-- [ ] Add arrays only after type and runtime rules are ready.
-- [ ] Decide whether to support structs/records.
-- [ ] Decide whether maps/dictionaries belong in the core language or standard library.
+- [x] Design array syntax and semantics. (Shipped Phase 2; documented in SPEC.md §9.)
+- [x] Add arrays only after type and runtime rules are ready. (Done — see SPEC.md §9.)
+- [x] Decide whether to support structs/records. (Yes — shipped Phase 2; SPEC.md §3.4.)
+- [x] Decide whether maps/dictionaries belong in the core language or standard library.
+      **Decision: stdlib.** `std.collections` ships `HashMap`/`HashSet` today.
+      Typed generics (`Map<K,V>`, `Set<T>`) will follow the generics RFC
+      (`docs/RFC-generics.md`).
+
+### Generics
+
+- [x] Design generics for Lamo. **RFC draft: `docs/RFC-generics.md`.**
+      Parametric generics with monomorphization, invariant by default, with
+      a small fixed constraint catalogue (`Ord`, `Eq`, `Hash`, `Show`, `Num`).
+      Depends on the type-system decision (already shipped — see
+      `docs/TYPE-SYSTEM.md`). Suggested rollout in 6 PRs (RFC §10).
+- [ ] **Generics PR 1**: generic struct declarations + type parameters in field types.
+- [ ] **Generics PR 2**: generic functions + type inference at call sites.
+- [ ] **Generics PR 3**: `Array<T>` typed-array syntax + deprecation warning for bare `array`.
+- [ ] **Generics PR 4**: typed `Map<K,V>` and `Set<T>` in stdlib.
+- [ ] **Generics PR 5** (depends on tagged-union enums): `Option<T>`, `Result<T, E>`.
+- [ ] **Generics PR 6**: constraint syntax (`: Ord`, `: Eq`, ...).
 
 ### Expressions And Statements
 
@@ -271,3 +302,43 @@
 - [x] Treat `print`, `input`, `isnumber`, `isstring`, `exit`, `abs` as regular identifiers resolved via builtin table; allow shadowing.
 - [x] Prefix all user identifiers in generated C with `lamo_u_` to avoid collisions with libc names (`abs`, `exit`, ...).
 - [x] Add `_DEFAULT_SOURCE` feature macro so `realpath` is declared on Linux.
+
+## Recently Added (Engineering Sprint — spec, types, memory, refactor, generics RFC)
+
+This sprint resolved the five "what should we lock down before adding more
+syntax" items that were blocking further language growth.
+
+- [x] **Type-system decision (Phase 4 / Phase 6)** — formalized the existing
+      hybrid inference model as official. `let` infers, `fn` annotations are
+      optional but checked, struct fields require annotations. Full rationale
+      and rejected alternatives documented in `docs/TYPE-SYSTEM.md`. No
+      compiler changes (the implementation already matches the decision);
+      formalizes "what the parser does today" as "what the language means".
+- [x] **Language specification (Phase 6)** — wrote `docs/SPEC.md`, the
+      authoritative spec covering lexical structure, grammar, declarations,
+      statements, expressions, operators (with full precedence table),
+      builtins, type rules, scopes, modules/imports, platform-specific
+      builtins (GUI/HTTP), and runtime behavior. Future compilers must
+      conform to this spec, not the other way around.
+- [x] **Memory model resolution (Phase 5)** — wrote `docs/MEMORY-MODEL.md`
+      with the full design of an opt-in mark-sweep GC, a 7-step rollout
+      plan, and a concrete policy ("an example is 'official' iff memory is
+      reclaimed during the run, OR a hard upper bound is documented")
+      gating HTTP-server example promotion. Demoted
+      `examples/http_server.lamo` from "official" to "preview" with a
+      prominent warning header. The actual GC implementation is tracked as
+      concrete TODO items in Phase 5 above (Steps 2–6).
+- [x] **Refactor: split `lamo_v2.c` and `lampm.c` into smaller modules.**
+      `lamo_v2.c` went from 2563 → 379 lines (-85%); the import resolver,
+      path utilities, subcommand handlers, compile pipeline, and CLI help
+      now live in dedicated files under `src/cli/`. `lampm.c` went from
+      2473 → 1337 lines (-46%); the manifest, lockfile, git, and utility
+      code now live in dedicated files under `src/lampm/`. Public API
+      (`lampm.h`) is unchanged. All 84 tests still pass with zero warnings
+      under `-Wall -Wextra`.
+- [x] **Generics design (Phase 7)** — wrote `docs/RFC-generics.md`, a draft
+      RFC for parametric generics with monomorphization, invariant by
+      default, with a small fixed constraint catalogue. Ships a 6-PR rollout
+      plan; PR 1 (generic structs) is the next concrete step. Depends on the
+      type-system decision (already shipped). Tagged-union enums are a
+      separate prerequisite for `Option<T>` / `Result<T, E>` (PR 5).

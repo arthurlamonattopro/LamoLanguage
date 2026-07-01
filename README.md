@@ -127,7 +127,7 @@ while (gui_should_close() == 0) {
 gui_close();
 ```
 
-Native HTTP example:
+Native HTTP example (**preview, not official** — see `docs/MEMORY-MODEL.md`):
 
 ```lamo
 http_route("/", "Lamo HTTP server");
@@ -136,6 +136,13 @@ http_route("/health", "ok");
 print("HTTP server on http://127.0.0.1:8080");
 http_serve(8080);
 ```
+
+> ⚠ **Memory model warning.** The runtime has no GC yet. Strings produced by
+> `http_route` and request handling accumulate in the arena for the duration
+> of `http_serve()`. Do NOT use this for production long-running processes
+> until the opt-in mark-sweep GC lands (see `docs/MEMORY-MODEL.md`, rollout
+> Steps 2–5). For local development, demos, and short-lived tools, this is
+> fine.
 
 ### Modules and Namespaced Imports
 
@@ -549,9 +556,19 @@ On Windows, GUI builtins are lowered to Win32 + GDI in the generated C and can o
 
 ### Memory Model
 
-The runtime does not have a garbage collector. Strings produced by dynamic operations (concatenation via `+`, `input_str`, etc.) are tracked in a small string arena that is freed in one shot via `atexit()` when the program exits. This avoids the leak that used to happen on `s = s + "x"` patterns inside loops.
+The runtime does not have a garbage collector yet. Strings produced by
+dynamic operations (concatenation via `+`, `input_str`, etc.) are tracked
+in a small string arena that is freed in one shot via `atexit()` when the
+program exits. This avoids the leak that used to happen on `s = s + "x"`
+patterns inside loops.
 
-Known limitation: long-running programs (e.g. an HTTP server) still see the arena grow while they run, because the runtime has no way to know which strings are still reachable. For a prototype educational language this is acceptable; a real GC or ownership model is future work.
+**Long-running programs** (e.g. an HTTP server) still see the arena grow
+while they run, because the runtime has no way to know which strings are
+still reachable. The full design for an opt-in mark-sweep GC — including
+the rollout plan and the policy that gates HTTP-server example promotion —
+lives in [`docs/MEMORY-MODEL.md`](./docs/MEMORY-MODEL.md). Until the GC
+ships (rollout Steps 2–5), the HTTP example is officially a "preview",
+not a recommended production pattern.
 
 ## Tests
 
@@ -641,10 +658,28 @@ by placing files in `./std/` next to their program.
 - [src/codegen/codegen.c](./src/codegen/codegen.c) — AST → C transpiler
 - [src/codegen/lamo_runtime.h](./src/codegen/lamo_runtime.h) — runtime (value type, arena, GUI, HTTP)
 - [src/eval/eval.c](./src/eval/eval.c) — tree-walking interpreter (powers `lamo eval` and `lamo repl`)
-- [src/lampm/lampm.c](./src/lampm/lampm.c) — integrated package manager (formerly `lampm`)
-- [src/lampm/lampm.h](./src/lampm/lampm.h) — public API for the package manager
+- [src/lampm/](./src/lampm) — integrated package manager, split across:
+  - [lampm.c](./src/lampm/lampm.c) — entry point (`lampm_main`, `lampm_is_subcommand`, `lampm_configure`, all `command_*` handlers, `install_dependency`)
+  - [lampm.h](./src/lampm/lampm.h) — public API
+  - [lampm_internal.h](./src/lampm/lampm_internal.h) — shared types (`Manifest`, `Lockfile`, `Dependency`, `LockEntry`) + helper decls
+  - [lampm_util.c](./src/lampm/lampm_util.c) — string/fs helpers + output helpers
+  - [lampm_manifest.c](./src/lampm/lampm_manifest.c) — `lamo.pkg` parsing/writing
+  - [lampm_lockfile.c](./src/lampm/lampm_lockfile.c) — `lamo.lock` parsing/writing
+  - [lampm_git.c](./src/lampm/lampm_git.c) — git operations + repo-spec parsing
 - [src/modules.c](./src/modules.c) + [src/modules.h](./src/modules.h) — module registry backing the namespaced-import feature (`import "..." as alias;` + `alias.fn(args)`)
-- [src/lamo_v2.c](./src/lamo_v2.c) — CLI entry point: parses global flags, dispatches subcommands
+- [src/cli/](./src/cli) — CLI layer split out of `lamo_v2.c`:
+  - [cli_options.h](./src/cli/cli_options.h) / [cli_options.c](./src/cli/cli_options.c) — global flags (`g_verbose`, `g_quiet`, `g_no_color`), `LamoCommand` enum, `VERSION`
+  - [paths.h](./src/cli/paths.h) / [paths.c](./src/cli/paths.c) — path utilities, `resolve_import_path`, `read_file`, `lamo_cc`, `executable_suffix`
+  - [import_resolver.h](./src/cli/import_resolver.h) / [import_resolver.c](./src/cli/import_resolver.c) — `CompilationState`, recursive loader, import cycle detection, module declaration renaming
+  - [commands.h](./src/cli/commands.h) / [commands.c](./src/cli/commands.c) — `command_new`, `command_clean`, `command_repl`, `command_test`, `command_fmt`
+  - [compile.h](./src/cli/compile.h) / [compile.c](./src/cli/compile.c) — `compile_sources` + helpers (GUI detection, source/module callbacks)
+  - [help.h](./src/cli/help.h) / [help.c](./src/cli/help.c) — `print_usage`, `print_command_help`
+- [src/lamo_v2.c](./src/lamo_v2.c) — thin CLI entry point: env-var parsing, global-flag parsing, subcommand dispatch (~380 lines)
+- [docs/](./docs) — design documents:
+  - [SPEC.md](./docs/SPEC.md) — authoritative language specification
+  - [TYPE-SYSTEM.md](./docs/TYPE-SYSTEM.md) — type-system decision record (hybrid inference)
+  - [MEMORY-MODEL.md](./docs/MEMORY-MODEL.md) — memory model + GC design + rollout plan
+  - [RFC-generics.md](./docs/RFC-generics.md) — draft RFC for parametric generics
 - [tests/run_tests.sh](./tests/run_tests.sh) — POSIX test runner
 - [tests/run_tests.ps1](./tests/run_tests.ps1) — Windows PowerShell test runner
 - [tests/valid/](./tests/valid) — programs that must `check` successfully
