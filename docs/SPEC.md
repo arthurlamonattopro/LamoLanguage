@@ -131,7 +131,8 @@ top_decl      := import_decl
               | let_decl
 
 import_decl   := 'import' ( string_lit [ 'as' IDENT ] | IDENT [ 'as' IDENT ] ) ';'?
-struct_decl   := 'struct' IDENT '{' field_list '}'
+struct_decl   := 'struct' IDENT type_params? '{' field_list '}'
+type_params   := '<' IDENT (',' IDENT)* '>'
 field_list    := field ( (',' | ';' | NEWLINE) field )*
 field         := IDENT ':' type_ann
 enum_decl     := 'enum' IDENT '{' variant_list '}'
@@ -189,7 +190,8 @@ postfix       := primary ('.' IDENT | '[' expr ']' | '(' arg_list? ')')*
 primary       := INT_LIT | FLOAT_LIT | STRING_LIT | 'true' | 'false'
               | IDENT | '(' expr ')' | array_lit | struct_lit
 array_lit     := '[' (expr (',' expr)*)? ']'
-struct_lit    := IDENT '{' field_init (',' field_init)* '}'
+struct_lit    := IDENT type_args? '{' field_init (',' field_init)* '}'
+type_args     := '<' IDENT (',' IDENT)* '>'
 field_init    := IDENT ':' expr
 ```
 
@@ -255,12 +257,75 @@ struct Player {
 
 - Fields are separated by `,`, `;`, or newlines (any mix).
 - Every field MUST have a type annotation. The annotation may be `int`,
-  `float`, `bool`, `string`, `array`, or another struct name.
+  `float`, `bool`, `string`, `array`, `void`, or another struct name.
 - Field types are annotations only at runtime — Lamo is dynamically typed at
   the value level (see §7.4) — but the compiler uses them for static field
   validation. Accessing a non-declared field is a compile-time error.
 - Structs may not contain themselves by value (no direct recursion). A struct
   may contain an `array` of its own type.
+
+#### 3.4.1 Generic struct declarations (Generics PR 1)
+
+```
+struct Box<T> {
+    value: T,
+    label: string
+}
+
+struct Pair<A, B> {
+    first: A,
+    second: B
+}
+```
+
+- A struct may declare type parameters in `<...>` immediately after its name.
+  Multiple parameters are comma-separated: `Pair<A, B>`, `Map<K, V>`.
+- Type parameter names must be unique within the declaration
+  (`struct Dup<T, T>` is a compile-time error).
+- Field types may reference any declared type parameter (`value: T`,
+  `first: A`, `second: B`). Field types that are neither builtins, declared
+  structs, nor one of the declared type parameters are a compile-time error
+  (catches typos like `struct Pair<A, B> { x: C }`).
+- The type parameter list is optional. Omitting it produces a regular
+  non-generic struct — fully backwards-compatible with pre-2.4.0 syntax.
+
+#### 3.4.2 Generic struct literals (Generics PR 1)
+
+```
+let bi = Box<int> { value: 42, label: "answer" }
+let p  = Pair<int, string> { first: 1, second: "one" }
+```
+
+- A generic struct is instantiated by listing concrete type arguments in
+  `<...>` between the struct name and the `{` of the literal.
+- The number of type arguments must match the number of type parameters
+  declared on the struct (`Pair<int>` is a compile-time error — `Pair`
+  expects 2 type arguments).
+- Type arguments must be known types: builtins (`int`, `float`, `bool`,
+  `string`, `array`) or declared struct names. Using an unknown identifier
+  as a type argument is a compile-time error.
+- Non-generic structs MUST NOT receive type arguments
+  (`Plain<int> { ... }` is a compile-time error if `Plain` has no type
+  parameters).
+- The runtime representation of a generic struct is the same regardless of
+  type arguments — every field is a tagged `LamoValue`. Type arguments
+  exist purely for compile-time type checking; they are erased at runtime.
+  This is the "monomorphization with shared layout" strategy from the
+  generics RFC §8 — different instantiations of the same generic struct
+  share the same C layout for PR 1. Layout-per-instantiation specialization
+  (e.g. packed `Array<int>`) will land with PR 3.
+
+#### 3.4.3 Disambiguation: `<` as type args vs comparison
+
+In expression position, `Foo < bar` is ambiguous between a generic struct
+literal `Foo<...>` and a comparison expression. Lamo resolves this by
+lookahead: if the tokens after `Foo` match the pattern
+`< IDENT (, IDENT)* > {`, the construct is parsed as a generic struct
+literal; otherwise `<` is treated as a comparison operator. This means
+`if (a < b) { ... }` continues to work, but `Foo<int> { ... }` is also
+recognized as a struct literal. The `match` scrutinee is exempt — `match
+c < X > { ... }` is always parsed as a comparison scrutinee (the `{`
+belongs to `match`), not as a generic struct literal.
 
 ### 3.5 `enum` declarations
 

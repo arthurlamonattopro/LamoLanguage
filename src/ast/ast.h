@@ -271,13 +271,21 @@ typedef struct {
 /* Phase 2: struct declaration.
  *   struct Player { name: string; hp: int; level: int; }
  * field_names[i] / field_types[i] are owned by the AST (strdup'd).
- * field_types[i] may be NULL when the field has no annotation. */
+ * field_types[i] may be NULL when the field has no annotation.
+ *
+ * Generics PR 1: type_params / type_param_count carry the optional
+ * `<T, K, V>` parameter list after the struct name. When type_param_count
+ * == 0 the struct is non-generic (the legacy case). Type parameters can
+ * be used as field types; the semantic pass validates that any non-builtin,
+ * non-struct field type is one of these names. */
 typedef struct {
     ASTNode base;
     char* name;
     char** field_names;
     char** field_types;
     int field_count;
+    char** type_params;
+    int type_param_count;
 } ASTStructDecl;
 
 /* Phase 2: impl block.
@@ -318,13 +326,23 @@ typedef struct {
 /* Phase 2: struct literal.
  *   Player { name: "Arthur"; hp: 100; level: 1; }
  * struct_name is owned (strdup'd). field_names[i] / field_values[i]
- * are owned; the AST frees them. */
+ * are owned; the AST frees them.
+ *
+ * Generics PR 1: type_args / type_arg_count carry the optional
+ * `<int, string>` argument list after the struct name. When the named
+ * struct is generic, the semantic pass validates that type_arg_count
+ * matches the declaration's type_param_count. The runtime layout is
+ * the same regardless of type args (all fields are LamoValue), so the
+ * codegen ignores type_args — they exist purely for compile-time type
+ * checking. */
 typedef struct {
     ASTNode base;
     char* struct_name;
     char** field_names;
     struct ASTNode** field_values;
     int field_count;
+    char** type_args;
+    int type_arg_count;
 } ASTStructLiteral;
 
 /* Phase 2: place-assignment statement - `arr[i] = value;` or
@@ -396,8 +414,13 @@ ASTMemberCall* ast_new_member_call(ASTNode* object, char* member_name, ASTNode**
 /* struct Name { field: type, ... }
  * `field_names` and `field_types` are arrays of strings; we strdup each
  * entry. field_types[i] may be NULL when no annotation is given for that
- * field. The caller retains ownership of the input arrays. */
-ASTNode* ast_new_struct_decl(char* name, char** field_names, char** field_types, int field_count, int line, int column);
+ * field. The caller retains ownership of the input arrays.
+ *
+ * Generics PR 1: type_params / type_param_count carry the optional
+ * `<T, K, V>` parameter list. Pass type_param_count = 0 (and type_params
+ * = NULL) for non-generic structs — the legacy case. The strings are
+ * strdup'd here. */
+ASTNode* ast_new_struct_decl(char* name, char** field_names, char** field_types, int field_count, char** type_params, int type_param_count, int line, int column);
 
 /* impl Type { fn method(...) {...} ... } - `methods` is a linked list of
  * AST_FN_DECL nodes (linked via ->next). The list is taken ownership of;
@@ -418,8 +441,12 @@ ASTNode* ast_new_match_stmt(ASTNode* scrutinee, char** patterns, int* pattern_is
 
 /* Struct literal: Name { field: value, ... }
  * `field_names` and `field_values` are arrays of size field_count.
- * field_names[i] is strdup'd. field_values[i] is owned by the AST. */
-ASTNode* ast_new_struct_literal(char* struct_name, char** field_names, ASTNode** field_values, int field_count, int line, int column);
+ * field_names[i] is strdup'd. field_values[i] is owned by the AST.
+ *
+ * Generics PR 1: type_args / type_arg_count carry the optional
+ * `<int, string>` argument list. Pass type_arg_count = 0 (and type_args
+ * = NULL) for non-generic literals. Strings are strdup'd here. */
+ASTNode* ast_new_struct_literal(char* struct_name, char** field_names, ASTNode** field_values, int field_count, char** type_args, int type_arg_count, int line, int column);
 
 /* Place-assignment: `target op= value` where target is AST_INDEX_EXPR
  * or AST_PROP_EXPR. The target and value nodes are owned by the AST. */

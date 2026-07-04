@@ -327,7 +327,7 @@ If the goal is the fastest meaningful progress, do this next:
 6. ~~Lock down the language spec before adding more syntax.~~ (Done — `docs/SPEC.md`.)
 7. ~~Resolve the memory model question for long-running processes.~~ (Done — `docs/MEMORY-MODEL.md`; rollout in progress.)
 8. ~~Split the large CLI files into modules for maintainability.~~ (Done — see `src/cli/` and `src/lampm/lampm_internal.h`.)
-9. **Next: ship generics PR 1 (generic structs).** Design is in `docs/RFC-generics.md`; the type-system decision it depends on is already locked.
+9. ~~Ship generics PR 1 (generic structs).~~ Done (2.4.0) — `struct Pair<A, B> { ... }` and `Pair<int, string> { ... }` are accepted and validated. See `docs/RFC-generics.md` §10 for the rollout status of PRs 2–6.
 10. In parallel: ship GC rollout Steps 2–5 (tracked in `todo.md` Phase 5) so `examples/http_server.lamo` can be re-promoted to "official".
 
 ## Definition Of "Real Language"

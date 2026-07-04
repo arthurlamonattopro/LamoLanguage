@@ -251,7 +251,7 @@ ASTMemberCall* ast_new_member_call(ASTNode* object, char* member_name, ASTNode**
 
 /* ─── Phase 2: structs / methods / enums / match ──────────────────── */
 
-ASTNode* ast_new_struct_decl(char* name, char** field_names, char** field_types, int field_count, int line, int column) {
+ASTNode* ast_new_struct_decl(char* name, char** field_names, char** field_types, int field_count, char** type_params, int type_param_count, int line, int column) {
     ASTStructDecl* node = (ASTStructDecl*)ast_new_node(AST_STRUCT_DECL, sizeof(ASTStructDecl), line, column);
     int i;
     node->name = strdup(name);
@@ -261,6 +261,12 @@ ASTNode* ast_new_struct_decl(char* name, char** field_names, char** field_types,
     for (i = 0; i < field_count; i++) {
         node->field_names[i] = strdup(field_names[i] ? field_names[i] : "");
         node->field_types[i] = field_types && field_types[i] ? strdup(field_types[i]) : NULL;
+    }
+    /* Generics PR 1: copy type parameter names. */
+    node->type_param_count = type_param_count;
+    node->type_params = type_param_count > 0 ? malloc(sizeof(char*) * (size_t)type_param_count) : NULL;
+    for (i = 0; i < type_param_count; i++) {
+        node->type_params[i] = strdup(type_params[i] ? type_params[i] : "");
     }
     return (ASTNode*)node;
 }
@@ -300,7 +306,7 @@ ASTNode* ast_new_match_stmt(ASTNode* scrutinee, char** patterns, int* pattern_is
     return (ASTNode*)node;
 }
 
-ASTNode* ast_new_struct_literal(char* struct_name, char** field_names, ASTNode** field_values, int field_count, int line, int column) {
+ASTNode* ast_new_struct_literal(char* struct_name, char** field_names, ASTNode** field_values, int field_count, char** type_args, int type_arg_count, int line, int column) {
     ASTStructLiteral* node = (ASTStructLiteral*)ast_new_node(AST_STRUCT_LITERAL, sizeof(ASTStructLiteral), line, column);
     int i;
     node->struct_name = strdup(struct_name);
@@ -310,6 +316,12 @@ ASTNode* ast_new_struct_literal(char* struct_name, char** field_names, ASTNode**
     for (i = 0; i < field_count; i++) {
         node->field_names[i] = strdup(field_names[i] ? field_names[i] : "");
         node->field_values[i] = field_values[i];
+    }
+    /* Generics PR 1: copy type argument names. */
+    node->type_arg_count = type_arg_count;
+    node->type_args = type_arg_count > 0 ? malloc(sizeof(char*) * (size_t)type_arg_count) : NULL;
+    for (i = 0; i < type_arg_count; i++) {
+        node->type_args[i] = strdup(type_args[i] ? type_args[i] : "");
     }
     return (ASTNode*)node;
 }
@@ -504,6 +516,11 @@ void ast_free(ASTNode* node) {
                 }
                 free(sd->field_names);
                 free(sd->field_types);
+                /* Generics PR 1: free type parameter names. */
+                for (i = 0; i < sd->type_param_count; i++) {
+                    free(sd->type_params[i]);
+                }
+                free(sd->type_params);
                 break;
             }
             case AST_IMPL_DECL: {
@@ -545,6 +562,11 @@ void ast_free(ASTNode* node) {
                 }
                 free(sl->field_names);
                 free(sl->field_values);
+                /* Generics PR 1: free type argument names. */
+                for (i = 0; i < sl->type_arg_count; i++) {
+                    free(sl->type_args[i]);
+                }
+                free(sl->type_args);
                 break;
             }
             case AST_PLACE_ASSIGN_STMT: {

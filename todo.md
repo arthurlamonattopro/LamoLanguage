@@ -229,7 +229,20 @@
       a small fixed constraint catalogue (`Ord`, `Eq`, `Hash`, `Show`, `Num`).
       Depends on the type-system decision (already shipped — see
       `docs/TYPE-SYSTEM.md`). Suggested rollout in 6 PRs (RFC §10).
-- [ ] **Generics PR 1**: generic struct declarations + type parameters in field types.
+- [x] **Generics PR 1**: generic struct declarations + type parameters in field types.
+      **Done (2.4.0):** `struct Pair<A, B> { first: A, second: B }` is now
+      parseable and checkable. `Pair<int, string> { first: 1, second: "x" }`
+      is validated at the semantic pass — type arg count must match type
+      param count, type args must be known types (builtins or declared
+      structs), and field types must be builtins, declared structs, or
+      one of the declared type params. The runtime representation is
+      unchanged (all fields are `LamoValue`), so monomorphization is
+      purely a compile-time concept for PR 1 — different instantiations
+      share the same C layout. New tests: `tests/runtime/generics_structs.lamo`,
+      `tests/valid/generics_structs.lamo`, and 5 `tests/invalid/generics_*.lamo`
+      cases covering unknown type params, wrong type arg count, type args
+      on non-generic structs, duplicate type params, and unknown type args.
+      All 93 tests pass with zero warnings under `-Wall -Wextra`.
 - [ ] **Generics PR 2**: generic functions + type inference at call sites.
 - [ ] **Generics PR 3**: `Array<T>` typed-array syntax + deprecation warning for bare `array`.
 - [ ] **Generics PR 4**: typed `Map<K,V>` and `Set<T>` in stdlib.

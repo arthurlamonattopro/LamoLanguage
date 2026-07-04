@@ -1,6 +1,6 @@
 # RFC: Generics for Lamo
 
-**Status:** Draft (2026-07). Not yet implemented. Tracked in `todo.md` Phase 7.
+**Status:** PR 1 shipped (2.4.0). PRs 2–6 in design / pending. Tracked in `todo.md` Phase 7.
 **Depends on:** Type-system decision (`docs/TYPE-SYSTEM.md`) — shipped.
 **Author:** Lamo engineering.
 **Discussion:** open a GitHub issue with the `generics` label.
@@ -362,7 +362,13 @@ Suggested rollout order:
 
 1. **PR 1: Generic struct declarations + type parameters in field types.**
    Constraint: just `Any`. Codegen: monomorphization. No new syntax for
-   constraints yet.
+   constraints yet. **SHIPPED (2.4.0).** `struct Pair<A, B> { ... }` and
+   `Pair<int, string> { ... }` are accepted and validated; field types
+   must be builtins, declared structs, or one of the declared type params.
+   The runtime representation is unchanged (all fields are `LamoValue`),
+   so different instantiations share the same C layout for now — true
+   layout-per-instantiation monomorphization will land with PR 3
+   (`Array<T>` needs a packed representation for `Array<int>`).
 2. **PR 2: Generic functions + type inference at call sites.**
 3. **PR 3: `Array<T>` typed-array syntax + deprecation warning for bare
    `array`.**

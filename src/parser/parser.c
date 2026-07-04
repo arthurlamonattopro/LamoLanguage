@@ -298,6 +298,68 @@ static long long parse_int_literal(const char* text) {
     return strtoll(text, NULL, 10);
 }
 
+/* Generics PR 1: lookahead helper.
+ *
+ * Disambiguates `Foo<int, string> { ... }` (generic struct literal) from
+ * `Foo < bar` (comparison expression). Both start with `IDENTIFIER <`, so
+ * we need to peek ahead to see if the tokens form `< IDENT (, IDENT)* > {`.
+ *
+ * Returns 1 if the pattern matches (i.e., this is a generic struct literal
+ * and the caller should parse the type args), 0 otherwise (the `<` is a
+ * comparison operator and the caller should fall through to plain
+ * identifier).
+ *
+ * Does NOT consume any tokens — saves and restores both lexer state and
+ * the current token. */
+static int parser_peek_is_generic_struct_literal(Parser* p) {
+    if (p->current.type != TOKEN_LT) return 0;
+
+    /* Save lexer state. */
+    int saved_pos = p->lexer->pos;
+    int saved_line = p->lexer->line;
+    int saved_column = p->lexer->column;
+    /* Deep-copy the current token so we can restore it. The value may be
+     * NULL for non-value tokens (operators, keywords); strdup(NULL) is
+     * undefined, so guard. */
+    Token saved_current;
+    saved_current.type = p->current.type;
+    saved_current.value = p->current.value ? strdup(p->current.value) : NULL;
+    saved_current.line = p->current.line;
+    saved_current.column = p->current.column;
+
+    int result = 0;
+    advance_p(p);  /* consume '<' */
+    int got_at_least_one = 0;
+    while (p->current.type == TOKEN_IDENTIFIER) {
+        advance_p(p);
+        got_at_least_one = 1;
+        if (p->current.type == TOKEN_COMMA) {
+            advance_p(p);
+            /* Allow trailing comma? No — keep strict. If next is not
+             * IDENTIFIER, the loop will exit and we'll fail at the `>`
+             * check below. */
+        } else {
+            break;
+        }
+    }
+    if (got_at_least_one && p->current.type == TOKEN_GT) {
+        advance_p(p);  /* consume '>' */
+        if (p->current.type == TOKEN_LBRACE) {
+            result = 1;
+        }
+    }
+
+    /* Restore state. Free the token we advanced to (it's about to be
+     * replaced by saved_current). */
+    token_free(p->current);
+    p->current = saved_current;
+    p->lexer->pos = saved_pos;
+    p->lexer->line = saved_line;
+    p->lexer->column = saved_column;
+
+    return result;
+}
+
 static ASTNode* parse_primary(Parser* p) {
     if (p->current.type == TOKEN_INT) {
         long long val = parse_int_literal(p->current.value);
@@ -337,6 +399,63 @@ static ASTNode* parse_primary(Parser* p) {
         int line = p->current.line;
         int column = p->current.column;
         advance_p(p);
+
+        /* Generics PR 1: optional type argument list for struct literals,
+         * parsed when lookahead confirms `Foo<int, string> { ... }`. The
+         * lookahead is necessary because `Foo < bar` is also valid (a
+         * comparison expression). The arrays are heap-allocated only if we
+         * actually parse type args; otherwise they stay NULL/0 and the
+         * existing struct-literal / identifier / call branches proceed
+         * unchanged.
+         *
+         * We also check !p->no_struct_literal so match-scrutinee parsing
+         * (which sets that flag to prevent `match c { ... }` from being
+         * misparsed as `match (c { ... })`) doesn't get confused by
+         * `match c < X > { ... }` — that's `match (c < X) > { ... }`,
+         * i.e. a comparison scrutinee, NOT a generic struct literal. */
+        char** type_args = NULL;
+        int type_arg_count = 0;
+        if (p->current.type == TOKEN_LT && !p->no_struct_literal && parser_peek_is_generic_struct_literal(p)) {
+            advance_p(p);  /* consume '<' (confirmed by lookahead) */
+            while (p->current.type != TOKEN_GT && p->current.type != TOKEN_EOF) {
+                if (p->current.type != TOKEN_IDENTIFIER) {
+                    parser_error(p, "expected type argument name after '<' in struct literal");
+                    for (int i = 0; i < type_arg_count; i++) free(type_args[i]);
+                    free(type_args); free(name);
+                    return parser_recover(p);
+                }
+                char* ta = strdup(p->current.value);
+                eat_p(p, TOKEN_IDENTIFIER);
+                {
+                    char** resized = realloc(type_args, sizeof(char*) * (size_t)(type_arg_count + 1));
+                    if (!resized) {
+                        parser_error(p, "out of memory while growing struct literal type argument list");
+                        free(ta);
+                        for (int i = 0; i < type_arg_count; i++) free(type_args[i]);
+                        free(type_args); free(name);
+                        return parser_recover(p);
+                    }
+                    type_args = resized;
+                }
+                type_args[type_arg_count++] = ta;
+                if (p->current.type == TOKEN_COMMA) advance_p(p);
+            }
+            if (p->current.type != TOKEN_GT) {
+                parser_error(p, "expected '>' to close struct literal type argument list");
+                for (int i = 0; i < type_arg_count; i++) free(type_args[i]);
+                free(type_args); free(name);
+                return parser_recover(p);
+            }
+            advance_p(p);  /* consume '>' */
+            /* After '>', the next token MUST be '{' — the lookahead already
+             * confirmed this. If it isn't, something is wrong; emit an error. */
+            if (p->current.type != TOKEN_LBRACE) {
+                parser_error(p, "expected '{' after generic struct literal type arguments");
+                for (int i = 0; i < type_arg_count; i++) free(type_args[i]);
+                free(type_args); free(name);
+                return parser_recover(p);
+            }
+        }
 
         /* Sprint 4: `module.member(args)` in expression position. We
          * recognize this BEFORE the regular call-expression branch so the
@@ -494,16 +613,28 @@ static ASTNode* parse_primary(Parser* p) {
                 else if (p->current.type == TOKEN_SEMICOLON) advance_p(p);
             }
             expect_p(p, TOKEN_RBRACE, "missing '}' at end of struct literal");
-            ASTNode* node = (ASTNode*)ast_new_struct_literal(name, field_names, field_values, field_count, line, column);
+            ASTNode* node = (ASTNode*)ast_new_struct_literal(name, field_names, field_values, field_count, type_args, type_arg_count, line, column);
             /* Free field_names array contents (the AST strdup'd them) and
              * the field_values array (the AST took ownership of the elements).
-             * Free the arrays themselves (the AST made its own copies). */
+             * Free the arrays themselves (the AST made its own copies).
+             * Generics PR 1: also free type_args contents (the AST strdup'd them). */
             for (int i = 0; i < field_count; i++) free(field_names[i]);
             free(field_names);
             free(field_values);
+            for (int i = 0; i < type_arg_count; i++) free(type_args[i]);
+            free(type_args);
             free(name);
             return node;
         } else {
+            /* If we somehow parsed type_args but the next token is not '{',
+             * we're in an inconsistent state (the lookahead should have
+             * prevented this). Free type_args and fall through to identifier. */
+            if (type_arg_count > 0) {
+                for (int i = 0; i < type_arg_count; i++) free(type_args[i]);
+                free(type_args);
+                type_args = NULL;
+                type_arg_count = 0;
+            }
             ASTNode* node = (ASTNode*)ast_new_identifier(name, line, column);
             free(name);
             return node;
@@ -934,6 +1065,46 @@ ASTNode* parse_statement(Parser* p) {
         }
         char* name = strdup(p->current.value);
         eat_p(p, TOKEN_IDENTIFIER);
+        /* Generics PR 1: optional type parameter list `<T, K, V>`. We
+         * distinguish this from the comparison operator `<` by context:
+         * after a struct name, the only valid follow tokens are `{`
+         * (start of body) or `<` (start of type params). A `<` here
+         * cannot be a comparison because there's no left-hand expression. */
+        char** type_params = NULL;
+        int type_param_count = 0;
+        if (p->current.type == TOKEN_LT) {
+            advance_p(p);  /* consume '<' */
+            while (p->current.type != TOKEN_GT && p->current.type != TOKEN_EOF) {
+                if (p->current.type != TOKEN_IDENTIFIER) {
+                    parser_error(p, "expected type parameter name after '<' in struct declaration");
+                    for (int i = 0; i < type_param_count; i++) free(type_params[i]);
+                    free(type_params); free(name);
+                    return parser_recover(p);
+                }
+                char* tp = strdup(p->current.value);
+                eat_p(p, TOKEN_IDENTIFIER);
+                {
+                    char** resized = realloc(type_params, sizeof(char*) * (size_t)(type_param_count + 1));
+                    if (!resized) {
+                        parser_error(p, "out of memory while growing struct type parameter list");
+                        free(tp);
+                        for (int i = 0; i < type_param_count; i++) free(type_params[i]);
+                        free(type_params); free(name);
+                        return parser_recover(p);
+                    }
+                    type_params = resized;
+                }
+                type_params[type_param_count++] = tp;
+                if (p->current.type == TOKEN_COMMA) advance_p(p);
+            }
+            if (p->current.type != TOKEN_GT) {
+                parser_error(p, "expected '>' to close struct type parameter list");
+                for (int i = 0; i < type_param_count; i++) free(type_params[i]);
+                free(type_params); free(name);
+                return parser_recover(p);
+            }
+            advance_p(p);  /* consume '>' */
+        }
         expect_p(p, TOKEN_LBRACE, "expected '{' to open struct body");
         char** field_names = NULL;
         char** field_types = NULL;
@@ -994,9 +1165,11 @@ ASTNode* parse_statement(Parser* p) {
         /* Optional trailing semicolon (struct decls usually don't have one,
          * but we allow it for symmetry with other declarations). */
         if (p->current.type == TOKEN_SEMICOLON) advance_p(p);
-        ASTNode* node = (ASTNode*)ast_new_struct_decl(name, field_names, field_types, field_count, line, column);
+        ASTNode* node = (ASTNode*)ast_new_struct_decl(name, field_names, field_types, field_count, type_params, type_param_count, line, column);
         for (int i = 0; i < field_count; i++) { free(field_names[i]); free(field_types[i]); }
-        free(field_names); free(field_types); free(name);
+        free(field_names); free(field_types);
+        for (int i = 0; i < type_param_count; i++) free(type_params[i]);
+        free(type_params); free(name);
         return node;
     }
     else if (p->current.type == TOKEN_IMPL) {

@@ -1026,10 +1026,57 @@ static void semantic_visit_statement(SemanticContext* ctx, ASTNode* node) {
             break;
         /* ─── Phase 2: struct / impl / enum / match / place-assign ────── */
         case AST_STRUCT_DECL: {
-            /* Already registered during the pre-pass; nothing to visit.
-             * We could validate field types here, but the type names are
-             * already validated lazily when variables are declared with
-             * those types. */
+            /* Already registered during the pre-pass; nothing to visit
+             * for non-generic structs. For generic structs (Generics PR 1),
+             * we validate:
+             *   - Type parameter names are unique within the declaration.
+             *   - Each field type is a builtin, a declared struct name, or
+             *     one of this struct's type parameters. This catches typos
+             *     like `struct Pair<A, B> { first: C }` (C is not a type
+             *     param) early, instead of letting them leak as
+             *     LAMO_TYPE_UNKNOWN at use sites. */
+            ASTStructDecl* sd = (ASTStructDecl*)node;
+            /* Check type parameter uniqueness. */
+            for (int i = 0; i < sd->type_param_count; i++) {
+                for (int j = i + 1; j < sd->type_param_count; j++) {
+                    if (strcmp(sd->type_params[i], sd->type_params[j]) == 0) {
+                        char message[256];
+                        snprintf(message, sizeof(message),
+                                 "duplicate type parameter '%s' in struct '%s'",
+                                 sd->type_params[i], sd->name);
+                        semantic_error_at(ctx, node->line, node->column, message);
+                    }
+                }
+            }
+            /* Validate field types. Skip NULL annotations (legacy). */
+            for (int i = 0; i < sd->field_count; i++) {
+                const char* ft = sd->field_types[i];
+                if (!ft) continue;
+                /* Builtins are always OK. */
+                if (strcmp(ft, "int") == 0 || strcmp(ft, "float") == 0 ||
+                    strcmp(ft, "bool") == 0 || strcmp(ft, "string") == 0 ||
+                    strcmp(ft, "array") == 0 || strcmp(ft, "void") == 0) {
+                    continue;
+                }
+                /* Declared struct names are OK. */
+                if (find_struct_def(ctx, ft)) continue;
+                /* Type parameters of THIS struct are OK. */
+                int is_type_param = 0;
+                for (int j = 0; j < sd->type_param_count; j++) {
+                    if (strcmp(ft, sd->type_params[j]) == 0) {
+                        is_type_param = 1;
+                        break;
+                    }
+                }
+                if (is_type_param) continue;
+                /* Otherwise: unknown type. */
+                char message[256];
+                snprintf(message, sizeof(message),
+                         "struct '%s' field '%s' has unknown type '%s' (expected a builtin, a declared struct, or one of the type parameters %s)",
+                         sd->name, sd->field_names[i], ft,
+                         sd->type_param_count > 0 ? "declared after the struct name" : "(this struct is not generic)");
+                semantic_error_at(ctx, node->line, node->column, message);
+            }
             break;
         }
         case AST_IMPL_DECL: {
@@ -1573,6 +1620,49 @@ static LamoType semantic_infer_expression(SemanticContext* ctx, ASTNode* node) {
                     semantic_infer_expression(ctx, sl->field_values[i]);
                 }
                 return LAMO_TYPE_UNKNOWN;
+            }
+            /* Generics PR 1: validate type argument count.
+             *   - If the struct is generic, type_arg_count must equal type_param_count.
+             *   - If the struct is non-generic, type_arg_count must be 0.
+             * We also validate that each type arg is a known type (builtin
+             * or declared struct). Type parameters as type args (i.e.,
+             * using one generic struct inside another generic struct's
+             * field) is future work — for PR 1 we only support concrete
+             * instantiations. */
+            if (sd->type_param_count > 0) {
+                if (sl->type_arg_count != sd->type_param_count) {
+                    char message[256];
+                    snprintf(message, sizeof(message),
+                             "struct '%s' expects %d type argument(s) <%s>, but %d were provided",
+                             sl->struct_name, sd->type_param_count,
+                             sd->type_param_count > 0 ? sd->type_params[0] : "",
+                             sl->type_arg_count);
+                    semantic_error_at(ctx, node->line, node->column, message);
+                }
+            } else {
+                if (sl->type_arg_count > 0) {
+                    char message[256];
+                    snprintf(message, sizeof(message),
+                             "struct '%s' is not generic; remove the '<...>' type arguments",
+                             sl->struct_name);
+                    semantic_error_at(ctx, node->line, node->column, message);
+                }
+            }
+            /* Validate each type arg is a known type (builtin or struct). */
+            for (int i = 0; i < sl->type_arg_count; i++) {
+                const char* ta = sl->type_args[i];
+                if (!ta) continue;
+                if (strcmp(ta, "int") == 0 || strcmp(ta, "float") == 0 ||
+                    strcmp(ta, "bool") == 0 || strcmp(ta, "string") == 0 ||
+                    strcmp(ta, "array") == 0) {
+                    continue;
+                }
+                if (find_struct_def(ctx, ta)) continue;
+                char message[256];
+                snprintf(message, sizeof(message),
+                         "type argument '%s' in struct literal '%s' is not a known type (expected a builtin or a declared struct)",
+                         ta, sl->struct_name);
+                semantic_error_at(ctx, node->line, node->column, message);
             }
             /* Validate each field name exists in the struct. */
             for (int i = 0; i < sl->field_count; i++) {
