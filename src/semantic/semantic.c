@@ -31,7 +31,12 @@ typedef enum {
      * stored separately on the Symbol (struct_name field) since multiple
      * distinct struct types exist. */
     LAMO_TYPE_ARRAY,
-    LAMO_TYPE_STRUCT
+    LAMO_TYPE_STRUCT,
+    /* Generics PR 2: VOID is produced by functions annotated `-> void`.
+     * Per SPEC §6.3/§7.5, using a void value in a boolean context (if /
+     * while / for conditions, && || ! operands) is a COMPILE-TIME error;
+     * semantic_check_truthy_operand() enforces exactly that. */
+    LAMO_TYPE_VOID
 } LamoType;
 
 typedef enum {
@@ -59,12 +64,45 @@ typedef struct Symbol {
      * name (e.g. "Player"). Borrowed pointer into the matching
      * ASTStructDecl->name — NOT owned. NULL for non-struct symbols. */
     const char* struct_name;
+    /* ── Phase 3 item "track declarations by scope level" ────────────────
+     * scope_level records the nesting depth at which this symbol was
+     * declared: 0 = global/top-level, 1 = function body, 2+ = nested
+     * blocks (if/while/for bodies and bare blocks). The Scope that owns
+     * the symbol knows its own level too (see Scope below), so duplicate
+     * detection and future visibility rules can reason about shadowing
+     * across levels without re-walking scopes. */
+    int scope_level;
+    /* ── Generics PR 2: full annotated-signature storage ────────────────
+     * All strings are NORMALIZED (semantic_normalize_type()) borrowed
+     * pointers into the intern table — NOT individually freed.
+     *
+     * full_type   — variable's normalized annotation ("int",
+     *               "array<int>", "pair<int,string>"); NULL when the let
+     *               had no annotation or inference produced only the
+     *               legacy LamoType enum value.
+     * param_full  — array of arity entries; entry i is the normalized
+     *               annotation of parameter i or NULL (unannotated).
+     * ret_full    — normalized return annotation or NULL.
+     * tp_names    — for generic fns: type parameter names ("T", ...
+     *               aligned with constraints). tp_count==0 => non-generic.
+     * tp_constraints — per-parameter constraint name from the PR 6
+     *               catalogue ("Ord","Eq","Hash","Show","Num") or NULL. */
+    const char* full_type;
+    const char** param_full;
+    const char* ret_full;
+    const char** tp_names;
+    const char** tp_constraints;
+    int tp_count;
     struct Symbol* next;
 } Symbol;
 
 typedef struct Scope {
     Symbol* symbols;
     struct Scope* parent;
+    /* Phase 3 item "track declarations by scope level": depth of this
+     * scope in the nesting chain. The global scope created by
+     * semantic_analyze_full has level 0; every scope_push adds 1. */
+    int level;
 } Scope;
 
 /* Sprint 3: source lookup callback so semantic_error_at can print the
@@ -122,10 +160,32 @@ typedef struct {
      * name so that `self` references inside method bodies can be
      * resolved. NULL outside of impl method bodies. */
     const char* current_impl_struct;
+    /* Generics PR 2 §4.4: type parameters inherited from an enclosing
+     * generic impl (`impl<T> Stack<T>`). Method signatures may use these
+     * like their own fn type parameters. Borrowed into intern table;
+     * NULL/0 outside impl blocks or for non-generic impls. */
+    const char* const* impl_tp_names;
+    int impl_tp_count;
+    /* Generics PR 2 §4.3/§5.2: type parameters of the function CURRENTLY
+     * being visited (`fn id<T>` while walking its body/literals). Set in
+     * the AST_FN_DECL case; NULL/0 elsewhere. Struct literals like
+     * `Option<T> { ... }` consult this so payloads can be parameterized
+     * over the enclosing function's parameters. */
+    const char* const* cur_fn_tp_names;
+    int cur_fn_tp_count;
 } SemanticContext;
 
 static void semantic_visit_statement(SemanticContext* ctx, ASTNode* node);
 static LamoType semantic_infer_expression(SemanticContext* ctx, ASTNode* node);
+/* Phase 2 struct registry lookup — referenced by the PR 6 constraint
+ * catalogue defined further below (ast.h is already included via
+ * semantic.h, so the types are complete here). */
+static ASTStructDecl* find_struct_def(SemanticContext* ctx, const char* name);
+static void semantic_error_at(SemanticContext* ctx, int line, int column, const char* message);
+/* Generics PR 2/3: annotation resolvers — defined after the machinery
+ * block that uses them; declared here. */
+static LamoType annotation_to_type_with_ctx(SemanticContext* ctx, const char* annotation);
+static LamoType annotation_resolve_full(SemanticContext* ctx, const char* annotation, const char** out_norm);
 /* Sprint 4: forward declaration so semantic_error_at can delegate to
  * the hinted variant below. */
 static void semantic_error_at_hint(SemanticContext* ctx, int line, int column,
@@ -145,13 +205,327 @@ static const char* type_name(LamoType type) {
         case LAMO_TYPE_BOOL:   return "bool";
         case LAMO_TYPE_ARRAY:  return "array";
         case LAMO_TYPE_STRUCT: return "struct";
+        case LAMO_TYPE_VOID:   return "void";
         case LAMO_TYPE_UNKNOWN: return "unknown";
     }
     return "unknown";
 }
 
+/* ════════════════════════════════════════════════════════════════════
+ * Generics PR 2 / PR 3 / PR 6: normalized full-type machinery.
+ *
+ * The parser now delivers annotations like "array<int>" or
+ * "Pair<int, array<string>>". To CHECK them (PR 2 call sites) and BIND
+ * type parameters (T := int), we need three primitives:
+ *
+ *   semantic_normalize_type(raw) — canonical compact spelling
+ *       - strips ALL whitespace around '<' ',' '>'
+ *       - lowercases the head only when it spells a builtin
+ *         ("Array" -> "array"); user struct names stay case-sensitive
+ *   ann_equal(a, b)              — structural equality of two
+ *                                  ALREADY-normalized types
+ *   ann_subst(ann, map)          — replaces free type parameters with
+ *                                  their bound concrete types,
+ *                                  recursively, returning malloc'd text
+ *   lamo_intern_type(str)        — stable borrowed pointer for storage
+ *                                  on Symbols/AST nodes
+ *
+ * Everything else in the compiler keeps working unchanged: the legacy
+ * LamoType enum path is untouched; this layer only ADDS checks when
+ * annotations are present.
+ * ════════════════════════════════════════════════════════════════════ */
+
+/* Intern table: grows-only, process-lifetime. Strings stored here are
+ * never freed — deliberate (the compiler is short-lived and this keeps
+ * every borrowed pointer valid from semantic pass through codegen). */
+static char** g_lamo_intern = NULL;
+static int g_lamo_intern_count = 0;
+static int g_lamo_intern_cap = 0;
+
+static const char* lamo_intern_type(const char* s) {
+    if (!s) return NULL;
+    for (int i = 0; i < g_lamo_intern_count; i++) {
+        if (strcmp(g_lamo_intern[i], s) == 0) return g_lamo_intern[i];
+    }
+    if (g_lamo_intern_count == g_lamo_intern_cap) {
+        g_lamo_intern_cap = g_lamo_intern_cap ? g_lamo_intern_cap * 2 : 64;
+        char** grown = realloc(g_lamo_intern, sizeof(char*) * (size_t)g_lamo_intern_cap);
+        if (!grown) {
+            perror("Failed to grow type intern table");
+            exit(EXIT_FAILURE);
+        }
+        g_lamo_intern = grown;
+    }
+    char* copy = strdup(s);
+    if (!copy) {
+        perror("Failed to intern type string");
+        exit(EXIT_FAILURE);
+    }
+    g_lamo_intern[g_lamo_intern_count++] = copy;
+    return copy;
+}
+
+/* Is `head` a builtin type name in any accepted spelling? */
+static int is_builtin_type_head(const char* head) {
+    static const char* kBuiltins[] = {
+        "int", "float", "string", "bool", "array", "void", NULL
+    };
+    for (int i = 0; kBuiltins[i]; i++) {
+        if (strcmp(head, kBuiltins[i]) == 0) return 1;
+        /* Accepted alternate spellings (RFC §7.1: Array<T> etc.). */
+        char capbuf[32];
+        snprintf(capbuf, sizeof(capbuf), "%c%s",
+                 (char)(kBuiltins[i][0] - 32), kBuiltins[i] + 1);
+        if (strcmp(head, capbuf) == 0) return 1;
+    }
+    return 0;
+}
+
+/* Normalize an annotation into a malloc'd compact string. */
+static char* semantic_normalize_type(const char* raw) {
+    if (!raw) return NULL;
+    size_t n = strlen(raw);
+    char* out = malloc(n + 1);
+    if (!out) {
+        perror("Failed to allocate normalized type buffer");
+        exit(EXIT_FAILURE);
+    }
+    size_t o = 0;
+    /* Extract head identifier. */
+    size_t h = 0;
+    while (h < n && raw[h] != '<') h++;
+    /* Head word without spaces (defensive — parser output has none). */
+    size_t head_end = h;
+    while (head_end > 0 && (raw[head_end-1] == ' ' || raw[head_end-1] == '\t')) head_end--;
+    int builtin_head = 0;
+    {
+        char headbuf[64];
+        size_t len = head_end < sizeof(headbuf)-1 ? head_end : sizeof(headbuf)-1;
+        memcpy(headbuf, raw, len);
+        headbuf[len] = '\0';
+        builtin_head = is_builtin_type_head(headbuf);
+    }
+    for (size_t i = 0; i < head_end; i++) {
+        char c = raw[i];
+        if (builtin_head && c >= 'A' && c <= 'Z') c = (char)(c + 32);
+        out[o++] = c;
+    }
+    /* Copy the remainder verbatim except whitespace. */
+    for (size_t i = h; i < n; i++) {
+        char c = raw[i];
+        if (c == ' ' || c == '\t') continue;
+        if (builtin_head && o < h && c >= 'A' && c <= 'Z') { /* unreachable guard */ }
+        out[o++] = c;
+    }
+    out[o] = '\0';
+    return out;
+}
+
+/* Base head of a normalized annotation ("array" of "array<int>"). */
+static void ann_head(const char* ann, char* out, size_t out_size) {
+    if (!ann) { out[0] = '\0'; return; }
+    size_t i = 0;
+    while (ann[i] && ann[i] != '<' && i + 1 < out_size) {
+        out[i] = ann[i];
+        i++;
+    }
+    out[i] = '\0';
+}
+
+/* Structural equality over normalized strings. Because normalization is
+ * canonical (no spaces, builtin heads lowercase), plain strcmp suffices.
+ * Kept as a named function so future canonicalizations (e.g. u8 vs byte)
+ * have one place to change. */
+static int ann_equal(const char* a, const char* b) {
+    if (a == b) return 1;
+    if (!a || !b) return 0;
+    return strcmp(a, b) == 0;
+}
+
+/* Map for ann_subst: parallel arrays of names + normalized values. */
+typedef struct {
+    const char** names;     /* tp name e.g. "T"           */
+    const char** values;    /* bound normalized type      */
+    int count;
+} AnnSubstMap;
+
+/* Substitute type parameters per map, writing compact result into sb.
+ * `pos` walks the annotation string; recursion handles nesting. Both
+ * leave pos past what was consumed. Returns 1 on success. */
+static int ann_subst_into(const char** pos, const AnnSubstMap* map, char* out, size_t out_size, size_t* olen);
+
+static int ann_subst_ident(const char** pos, const AnnSubstMap* map, char* out, size_t out_size, size_t* olen) {
+    const char* p = *pos;
+    size_t o = *olen;
+    size_t start = 0;
+    while (p[start] && p[start] != '<' && p[start] != '>' &&
+           p[start] != ',' ) start++;
+    if (start == 0) return 0;
+    char word[128];
+    size_t w = start < sizeof(word)-1 ? start : sizeof(word)-1;
+    memcpy(word, p, w);
+    word[w] = '\0';
+    /* Replace with binding when the word IS a type parameter. */
+    const char* replacement = NULL;
+    for (int i = 0; i < map->count; i++) {
+        if (strcmp(map->names[i], word) == 0) { replacement = map->values[i]; break; }
+    }
+    const char* emit = replacement ? replacement : word;
+    size_t elen = strlen(emit);
+    if (o + elen + 1 > out_size) return 0;
+    memcpy(out + o, emit, elen + 1);
+    *olen = o + elen;
+    *pos = p + start;
+    return 1;
+}
+
+static int ann_subst_into(const char** pos, const AnnSubstMap* map, char* out, size_t out_size, size_t* olen) {
+    const char* p = *pos;
+    if (*p == '<') {
+        /* Nesting opens right after an ident; recurse element-wise. */
+        size_t o = *olen;
+        if (o + 2 > out_size) return 0;
+        out[o++] = '<';
+        *olen = o;
+        p++;  /* consume '<' */
+        while (*p && *p != '>') {
+            if (!ann_subst_into(&p, map, out, out_size, olen)) return 0;
+            p = *p == ',' ? p : p;  /* no-op; handled below */
+            if (*p == ',') {
+                if (*olen + 2 > out_size) return 0;
+                out[(*olen)++] = ',';
+                out[*olen] = '\0';
+                p++;
+            }
+        }
+        if (*p != '>') return 0;
+        if (*olen + 2 > out_size) return 0;
+        out[(*olen)++] = '>';
+        out[*olen] = '\0';
+        *pos = p + 1;  /* consume '>' */
+        return 1;
+    }
+    return ann_subst_ident(pos, map, out, out_size, olen);
+}
+
+/* Top-level subst wrapper. Returns malloc'd normalized substituted string,
+ * or NULL on malformed input (which should not happen post-parse). */
+static char* ann_subst(const char* ann, const AnnSubstMap* map) {
+    if (!ann) return NULL;
+    size_t cap = strlen(ann) * 4 + 64;
+    char* buf = malloc(cap);
+    if (!buf) {
+        perror("Failed to allocate substitution buffer");
+        exit(EXIT_FAILURE);
+    }
+    size_t len = 0;
+    buf[0] = '\0';
+    const char* pos = ann;
+    while (*pos) {
+        if (!ann_subst_into(&pos, map, buf, cap, &len)) {
+            free(buf);
+            return NULL;
+        }
+    }
+    return buf;
+}
+
+/* ── PR 6: constraint catalogue ────────────────────────────────────── */
+
+typedef enum {
+    LAMO_CON_ANY,    /* every type                        */
+    LAMO_CON_EQ,     /* == != support                     */
+    LAMO_CON_ORD,    /* < <= > >= == !=                   */
+    LAMO_CON_NUM,    /* + - * /                           */
+    LAMO_CON_HASH,   /* hashable keys                     */
+    LAMO_CON_SHOW    /* printable via print()/to_string   */
+} LamoConstraintKind;
+
+/* Map catalogue name -> kind. Returns -1 for unknown constraints. */
+static int lamo_constraint_kind(const char* name) {
+    if (!name) return -1;
+    if (strcmp(name, "Any") == 0)  return LAMO_CON_ANY;
+    if (strcmp(name, "Eq") == 0)   return LAMO_CON_EQ;
+    if (strcmp(name, "Ord") == 0)  return LAMO_CON_ORD;
+    if (strcmp(name, "Num") == 0)  return LAMO_CON_NUM;
+    if (strcmp(name, "Hash") == 0) return LAMO_CON_HASH;
+    if (strcmp(name, "Show") == 0) return LAMO_CON_SHOW;
+    return -1;
+}
+
+static const char* lamo_constraint_name(int kind) {
+    switch (kind) {
+        case LAMO_CON_ANY:  return "Any";
+        case LAMO_CON_EQ:   return "Eq";
+        case LAMO_CON_ORD:  return "Ord";
+        case LAMO_CON_NUM:  return "Num";
+        case LAMO_CON_HASH: return "Hash";
+        case LAMO_CON_SHOW: return "Show";
+    }
+    return "?";
+}
+
+/* RFC §6 initial implementation: constraints checked against BUILTIN
+ * types only. User structs satisfy Any alone (documented limitation).
+ * `normalized` must already be normalized; only its HEAD is inspected. */
+static int lamo_type_satisfies_constraint(SemanticContext* ctx, const char* normalized, int kind) {
+    if (kind == LAMO_CON_ANY) return 1;
+    char head[64];
+    ann_head(normalized, head, sizeof(head));
+    int is_num = strcmp(head, "int") == 0 || strcmp(head, "float") == 0;
+    int is_str = strcmp(head, "string") == 0;
+    int is_bool = strcmp(head, "bool") == 0;
+    switch (kind) {
+        case LAMO_CON_EQ:
+        case LAMO_CON_ORD:
+        case LAMO_CON_HASH:
+            return is_num || is_str || is_bool;
+        case LAMO_CON_NUM:
+            return is_num;
+        case LAMO_CON_SHOW:
+            return is_num || is_str || is_bool || strcmp(head, "array") == 0 ||
+                   find_struct_def(ctx, head) != NULL ||
+                   strcmp(head, "") == 0 /* unknown head: defer */;
+        default:
+            return 0;
+    }
+}
+
 static int is_numeric_type(LamoType type) {
     return type == LAMO_TYPE_INT || type == LAMO_TYPE_FLOAT;
+}
+
+/* Generics PR 3 / migration §9: warning channel. Warnings go to stderr,
+ * NEVER fail compilation and never appear on stdout — regression tests
+ * that compare stdout stay unaffected. Format mirrors the error style:
+ *     <file>:<line>:<col>: warning: <message> */
+static void semantic_warn_at(SemanticContext* ctx, int line, int column, const char* message) {
+    const char* label = ctx->last_node_path ? ctx->last_node_path :
+                        (ctx->file_path ? ctx->file_path : "<input>");
+    if (lamo_error_use_color()) {
+        fprintf(stderr, "%s:%d:%d: %swarning:%s %s\n",
+                label, line, column,
+                LAMO_COLOR_BOLD, LAMO_COLOR_RESET, message);
+    } else {
+        fprintf(stderr, "%s:%d:%d: warning: %s\n", label, line, column, message);
+    }
+}
+
+/* ── Truthiness-domain check (SPEC §6.3 / §7.5) ──────────────────────
+ * All Lamo types have defined truthiness EXCEPT void. Conditions
+ * (if/while/for) and &&/||/! operands reject VOID values at compile
+ * time per the spec's explicit rule. UNKNOWN defers silently so error
+ * cascades don't multiply. */
+static void semantic_check_truthy_operand(SemanticContext* ctx, LamoType t,
+                                          const char* where,
+                                          int line, int column) {
+    if (t == LAMO_TYPE_VOID) {
+        char message[256];
+        snprintf(message, sizeof(message),
+                 "void value used in boolean context (%s); a function declared '-> void' returns nothing",
+                 where);
+        semantic_error_at(ctx, line, column, message);
+    }
 }
 
 static Scope* scope_push(Scope* parent) {
@@ -163,6 +537,9 @@ static Scope* scope_push(Scope* parent) {
 
     scope->symbols = NULL;
     scope->parent = parent;
+    /* Phase 3 "track declarations by scope level": depth = parent+1,
+     * global scope (NULL parent) stays at 0. */
+    scope->level = parent ? parent->level + 1 : 0;
     return scope;
 }
 
@@ -288,6 +665,16 @@ static void scope_define(SemanticContext* ctx, Scope* scope, const char* name, S
     symbol->column = column;
     symbol->file_path = file_path;
     symbol->struct_name = NULL;  /* Phase 2: set by callers via scope_define_struct */
+    /* Phase 3: record which nesting level owns this declaration. */
+    symbol->scope_level = scope->level;
+    /* Generics PR 2: annotated-signature fields start empty; they are
+     * populated right after registration by the fn/var visiting paths. */
+    symbol->full_type = NULL;
+    symbol->param_full = NULL;
+    symbol->ret_full = NULL;
+    symbol->tp_names = NULL;
+    symbol->tp_constraints = NULL;
+    symbol->tp_count = 0;
     symbol->next = scope->symbols;
     scope->symbols = symbol;
 }
@@ -384,6 +771,88 @@ static ASTFnDecl* find_method(SemanticContext* ctx, const char* struct_name, con
     return NULL;
 }
 
+/* Find an impl block for a struct by name. Returns NULL if not found.
+ * Generics PR 2 §4.4: used by typed method dispatch to resolve the
+ * impl's type parameters against the receiver's instantiation. */
+static ASTImplDecl* find_impl_decl(SemanticContext* ctx, const char* struct_name) {
+    ASTNode* cur;
+    if (!struct_name) return NULL;
+    for (cur = ctx->impl_defs; cur; cur = cur->next) {
+        if (cur->type == AST_IMPL_DECL) {
+            ASTImplDecl* id = (ASTImplDecl*)cur;
+            if (id->struct_name && strcmp(id->struct_name, struct_name) == 0) return id;
+        }
+    }
+    return NULL;
+}
+
+/* Generics PR 2: recursive annotation-tree validator for struct field
+ * types. Every leaf identifier must be a builtin, a declared struct or
+ * one of `sd`'s own type parameters; nesting is walked recursively.
+ * Returns 1 when the whole tree resolves. */
+static int lamo_validate_annotation_tree_cursor(SemanticContext* ctx, const ASTStructDecl* sd,
+                                                const char* s, const char** end);
+static int lamo_validate_annotation_tree(SemanticContext* ctx, const ASTStructDecl* sd, const char* ann) {
+    if (!ann) return 0;
+    char* norm = semantic_normalize_type(ann);
+    const char* p = norm;
+        int ok = lamo_validate_annotation_tree_cursor(ctx, sd, p, &p);
+        /* Consume the end-pointer BEFORE freeing norm — dereferencing a
+         * freed buffer is undefined behavior (this bit us once). */
+        int fully_consumed = (*p == '\0');
+            free(norm);
+    return ok && fully_consumed;
+}
+static int lamo_validate_annotation_tree_cursor(SemanticContext* ctx, const ASTStructDecl* sd,
+                                                const char* s, const char** end) {
+    size_t i = 0;
+    while (s[i] && s[i] != '<' && s[i] != '>') i++;
+    if (i == 0) return 0;
+    char head[64];
+    size_t n = i < sizeof(head)-1 ? i : sizeof(head)-1;
+    memcpy(head, s, n);
+    head[n] = '\0';
+
+    /* Leaf validity. */
+    int leaf_ok = strcmp(head,"int")==0 || strcmp(head,"float")==0 ||
+                  strcmp(head,"bool")==0 || strcmp(head,"string")==0 ||
+                  strcmp(head,"array")==0 || strcmp(head,"void")==0;
+    if (!leaf_ok && find_struct_def(ctx, head)) leaf_ok = 1;
+    if (!leaf_ok && sd) {
+        for (int j = 0; j < sd->type_param_count; j++) {
+            if (strcmp(head, sd->type_params[j]) == 0) { leaf_ok = 1; break; }
+        }
+    }
+    if (!leaf_ok && sd == NULL) {
+        /* Called without a declaring struct (expression contexts): a leaf
+         * may be any in-scope type parameter (impl-level or enclosing
+         * fn-level) or a declared enum/builtin handled by callers. */
+        int i;
+        for (i = 0; i < ctx->impl_tp_count; i++) {
+            if (strcmp(head, ctx->impl_tp_names[i]) == 0) { leaf_ok = 1; break; }
+        }
+        if (!leaf_ok) {
+            for (i = 0; i < ctx->cur_fn_tp_count; i++) {
+                if (strcmp(head, ctx->cur_fn_tp_names[i]) == 0) { leaf_ok = 1; break; }
+            }
+        }
+    }
+    if (!leaf_ok) return 0;
+    s += i;
+
+    if (*s != '<') { *end = s; return 1; }
+    /* Nested list — walk element-wise recursively. */
+    s++;
+    while (*s && *s != '>') {
+        if (!lamo_validate_annotation_tree_cursor(ctx, sd, s, &s)) return 0;
+        if (*s == ',') s++;
+        else break;
+    }
+    if (*s != '>') return 0;
+    *end = s + 1;
+    return 1;
+}
+
 static void semantic_visit_block(SemanticContext* ctx, ASTBlock* block) {
     Scope* parent = ctx->current_scope;
     ctx->current_scope = scope_push(parent);
@@ -397,13 +866,397 @@ static void semantic_visit_block(SemanticContext* ctx, ASTBlock* block) {
     scope_free(finished);
 }
 
-// Visit a call site: validates arity, runs builtin-specific checks, and
-// returns the inferred return type of the call. The args themselves are
-// visited (and their types inferred) as part of the validation.
-static LamoType semantic_visit_call(SemanticContext* ctx, const char* name, ASTNode** args, int arg_count, int line, int column) {
+/* ── Generics PR 2: compile-time type binding at call sites ────────── */
+
+#define LAMO_MAX_BIND_ARGS 32
+
+/* Generics PR 2 §4.4: find the (first) impl block declared for a struct. */
+static ASTImplDecl* find_impl_decl(SemanticContext* ctx, const char* struct_name);
+/* Defined later in this file; needed by typed method dispatch below. */
+static const char* arg_concrete_full_type(SemanticContext* ctx, ASTNode* node);
+static int ann_bind_pattern(const char* pattern, const char* concrete, AnnSubstMap* map);
+
+/* Split top-level type arguments of a normalized instantiation
+ * ("stack<int>" -> head="stack", args=["int"]). *out_args receives a
+ * malloc'd array of interned strings (free the ARRAY only); returns the
+ * count, or -1 when the annotation carries no angle list. */
+static int ann_split_top_args(const char* norm, char* out_head, size_t head_size,
+                              const char*** out_args) {
+    *out_args = NULL;
+    *out_head = '\0';
+    const char* lt = strchr(norm, '<');
+    if (!lt) {
+        snprintf(out_head, head_size, "%s", norm);
+        return -1;
+    }
+    size_t hlen = (size_t)(lt - norm);
+    if (hlen >= head_size) hlen = head_size - 1;
+    memcpy(out_head, norm, hlen);
+    *(out_head + hlen) = '\0';
+
+    /* Walk the angle list tracking depth, slicing between commas. */
+    const char** items = NULL;
+    int count = 0;
+    const char* p = lt + 1;
+    const char* start = p;
+    int depth = 1;
+    while (*p) {
+        if (*p == '<') depth++;
+        else if (*p == '>') { depth--; if (depth == 0) break; }
+        else if (*p == ',' && depth == 1) {
+            char slice[128];
+            size_t len = (size_t)(p - start);
+            len = len < sizeof(slice) - 1 ? len : sizeof(slice) - 1;
+            memcpy(slice, start, len);
+            slice[len] = '\0';
+            const char** grown = realloc(items, sizeof(const char*) * (size_t)(count + 1));
+            if (!grown) { free(items); return -1; }
+            items = grown;
+            items[count++] = lamo_intern_type(slice);
+            start = p + 1;
+        }
+        p++;
+    }
+    if (depth != 0 || p == start) { free(items); return -1; }  /* empty <> */
+    char slice[128];
+    size_t len = (size_t)(p - start);
+    len = len < sizeof(slice) - 1 ? len : sizeof(slice) - 1;
+    memcpy(slice, start, len);
+    slice[len] = '\0';
+    const char** grown = realloc(items, sizeof(const char*) * (size_t)(count + 1));
+    if (!grown) { free(items); return -1; }
+    items = grown;
+    items[count++] = lamo_intern_type(slice);
+    *out_args = items;
+    return count;
+}
+
+/* Typed struct-method dispatch (RFC §4.4 + §5): given a receiver whose
+ * variable carries an instantiated full type ("stack<int>") and the
+ * matched method's annotated signature, validate argument compatibility
+ * and optionally annotate the call with the substituted return type.
+ * Everything degrades gracefully to the legacy arity-only behavior when
+ * instantiations or annotations are missing. */
+static void check_struct_method_call(SemanticContext* ctx, ASTMemberCall* mc,
+                                     const char* obj_struct_name,
+                                     ASTNode* call_node, int line, int column) {
+    ASTFnDecl* method = find_method(ctx, obj_struct_name, mc->member_name);
+    if (!method) return;  /* caller already reported unknown method */
+
+    /* Receiver instantiation (may be NULL for unannotated vars). */
+    Symbol* recv_sym = NULL;
+    if (mc->object->type == AST_IDENTIFIER) {
+        recv_sym = scope_find(ctx->current_scope, ((ASTIdentifier*)mc->object)->name);
+    }
+    const char* recv_full = recv_sym && recv_sym->kind == SYMBOL_VAR ? recv_sym->full_type : NULL;
+
+    ASTImplDecl* impl = find_impl_decl(ctx, obj_struct_name);
+    int tp_count = impl ? impl->type_param_count : 0;
+    if (tp_count == 0 || !recv_full) return;   /* nothing generic to do */
+
+    char head[64];
+    const char** rargs = NULL;
+    int nargs = ann_split_top_args(recv_full, head, sizeof(head), &rargs);
+    if (nargs <= 0) { free(rargs); return; }
+    if (head[0] == '\0' || strcmp(head, obj_struct_name) != 0 || nargs != tp_count) {
+        free(rargs);
+        return;
+    }
+
+    AnnSubstMap map;
+    map.names = malloc(sizeof(const char*) * (size_t)tp_count);
+    map.values = malloc(sizeof(const char*) * (size_t)tp_count);
+    map.count = tp_count;
+    if (!map.names || !map.values) {
+        perror("Failed to allocate method binding map");
+        exit(EXIT_FAILURE);
+    }
+    for (int i = 0; i < tp_count; i++) {
+        map.names[i] = lamo_intern_type(impl->type_params[i]);
+        map.values[i] = rargs[i];
+    }
+
+    /* Validate arguments against the method's parameter annotations. */
+    int limit = mc->arg_count < LAMO_MAX_BIND_ARGS ? mc->arg_count : LAMO_MAX_BIND_ARGS;
+    for (int i = 0; i < limit; i++) {
+        const char* raw_pat = method->param_types ? method->param_types[i] : NULL;
+        if (!raw_pat) continue;
+        char* pat_norm = semantic_normalize_type(raw_pat);
+        const char* pat_interned = lamo_intern_type(pat_norm);
+        free(pat_norm);
+        const char* actual = arg_concrete_full_type(ctx, mc->args[i]);
+        if (!actual) continue;
+        int r = ann_bind_pattern(pat_interned, actual, &map);
+        if (r == 0) {
+            char message[300];
+            snprintf(message, sizeof(message),
+                     "argument %d to method '%s.%s': expected type '%s', got '%s'",
+                     i + 1, obj_struct_name, mc->member_name, pat_interned, actual);
+            semantic_error_at(ctx, line, column, message);
+        }
+    }
+
+    /* Constraint satisfaction of the receiver instantiation. */
+    for (int t = 0; t < tp_count; t++) {
+        /* Note: impl-level constraints are not parsed onto the impl today
+         * (PR 6 grammar covers fn/struct lists); placeholder keeps the
+         * door open without changing behavior. */
+        (void)t;
+    }
+
+    /* Annotate the substituted return type when annotated. */
+    if (method->return_type_annotation && call_node) {
+        char* ret_norm = semantic_normalize_type(method->return_type_annotation);
+        char* substituted = ann_subst(ret_norm, &map);
+        free(ret_norm);
+        if (substituted) {
+            call_node->sema_full_type = lamo_intern_type(substituted);
+            free(substituted);
+        }
+    }
+
+    free(map.names);
+    free(map.values);
+    free(rargs);
+}
+
+/* Best-effort concrete full type of an already-visited argument node.
+ * Returns a normalized interned string, or NULL when unknown. Covers
+ * the cases that matter for real call sites: literals, identifiers,
+ * array literals of inferable elements and nested calls whose result
+ * type was annotated on the node by an earlier inference round. */
+static const char* arg_concrete_full_type(SemanticContext* ctx, ASTNode* node) {
+    if (!node) return NULL;
+    switch (node->type) {
+        case AST_INT_LITERAL:    return lamo_intern_type("int");
+        case AST_FLOAT_LITERAL:  return lamo_intern_type("float");
+        case AST_STRING_LITERAL: return lamo_intern_type("string");
+        case AST_BOOL_LITERAL:   return lamo_intern_type("bool");
+        case AST_IDENTIFIER: {
+            Symbol* s = scope_find(ctx->current_scope,
+                                   ((ASTIdentifier*)node)->name);
+            if (s && s->kind == SYMBOL_VAR) {
+                if (s->full_type) return s->full_type;
+                if (s->struct_name) return lamo_intern_type(s->struct_name);
+                /* Fall back to the legacy enum inference. */
+                switch (s->type) {
+                    case LAMO_TYPE_INT:    return lamo_intern_type("int");
+                    case LAMO_TYPE_FLOAT:  return lamo_intern_type("float");
+                    case LAMO_TYPE_STRING: return lamo_intern_type("string");
+                    case LAMO_TYPE_BOOL:   return lamo_intern_type("bool");
+                    default: return NULL;
+                }
+            }
+            return NULL;
+        }
+        case AST_ARRAY_LITERAL: {
+            /* PR 3 §5.1: [a,b,c] infers array<T> via least-upper-bound
+             * over element concrete types; heterogeneous arrays stay
+             * plain "array" (the PR 3 warning handles them at decl). */
+            ASTArrayLiteral* arr = (ASTArrayLiteral*)node;
+            const char* lub = NULL;
+            int conflict = 0;
+            for (int i = 0; i < arr->element_count; i++) {
+                const char* t = arg_concrete_full_type(ctx, arr->elements[i]);
+                if (!t) { lub = NULL; break; }
+                char head[32];
+                ann_head(t, head, sizeof(head));
+                int is_num_t = strcmp(head, "int") == 0 || strcmp(head, "float") == 0;
+                if (!lub) { lub = t; continue; }
+                if (ann_equal(lub, t)) continue;
+                char prev_head[32];
+                ann_head(lub, prev_head, sizeof(prev_head));
+                int both_num = (strcmp(prev_head,"int")==0 || strcmp(prev_head,"float")==0) && is_num_t;
+                if (both_num) { lub = lamo_intern_type("float"); continue; }
+                conflict = 1;
+                lub = NULL;
+                break;
+            }
+            if (conflict || !lub) return lamo_intern_type("array");
+            char buf[160];
+            snprintf(buf, sizeof(buf), "array<%s>", lub);
+            return lamo_intern_type(buf);
+        }
+        default:
+            return node->sema_full_type;  /* set by earlier rounds */
+    }
+}
+
+/* Numeric-compat rule carried over from `let` validation: top-level
+ * int ↔ float interplay is allowed (widening); everything else must be
+ * structurally equal (RFC §5.4: generics are invariant). */
+static int call_types_compatible(const char* expected_full, LamoType expected_base,
+                                 const char* actual_full, LamoType actual_base) {
+    if (expected_base == LAMO_TYPE_UNKNOWN || actual_base == LAMO_TYPE_UNKNOWN) return 1; /* defer */
+    if (actual_base == LAMO_TYPE_VOID || expected_base == LAMO_TYPE_VOID) {
+        return actual_base == expected_base;
+    }
+    int numeric_pair = (expected_base == LAMO_TYPE_INT || expected_base == LAMO_TYPE_FLOAT) &&
+                       (actual_base == LAMO_TYPE_INT || actual_base == LAMO_TYPE_FLOAT);
+    if (numeric_pair) return 1;
+    if (expected_full && actual_full) return ann_equal(expected_full, actual_full);
+    /* No strings to compare — bases decide when non-degenerate. */
+    if (!actual_full && !expected_full) return expected_base == actual_base ||
+                                                    expected_base == LAMO_TYPE_STRUCT ||
+                                                    actual_base == LAMO_TYPE_ARRAY;
+    return 0;
+}
+
+/* Bind pattern leaves against a concrete type. Returns:
+ *   1 ok/consistent, 0 conflict, -1 malformed (skip silently).
+ *
+ * Works by SIMULTANEOUS recursive descent over the (normalized) pattern
+ * and concrete annotations:
+ *   pattern  array<T>        concrete  array<int>   ⇒ binds T := int
+ *   pattern  Map<K,V>        concrete  Map<int,int> ⇒ K:=int, V:=int,
+ *                                               conflict if K were string
+ *   pattern  T               concrete  anything     ⇒ direct binding
+ * Head identifiers must match exactly unless the pattern head IS a type
+ * parameter name (RFC §5.4 invariant generics: no implicit widening). */
+static int bind_read_ident(const char** p, char* out, size_t out_size) {
+    const char* s = *p;
+    size_t i = 0;
+    while (s[i] && s[i] != '<' && s[i] != '>' && s[i] != ',') i++;
+    if (i == 0) return 0;
+    size_t n = i < out_size - 1 ? i : out_size - 1;
+    memcpy(out, s, n);
+    out[n] = '\0';
+    *p = s + i;
+    return 1;
+}
+
+/* Capture a balanced '<...>' subtree starting AT '<'. Advances *p past
+ * the closing '>'. Returns malloc'd slice including the angles. */
+static char* bind_capture_subtree(const char** p) {
+    const char* s = *p;
+    if (*s != '<') return NULL;
+    int depth = 0;
+    const char* start = s;
+    while (*s) {
+        if (*s == '<') depth++;
+        else if (*s == '>') { depth--; if (depth == 0) break; }
+        s++;
+    }
+    if (depth != 0) return NULL;
+    size_t len = (size_t)(s - start + 1);
+    char* out = malloc(len + 1);
+    if (!out) {
+        perror("Failed to allocate binding buffer");
+        exit(EXIT_FAILURE);
+    }
+    memcpy(out, start, len);
+    out[len] = '\0';
+    *p = s + 1;
+    return out;
+}
+
+static int bind_walk(const char** pp, const char** cp, AnnSubstMap* map);
+
+/* Pairwise-compare two argument lists inside matched '<' contexts.
+ * Both cursors sit right after their '<'. */
+static int bind_walk_list(const char** pp, const char** cp, AnnSubstMap* map) {
+    while (**pp && **pp != '>') {
+        if (!bind_walk(pp, cp, map)) return 0;
+        if (**pp == ',') {
+            if (**cp != ',') return 0;
+            (*pp)++; (*cp)++;
+            continue;
+        }
+        break;
+    }
+    /* Counts must agree: either both hit '>' now or the pattern list has
+     * a fixed arity mismatch against concrete. */
+    if ((**pp == '>') != (**cp == '>')) return 0;
+    return 1;
+}
+
+static int bind_walk(const char** pp, const char** cp, AnnSubstMap* map) {
+    char pid[128], cid[128];
+    if (!bind_read_ident(pp, pid, sizeof(pid))) return 0;
+    if (!bind_read_ident(cp, cid, sizeof(cid))) return 0;
+
+    /* Is the pattern head one of our type parameters? */
+    const char* bound_value = NULL;
+    int idx = -1;
+    for (int i = 0; i < map->count; i++) {
+        if (strcmp(map->names[i], pid) == 0) { idx = i; break; }
+    }
+    if (idx >= 0) {
+        /* The CONCRETE side may itself carry a nested subtree. */
+        char* csub = NULL;
+        size_t clen = strlen(cid);
+        if (**cp == '<') {
+            csub = bind_capture_subtree(cp);
+            if (!csub) return 0;
+            char* joined = malloc(clen + strlen(csub) + 1);
+            if (!joined) {
+                perror("Failed to allocate binding buffer");
+                exit(EXIT_FAILURE);
+            }
+            strcpy(joined, cid);
+            strcat(joined, csub);
+            free(csub);
+            cid[0] = '\0';
+            strncat(cid, joined, sizeof(cid) - 1);
+            free(joined);
+        }
+        bound_value = lamo_intern_type(cid);
+        if (!map->values[idx]) {
+            map->values[idx] = bound_value;
+            return 1;
+        }
+        return ann_equal(map->values[idx], bound_value) ? 1 : 0;
+    }
+
+    /* Plain identifier: heads must match. Then continue structurally. */
+    if (strcmp(pid, cid) != 0) return 0;
+
+    int p_angle = (**pp == '<');
+    int c_angle = (**cp == '<');
+    if (p_angle != c_angle) return 0;
+    if (p_angle) {
+        (*pp)++; (*cp)++;   /* consume both '<' */
+        if (!bind_walk_list(pp, cp, map)) return 0;
+        if (**pp != '>' || **cp != '>') return 0;
+        (*pp)++; (*cp)++;
+    }
+    return 1;
+}
+
+static int ann_bind_pattern(const char* pattern, const char* concrete, AnnSubstMap* map) {
+    if (!pattern || !concrete) return -1;
+    const char* pp = pattern;
+    const char* cp = concrete;
+    int r = bind_walk(&pp, &cp, map);
+    /* Full consumption required on both sides. */
+    if (r && (*pp || *cp)) return 0;
+    return r;
+}
+
+// Visit a call site: validates arity, parameter/argument types (SPEC
+// §7.3 "Function call"), binds generic type parameters with local
+// inference + optional explicit `<...>` arguments (RFC §4.5/§5.3),
+// enforces PR 6 constraints, and returns the inferred return type. The
+// args themselves are visited (and their types inferred) as part of the
+// validation.
+static LamoType semantic_visit_call_full(SemanticContext* ctx, const char* name,
+                                         char** explicit_type_args, int explicit_type_arg_count,
+                                         ASTNode** args, int arg_count,
+                                         int line, int column,
+                                         ASTNode* call_node_for_annotation) {
     Symbol* symbol = scope_find(ctx->current_scope, name);
     int builtin_arity = builtin_function_arity(name);
     LamoType return_type = LAMO_TYPE_UNKNOWN;
+
+    /* 1. Infer every argument's legacy enum type first (order preserved:
+     * errors report innermost-first as before). */
+    LamoType arg_types[LAMO_MAX_BIND_ARGS];
+    const char* arg_full[LAMO_MAX_BIND_ARGS] = {0};
+    int checkable = arg_count <= LAMO_MAX_BIND_ARGS;
+    for (int i = 0; i < arg_count; i++) {
+        arg_types[i & (LAMO_MAX_BIND_ARGS - 1)] = semantic_infer_expression(ctx, args[i]);
+        if (checkable) arg_full[i] = arg_concrete_full_type(ctx, args[i]);
+    }
 
     if (symbol && symbol->kind == SYMBOL_FN) {
         if (symbol->arity != arg_count) {
@@ -412,7 +1265,125 @@ static LamoType semantic_visit_call(SemanticContext* ctx, const char* name, ASTN
                      name, symbol->arity, arg_count);
             semantic_error_at(ctx, line, column, message);
         }
-        return_type = symbol->type;
+
+        /* ── SPEC §7.3 / Generics PR 2 + PR 6 checks ─────────────────── */
+        if (checkable && symbol->param_full && symbol->arity == arg_count) {
+            AnnSubstMap map;
+            map.names = symbol->tp_names;
+            map.values = malloc(sizeof(const char*) * (size_t)(symbol->tp_count > 0 ? symbol->tp_count : 1));
+            map.count = symbol->tp_count;
+            for (int i = 0; i < symbol->tp_count; i++) {
+                /* Explicit type arguments fill positions first (RFC §4.5). */
+                if (explicit_type_args && i < explicit_type_arg_count && explicit_type_args[i]) {
+                    char* n = semantic_normalize_type(explicit_type_args[i]);
+                    map.values[i] = lamo_intern_type(n);
+                    free(n);
+                } else {
+                    map.values[i] = NULL;
+                }
+            }
+
+            int generic_fn = symbol->tp_count > 0;
+
+            for (int i = 0; i < arg_count; i++) {
+                const char* expected = symbol->param_full[i];
+                if (!expected) continue;
+                LamoType expected_base = annotation_to_type_with_ctx(ctx, expected);
+
+                /* Type-parameter leaves: "T" or "array<T>" etc. */
+                int referenced_tp = 0;
+                for (int t = 0; t < symbol->tp_count; t++) {
+                    if (strstr(expected, symbol->tp_names[t])) { referenced_tp = 1; break; }
+                }
+
+                if (generic_fn && referenced_tp && arg_full[i]) {
+                    int r = ann_bind_pattern(expected, arg_full[i], &map);
+                    if (r == 0) {
+                        char message[400];
+                        char disp[128];
+                        snprintf(disp, sizeof(disp), "%s", expected);
+                        AnnSubstMap cur = map;
+                        char* shown = ann_subst(expected, &cur);
+                        snprintf(message, sizeof(message),
+                                 "argument %d to '%s': expected type '%s', got '%s'%s",
+                                 i + 1, name,
+                                 shown ? shown : disp,
+                                 arg_full[i],
+                                 shown ? "" : "");
+                        if (shown) free(shown);
+                        semantic_error_at(ctx, line, column, message);
+                    }
+                } else if (!referenced_tp || !generic_fn) {
+                    /* Concrete parameter annotation → direct compat. */
+                    const char* exp_norm = NULL;
+                    annotation_resolve_full(ctx, expected, &exp_norm);
+                    if (!call_types_compatible(exp_norm, expected_base,
+                                               arg_full[i], arg_types[i])) {
+                        char message[300];
+                        snprintf(message, sizeof(message),
+                                 "argument %d to '%s': expected type '%s', got '%s'",
+                                 i + 1, name,
+                                 exp_norm ? exp_norm : type_name(expected_base),
+                                 arg_full[i] ? arg_full[i] : type_name(arg_types[i]));
+                        semantic_error_at(ctx, line, column, message);
+                    }
+                }
+                /* Generic-but-unbound here: leave for the map pass below. */
+            }
+
+            /* Constraint enforcement (PR 6 §6): each BOUND parameter must
+             * satisfy its catalogue constraint; still-unbound parameters
+             * cannot be checked (already reported above only when needed). */
+            if (generic_fn) {
+                for (int t = 0; t < symbol->tp_count; t++) {
+                    const char* val = map.values[t];
+                    const char* con = symbol->tp_constraints[t];
+                    int ckind = lamo_constraint_kind(con);
+                    if (!val || ckind <= 0) continue;   /* Any/-1 skip */
+                    if (!lamo_type_satisfies_constraint(ctx, val, ckind)) {
+                        char message[300];
+                        snprintf(message, sizeof(message),
+                                 "type argument '%s' for parameter '%s' does not satisfy constraint '%s' (%s)",
+                                 val, symbol->tp_names[t], lamo_constraint_name(ckind),
+                                 ckind == LAMO_CON_NUM ? "requires int or float"
+                                 : ckind == LAMO_CON_SHOW ? "requires a printable builtin or declared struct"
+                                 : "requires a builtin with the required operations");
+                        semantic_error_at(ctx, line, column, message);
+                    }
+                }
+            }
+
+            /* Return-type computation with substitution. */
+            if (symbol->ret_full) {
+                char* substituted = ann_subst(symbol->ret_full, &map);
+                if (substituted) {
+                    const char* stored = lamo_intern_type(substituted);
+                    free(substituted);
+                    if (call_node_for_annotation) {
+                        call_node_for_annotation->sema_full_type = stored;
+                    }
+                    char head[64];
+                    ann_head(stored, head, sizeof(head));
+                    /* Legacy consumers read the enum too. */
+                    if      (strcmp(head, "int") == 0)    return_type = LAMO_TYPE_INT;
+                    else if (strcmp(head, "float") == 0)  return_type = LAMO_TYPE_FLOAT;
+                    else if (strcmp(head, "string") == 0) return_type = LAMO_TYPE_STRING;
+                    else if (strcmp(head, "bool") == 0)   return_type = LAMO_TYPE_BOOL;
+                    else if (strcmp(head, "array") == 0)  return_type = LAMO_TYPE_ARRAY;
+                    else if (find_struct_def(ctx, head))  return_type = LAMO_TYPE_STRUCT;
+                    else if (strcmp(head, "void") == 0)   return_type = LAMO_TYPE_VOID;
+                    else                                  return_type = symbol->type;
+                } else {
+                    return_type = symbol->type;
+                }
+            } else {
+                return_type = symbol->type;
+            }
+
+            free(map.values);
+        } else {
+            return_type = symbol->type;
+        }
     } else if (builtin_arity >= 0) {
         if (builtin_arity != arg_count) {
             char message[256];
@@ -424,6 +1395,22 @@ static LamoType semantic_visit_call(SemanticContext* ctx, const char* name, ASTN
         }
         // Compute return type from builtin signature (with arg-dependent types where relevant).
         return_type = builtin_function_return_type(name, args, arg_count);
+
+        /* Backend-alignment item "make print() use semantic type
+         * information": annotate the printed expression with its known
+         * full type so codegen can specialize output (named struct
+         * printing — see generate_lang_builtin_call_expr). */
+        if (strcmp(name, "print") == 0 && arg_count == 1 && args[0]) {
+            const char* ft = arg_concrete_full_type(ctx, args[0]);
+            if (ft) {
+                args[0]->sema_full_type = ft;
+                char head[64];
+                ann_head(ft, head, sizeof(head));
+                if (find_struct_def(ctx, head)) {
+                    args[0]->sema_struct_name = lamo_intern_type(head);
+                }
+            }
+        }
     } else {
         char message[256];
         char hint[256];
@@ -434,11 +1421,12 @@ static LamoType semantic_visit_call(SemanticContext* ctx, const char* name, ASTN
         semantic_error_at_hint(ctx, line, column, message, hint);
     }
 
-    for (int i = 0; i < arg_count; i++) {
-        semantic_infer_expression(ctx, args[i]);
-    }
     return return_type;
 }
+
+/* Legacy wrapper removed in Generics PR 2: all call paths now go through
+ * semantic_visit_call_full (statements/expressions pass their optional
+ * explicit type arguments; NULL when absent). */
 
 // Sprint 2 refactor: the per-builtin arity and return-type logic now lives
 // in src/builtins.h as a single shared table. The two wrappers below are
@@ -534,9 +1522,47 @@ static LamoType annotation_to_type_with_ctx(SemanticContext* ctx, const char* an
     if (strcmp(annotation, "float") == 0) return LAMO_TYPE_FLOAT;
     if (strcmp(annotation, "string") == 0) return LAMO_TYPE_STRING;
     if (strcmp(annotation, "bool") == 0) return LAMO_TYPE_BOOL;
-    if (strcmp(annotation, "array") == 0) return LAMO_TYPE_ARRAY;
-    /* Phase 2: struct-name annotation. */
-    if (ctx && find_struct_def(ctx, annotation)) return LAMO_TYPE_STRUCT;
+    if (strcmp(annotation, "array") == 0 || strcmp(annotation, "Array") == 0) return LAMO_TYPE_ARRAY;
+    if (strcmp(annotation, "void") == 0 || strcmp(annotation, "Void") == 0) return LAMO_TYPE_VOID;
+    /* Phase 2: struct-name annotation. Generics PR 2/3: generic
+     * instantiations like "Pair<int, string>" resolve via their head. */
+    {
+        char head[64];
+        ann_head(annotation, head, sizeof(head));
+        if (strchr(annotation, '<') != NULL) {
+            if (find_struct_def(ctx, head)) return LAMO_TYPE_STRUCT;
+            return LAMO_TYPE_UNKNOWN;
+        }
+        if (ctx && find_struct_def(ctx, annotation)) return LAMO_TYPE_STRUCT;
+    }
+    return LAMO_TYPE_UNKNOWN;
+}
+
+/* Generics PR 2/3: full-resolution variant. Maps a RAW parser annotation
+ * to (base kind, normalized interned string). Returns UNKNOWN for
+ * garbage; *out_norm receives the canonical form (borrowed, never
+ * freed) even when the head is unknown so error paths can quote it. */
+static LamoType annotation_resolve_full(SemanticContext* ctx, const char* annotation, const char** out_norm) {
+    if (out_norm) *out_norm = NULL;
+    if (!annotation) return LAMO_TYPE_UNKNOWN;
+    char* norm = semantic_normalize_type(annotation);
+    char head[64];
+    ann_head(norm, head, sizeof(head));
+    const char* stored = lamo_intern_type(norm);
+    free(norm);
+    if (out_norm) *out_norm = stored;
+
+    if (strcmp(head, "int") == 0) return LAMO_TYPE_INT;
+    if (strcmp(head, "float") == 0) return LAMO_TYPE_FLOAT;
+    if (strcmp(head, "string") == 0) return LAMO_TYPE_STRING;
+    if (strcmp(head, "bool") == 0) return LAMO_TYPE_BOOL;
+    if (strcmp(head, "array") == 0) return LAMO_TYPE_ARRAY;
+    if (strcmp(head, "void") == 0) return LAMO_TYPE_VOID;
+    if (ctx && find_struct_def(ctx, head)) return LAMO_TYPE_STRUCT;
+    /* A declared TYPE PARAMETER of an enclosing generic fn is legal in
+     * signature position; callers bind it at call sites. Report ARRAY? No
+     * — report UNKNOWN-with-string and let binding logic decide. The
+     * distinction matters so we surface real typos as errors there. */
     return LAMO_TYPE_UNKNOWN;
 }
 
@@ -665,11 +1691,14 @@ static void semantic_visit_statement(SemanticContext* ctx, ASTNode* node) {
              * previous error) is accepted to avoid cascading errors. */
             const char* annotated_struct_name = NULL;
             if (var_decl->type_annotation) {
-                LamoType annotated = annotation_to_type_with_ctx(ctx, var_decl->type_annotation);
+                /* Generics PR 2/3: full resolver so nested annotations
+                 * ("array<int>", "Pair<int,string>") pass the legacy
+                 * strict check instead of being rejected as unknown. */
+                LamoType annotated = annotation_resolve_full(ctx, var_decl->type_annotation, NULL);
                 if (annotated == LAMO_TYPE_UNKNOWN) {
                     char message[256];
                     snprintf(message, sizeof(message),
-                             "unknown type annotation '%s' (expected int, float, string, bool, array, or a struct name)",
+                             "unknown type annotation '%s' (expected int, float, string, bool, array<T>, void, or a struct name)",
                              var_decl->type_annotation);
                     semantic_error_at(ctx, node->line, node->column, message);
                 } else if (annotated == LAMO_TYPE_STRUCT) {
@@ -677,13 +1706,20 @@ static void semantic_visit_statement(SemanticContext* ctx, ASTNode* node) {
                      * can define the variable with the struct type. */
                     annotated_struct_name = var_decl->type_annotation;
                     /* If the initializer is also a struct literal, validate
-                     * the struct names match. */
-                    if (inferred_struct_name && strcmp(inferred_struct_name, annotated_struct_name) != 0) {
-                        char message[256];
-                        snprintf(message, sizeof(message),
-                                 "type annotation '%s' does not match struct literal '%s'",
-                                 annotated_struct_name, inferred_struct_name);
-                        semantic_error_at(ctx, node->line, node->column, message);
+                     * the struct names match. Generics PR 2: annotated
+                     * instantiations (`Pair<int,string>`) match literals of
+                     * the same BASE struct (`Pair`). */
+                    if (inferred_struct_name &&
+                        strcmp(inferred_struct_name, annotated_struct_name) != 0) {
+                        char ahead[64];
+                        ann_head(annotated_struct_name, ahead, sizeof(ahead));
+                        if (strcmp(inferred_struct_name, ahead) != 0) {
+                            char message[256];
+                            snprintf(message, sizeof(message),
+                                     "type annotation '%s' does not match struct literal '%s'",
+                                     annotated_struct_name, inferred_struct_name);
+                            semantic_error_at(ctx, node->line, node->column, message);
+                        }
                     }
                     init_type = LAMO_TYPE_STRUCT;
                 } else if (init_type != LAMO_TYPE_UNKNOWN && init_type != annotated) {
@@ -706,6 +1742,25 @@ static void semantic_visit_statement(SemanticContext* ctx, ASTNode* node) {
                     init_type = annotated;
                 }
             }
+            /* Generics PR 2/3: resolve the annotation through the FULL
+             * resolver so nested generics work, remember the normalized
+             * type on the symbol (consumed by call-site binding and the
+             * Array<T> element checks), and warn on BARE `array` per RFC
+             * §9 ("the old array keyword remains as an alias for
+             * Array<Any> for backwards compatibility"). */
+            const char* var_full_norm = NULL;
+            if (var_decl->type_annotation) {
+                LamoType ann_kind = annotation_resolve_full(ctx, var_decl->type_annotation,
+                                                            &var_full_norm);
+                if (ann_kind != LAMO_TYPE_UNKNOWN && var_full_norm &&
+                    strcmp(var_full_norm, "array") == 0) {
+                    char message[256];
+                    snprintf(message, sizeof(message),
+                             "bare 'array' annotation is deprecated; prefer 'array<T>' (e.g. array<int>) - bare means array<any>");
+                    semantic_warn_at(ctx, node->line, node->column, message);
+                }
+            }
+
             /* Phase 2: if the variable has a struct type (either from
              * annotation or inferred from a struct literal), define it
              * with the struct name so field access can be validated. */
@@ -719,6 +1774,36 @@ static void semantic_visit_statement(SemanticContext* ctx, ASTNode* node) {
             } else {
                 scope_define(ctx, ctx->current_scope, var_decl->name, SYMBOL_VAR, 0, init_type, node->line, node->column, node->file_path);
             }
+            /* Attach normalized full type + PR3 literal inference. */
+            {
+                Symbol* sym = scope_find_in_current(ctx->current_scope, var_decl->name);
+                if (sym) {
+                    if (var_full_norm) {
+                        sym->full_type = var_full_norm;
+                        /* Generic instantiations keep their concrete head
+                         * as struct_name so method dispatch still finds
+                         * impls declared under the bare name. */
+                        if (init_type == LAMO_TYPE_STRUCT) {
+                            char head[64];
+                            ann_head(var_full_norm, head, sizeof(head));
+                            sym->struct_name = lamo_intern_type(head);
+                            node->sema_struct_name = sym->struct_name;
+                        }
+                    } else if (!var_decl->type_annotation) {
+                        /* No annotation: infer from literals. Array
+                         * literals get element-typed via least upper
+                         * bound (PR 3 §5.1); heterogeneous arrays fall
+                         * back to plain "array" WITHOUT a warning here —
+                         * the migration warning only fires on explicit
+                         * annotations to avoid noise in existing code. */
+                        const char* inferred = arg_concrete_full_type(ctx, var_decl->initializer);
+                        if (inferred && strcmp(inferred, "array") != 0) {
+                            sym->full_type = inferred;
+                            node->sema_full_type = inferred;
+                        }
+                    }
+                }
+            }
             break;
         }
         case AST_FN_DECL: {
@@ -728,30 +1813,62 @@ static void semantic_visit_statement(SemanticContext* ctx, ASTNode* node) {
             LamoType previous_fn_return_type = ctx->current_fn_return_type;
             const char* previous_fn_name = ctx->current_fn_name;
 
+            /* Expose this fn's own type parameters to literal/annotation
+             * validation while its body is walked. */
+            const char* const* saved_fn_tps = ctx->cur_fn_tp_names;
+            int saved_fn_tp_count = ctx->cur_fn_tp_count;
+            const char** own_tp_interned = NULL;
+            if (fn_decl->type_param_count > 0) {
+                own_tp_interned = malloc(sizeof(const char*) * (size_t)fn_decl->type_param_count);
+                if (!own_tp_interned) {
+                    perror("Failed to allocate fn tp name array");
+                    exit(EXIT_FAILURE);
+                }
+                for (int i2 = 0; i2 < fn_decl->type_param_count; i2++) {
+                    own_tp_interned[i2] = lamo_intern_type(fn_decl->type_params[i2]);
+                }
+                ctx->cur_fn_tp_names = own_tp_interned;
+                ctx->cur_fn_tp_count = fn_decl->type_param_count;
+            }
+
             ctx->current_scope = scope_push(parent);
             ctx->inside_function = 1;
 
             for (int i = 0; i < fn_decl->param_count; i++) {
                 /* Sprint 3: if the parameter has a type annotation, use
-                 * it as the inferred type; otherwise leave UNKNOWN so
-                 * the caller's argument type flows in unchanged. We also
-                 * validate that the annotation is a known type name.
-                 *
-                 * Phase 2: also recognize struct-name annotations, so a
-                 * function can declare `fn heal(p: Player) { ... }` and
-                 * access `p.hp` inside the body. */
+                 * it as the inferred type. Phase 2 added struct names.
+                 * Generics PR 2: bare/nested references to this fn's OWN
+                 * type parameters ("T", "array<T>") are legal here and
+                 * stay UNKNOWN at declaration time — bindings happen at
+                 * call sites (RFC §5.3). */
                 LamoType param_type = LAMO_TYPE_UNKNOWN;
                 const char* param_struct_name = NULL;
                 if (fn_decl->param_types && fn_decl->param_types[i]) {
-                    param_type = annotation_to_type_with_ctx(ctx, fn_decl->param_types[i]);
-                    if (param_type == LAMO_TYPE_UNKNOWN) {
+                    const char* raw_ann = fn_decl->param_types[i];
+                    int is_own_tp = 0;
+                    {
+                        int scope_tp_count = fn_decl->type_param_count + ctx->impl_tp_count;
+                        for (int t = 0; t < scope_tp_count; t++) {
+                            const char* tp_name = t < fn_decl->type_param_count
+                                ? fn_decl->type_params[t]
+                                : ctx->impl_tp_names[t - fn_decl->type_param_count];
+                            if (strcmp(raw_ann, tp_name) == 0 || strstr(raw_ann, tp_name)) {
+                                is_own_tp = 1;
+                                break;
+                            }
+                        }
+                    }
+                    if (!is_own_tp) {
+                        param_type = annotation_to_type_with_ctx(ctx, raw_ann);
+                    }
+                    if (param_type == LAMO_TYPE_UNKNOWN && !is_own_tp) {
                         char message[256];
                         snprintf(message, sizeof(message),
-                                 "unknown type annotation '%s' on parameter '%s' (expected int, float, string, bool, array, or a struct name)",
-                                 fn_decl->param_types[i], fn_decl->params[i]);
+                                 "unknown type annotation '%s' on parameter '%s' (expected int, float, string, bool, array<T>, void, a struct name, or a declared type parameter)",
+                                 raw_ann, fn_decl->params[i]);
                         semantic_error_at(ctx, node->line, node->column, message);
                     } else if (param_type == LAMO_TYPE_STRUCT) {
-                        param_struct_name = fn_decl->param_types[i];
+                        param_struct_name = raw_ann;
                     }
                 }
                 if (param_type == LAMO_TYPE_STRUCT && param_struct_name) {
@@ -875,6 +1992,11 @@ static void semantic_visit_statement(SemanticContext* ctx, ASTNode* node) {
 
             semantic_visit_statement(ctx, fn_decl->body);
 
+            /* Restore enclosing fn type-parameter scope (PR 2). */
+            ctx->cur_fn_tp_names = saved_fn_tps;
+            ctx->cur_fn_tp_count = saved_fn_tp_count;
+            free(own_tp_interned);
+
             Scope* finished = ctx->current_scope;
             ctx->current_scope = parent;
             ctx->inside_function = previous_inside_function;
@@ -888,14 +2010,16 @@ static void semantic_visit_statement(SemanticContext* ctx, ASTNode* node) {
             break;
         case AST_IF_STMT: {
             ASTIfStmt* if_stmt = (ASTIfStmt*)node;
-            semantic_infer_expression(ctx, if_stmt->condition);
+            LamoType cond_type = semantic_infer_expression(ctx, if_stmt->condition);
+            semantic_check_truthy_operand(ctx, cond_type, "if condition", node->line, node->column);
             semantic_visit_statement(ctx, if_stmt->then_branch);
             semantic_visit_statement(ctx, if_stmt->else_branch);
             break;
         }
         case AST_WHILE_STMT: {
             ASTWhileStmt* while_stmt = (ASTWhileStmt*)node;
-            semantic_infer_expression(ctx, while_stmt->condition);
+            LamoType cond_type = semantic_infer_expression(ctx, while_stmt->condition);
+            semantic_check_truthy_operand(ctx, cond_type, "while condition", node->line, node->column);
             int prev_in_loop = ctx->inside_loop;
             ctx->inside_loop = 1;
             semantic_visit_statement(ctx, while_stmt->body);
@@ -908,7 +2032,10 @@ static void semantic_visit_statement(SemanticContext* ctx, ASTNode* node) {
             ctx->current_scope = scope_push(parent);
 
             semantic_visit_statement(ctx, for_stmt->initializer);
-            semantic_infer_expression(ctx, for_stmt->condition);
+            {
+                LamoType cond_type = semantic_infer_expression(ctx, for_stmt->condition);
+                semantic_check_truthy_operand(ctx, cond_type, "for condition", node->line, node->column);
+            }
             semantic_visit_statement(ctx, for_stmt->increment);
             int prev_in_loop = ctx->inside_loop;
             ctx->inside_loop = 1;
@@ -969,11 +2096,30 @@ static void semantic_visit_statement(SemanticContext* ctx, ASTNode* node) {
             if (!symbol || symbol->kind != SYMBOL_VAR) {
                 char message[256];
                 char hint[256];
-                snprintf(message, sizeof(message), "assignment to undeclared variable '%s'", assign_stmt->name);
-                snprintf(hint, sizeof(hint),
-                         "did you mean `let %s = ...;`? Lamo requires variables to be declared before assignment.",
-                         assign_stmt->name);
-                semantic_error_at_hint(ctx, node->line, node->column, message, hint);
+                if (symbol && symbol->kind == SYMBOL_FN) {
+                    /* Phase 3 item "validate that assignment targets are
+                     * valid identifiers": naming a function on the left
+                     * of '=' is a category error, not "undeclared". */
+                    snprintf(message, sizeof(message),
+                             "cannot assign to function '%s' (functions are immutable)", assign_stmt->name);
+                    snprintf(hint, sizeof(hint),
+                             "did you mean to CALL it ('%s(...)') or declare a variable with `let %s = ...;`?",
+                             assign_stmt->name, assign_stmt->name);
+                    semantic_error_at_hint(ctx, node->line, node->column, message, hint);
+                } else if (!symbol && lamo_builtin_lookup(assign_stmt->name)) {
+                    snprintf(message, sizeof(message),
+                             "cannot assign to builtin '%s'", assign_stmt->name);
+                    snprintf(hint, sizeof(hint),
+                             "builtins are immutable; declare your own variable with `let %s = ...;` to shadow the builtin name",
+                             assign_stmt->name);
+                    semantic_error_at_hint(ctx, node->line, node->column, message, hint);
+                } else {
+                    snprintf(message, sizeof(message), "assignment to undeclared variable '%s'", assign_stmt->name ? assign_stmt->name : "<null>");
+                    snprintf(hint, sizeof(hint),
+                             "did you mean `let %s = ...;`? Lamo requires variables to be declared before assignment.",
+                             assign_stmt->name ? assign_stmt->name : "<null>");
+                    semantic_error_at_hint(ctx, node->line, node->column, message, hint);
+                }
             }
             LamoType value_type = semantic_infer_expression(ctx, assign_stmt->value);
             // Update the variable's inferred type to the new value. Lamo is
@@ -1003,7 +2149,10 @@ static void semantic_visit_statement(SemanticContext* ctx, ASTNode* node) {
         }
         case AST_CALL_STMT: {
             ASTCallStmt* call_stmt = (ASTCallStmt*)node;
-            semantic_visit_call(ctx, call_stmt->name, call_stmt->args, call_stmt->arg_count, node->line, node->column);
+            semantic_visit_call_full(ctx, call_stmt->name,
+                                     call_stmt->type_args, call_stmt->type_arg_count,
+                                     call_stmt->args, call_stmt->arg_count,
+                                     node->line, node->column, NULL);
             break;
         }
         case AST_MEMBER_CALL: {
@@ -1027,14 +2176,14 @@ static void semantic_visit_statement(SemanticContext* ctx, ASTNode* node) {
         /* ─── Phase 2: struct / impl / enum / match / place-assign ────── */
         case AST_STRUCT_DECL: {
             /* Already registered during the pre-pass; nothing to visit
-             * for non-generic structs. For generic structs (Generics PR 1),
-             * we validate:
+             * for non-generic structs. For generic structs (Generics PR
+             * 1), we validate:
              *   - Type parameter names are unique within the declaration.
-             *   - Each field type is a builtin, a declared struct name, or
-             *     one of this struct's type parameters. This catches typos
-             *     like `struct Pair<A, B> { first: C }` (C is not a type
-             *     param) early, instead of letting them leak as
-             *     LAMO_TYPE_UNKNOWN at use sites. */
+             *   - Each field type is a builtin, a declared struct name,
+             *     one of this struct's type parameters — GENERICS PR 2:
+             *     recursively for NESTED annotations like `array<T>` or
+             *     `Pair<int, array<T>>`, so containers of parameters are
+             *     legal but typos still fail fast. */
             ASTStructDecl* sd = (ASTStructDecl*)node;
             /* Check type parameter uniqueness. */
             for (int i = 0; i < sd->type_param_count; i++) {
@@ -1047,35 +2196,27 @@ static void semantic_visit_statement(SemanticContext* ctx, ASTNode* node) {
                         semantic_error_at(ctx, node->line, node->column, message);
                     }
                 }
+                const char* con = sd->type_param_constraints
+                                      ? sd->type_param_constraints[i] : NULL;
+                if (con && lamo_constraint_kind(con) < 0) {
+                    char message[256];
+                    snprintf(message, sizeof(message),
+                             "unknown constraint '%s' on type parameter '%s' of struct '%s' (catalogue: Any, Eq, Ord, Num, Hash, Show)",
+                             con, sd->type_params[i], sd->name);
+                    semantic_error_at(ctx, node->line, node->column, message);
+                }
             }
-            /* Validate field types. Skip NULL annotations (legacy). */
+            /* Validate field types (nested-aware since PR 2). */
             for (int i = 0; i < sd->field_count; i++) {
                 const char* ft = sd->field_types[i];
                 if (!ft) continue;
-                /* Builtins are always OK. */
-                if (strcmp(ft, "int") == 0 || strcmp(ft, "float") == 0 ||
-                    strcmp(ft, "bool") == 0 || strcmp(ft, "string") == 0 ||
-                    strcmp(ft, "array") == 0 || strcmp(ft, "void") == 0) {
-                    continue;
+                if (!lamo_validate_annotation_tree(ctx, sd, ft)) {
+                    char message[320];
+                    snprintf(message, sizeof(message),
+                             "struct '%s' field '%s' has unknown type '%s' (expected builtins, declared structs, type parameters, or generic nests of those)",
+                             sd->name, sd->field_names[i], ft);
+                    semantic_error_at(ctx, node->line, node->column, message);
                 }
-                /* Declared struct names are OK. */
-                if (find_struct_def(ctx, ft)) continue;
-                /* Type parameters of THIS struct are OK. */
-                int is_type_param = 0;
-                for (int j = 0; j < sd->type_param_count; j++) {
-                    if (strcmp(ft, sd->type_params[j]) == 0) {
-                        is_type_param = 1;
-                        break;
-                    }
-                }
-                if (is_type_param) continue;
-                /* Otherwise: unknown type. */
-                char message[256];
-                snprintf(message, sizeof(message),
-                         "struct '%s' field '%s' has unknown type '%s' (expected a builtin, a declared struct, or one of the type parameters %s)",
-                         sd->name, sd->field_names[i], ft,
-                         sd->type_param_count > 0 ? "declared after the struct name" : "(this struct is not generic)");
-                semantic_error_at(ctx, node->line, node->column, message);
             }
             break;
         }
@@ -1090,6 +2231,29 @@ static void semantic_visit_statement(SemanticContext* ctx, ASTNode* node) {
                 semantic_error_at(ctx, node->line, node->column, message);
                 break;
             }
+            /* RFC §4.4: generic impl validation.
+             *   - the echo `Stack<T>` must name exactly this impl's own
+             *     parameters, in order;
+             *   - constraints referenced here must exist in the catalogue. */
+            if (id->type_arg_count > 0 || id->type_param_count > 0) {
+                if (id->type_arg_count != id->type_param_count) {
+                    char message[256];
+                    snprintf(message, sizeof(message),
+                             "impl for '%s' declares %d type parameter(s) but echoes %d type argument(s)",
+                             id->struct_name, id->type_param_count, id->type_arg_count);
+                    semantic_error_at(ctx, node->line, node->column, message);
+                } else {
+                    for (int i = 0; i < id->type_arg_count; i++) {
+                        if (strcmp(id->type_args[i], id->type_params[i]) != 0) {
+                            char message[256];
+                            snprintf(message, sizeof(message),
+                                     "impl echo '%s<%s>' does not match declared parameter '%s' (position %d)",
+                                     id->struct_name, id->type_args[i], id->type_params[i], i + 1);
+                            semantic_error_at(ctx, node->line, node->column, message);
+                        }
+                    }
+                }
+            }
             /* Set the current impl struct so method bodies can use `self`.
              * Mark each method's AST node with sema_struct_name so codegen
              * knows to (a) emit it with the mangled name `lamo_method_<Type>__<name>`
@@ -1098,11 +2262,33 @@ static void semantic_visit_statement(SemanticContext* ctx, ASTNode* node) {
              * which looks up methods by their original name. */
             const char* prev_impl = ctx->current_impl_struct;
             ctx->current_impl_struct = id->struct_name;
-            for (ASTNode* m = id->methods; m; m = m->next) {
-                if (m->type == AST_FN_DECL) {
-                    m->sema_struct_name = id->struct_name;
-                    semantic_visit_statement(ctx, m);
+            {
+                /* Inherit impl type parameters so method signatures can
+                 * use them (RFC §4.4). */
+                const char* const* saved_tp_names = ctx->impl_tp_names;
+                int saved_tp_count = ctx->impl_tp_count;
+                const char** tp_interned = NULL;
+                if (id->type_param_count > 0) {
+                    tp_interned = malloc(sizeof(const char*) * (size_t)id->type_param_count);
+                    if (!tp_interned) {
+                        perror("Failed to allocate impl tp name array");
+                        exit(EXIT_FAILURE);
+                    }
+                    for (int i = 0; i < id->type_param_count; i++) {
+                        tp_interned[i] = lamo_intern_type(id->type_params[i]);
+                    }
+                    ctx->impl_tp_names = tp_interned;
+                    ctx->impl_tp_count = id->type_param_count;
                 }
+                for (ASTNode* m = id->methods; m; m = m->next) {
+                    if (m->type == AST_FN_DECL) {
+                        m->sema_struct_name = id->struct_name;
+                        semantic_visit_statement(ctx, m);
+                    }
+                }
+                ctx->impl_tp_names = saved_tp_names;
+                ctx->impl_tp_count = saved_tp_count;
+                free(tp_interned);
             }
             ctx->current_impl_struct = prev_impl;
             break;
@@ -1327,8 +2513,20 @@ static LamoType semantic_infer_expression(SemanticContext* ctx, ASTNode* node) {
                     // Equality accepts any pair; runtime handles mixed types by returning false.
                     return LAMO_TYPE_BOOL;
                 case TOKEN_AND_AND:
-                case TOKEN_OR_OR:
+                case TOKEN_OR_OR: {
+                    /* Phase 4 item "validate logical operators by type",
+                     * per SPEC §6.3/§7.5: both operands accept any type
+                     * WITH defined truthiness; void values are a compile
+                     * error. The result is bool built from truthiness
+                     * (matches the shipped runtime lamo_and/lamo_or). */
+                    const char* op_name =
+                        expr->operator == TOKEN_AND_AND ? "&&" : "||";
+                    char where[64];
+                    snprintf(where, sizeof(where), "'%s' operand", op_name);
+                    semantic_check_truthy_operand(ctx, left, where, node->line, node->column);
+                    semantic_check_truthy_operand(ctx, right, where, node->line, node->column);
                     return LAMO_TYPE_BOOL;
+                }
                 default:
                     return LAMO_TYPE_UNKNOWN;
             }
@@ -1344,13 +2542,17 @@ static LamoType semantic_infer_expression(SemanticContext* ctx, ASTNode* node) {
                 return right; // -int -> int, -float -> float
             }
             if (expr->operator == TOKEN_BANG) {
+                semantic_check_truthy_operand(ctx, right, "'!' operand", node->line, node->column);
                 return LAMO_TYPE_BOOL;
             }
             return LAMO_TYPE_UNKNOWN;
         }
         case AST_CALL_EXPR: {
             ASTCallExpr* call_expr = (ASTCallExpr*)node;
-            return semantic_visit_call(ctx, call_expr->name, call_expr->args, call_expr->arg_count, node->line, node->column);
+            return semantic_visit_call_full(ctx, call_expr->name,
+                                            call_expr->type_args, call_expr->type_arg_count,
+                                            call_expr->args, call_expr->arg_count,
+                                            node->line, node->column, node);
         }
         case AST_MEMBER_CALL: {
             /* Sprint 4: `module.member(args)` in expression position.
@@ -1406,6 +2608,55 @@ static LamoType semantic_infer_expression(SemanticContext* ctx, ASTNode* node) {
                 }
                 /* Not a module alias; fall through to value-method-call. */
             }
+            /* Generics PR 2 §5.3: when this member call targets an
+             * IMPORTED function, its renamed declaration still lives in
+             * the global scope — look it up and run the SAME signature
+             * binding/validation as plain calls, so Option<T>-style
+             * factories keep their payload types across boundaries. */
+            if (ctx->module_resolve) {
+                const char* prefixed = ctx->module_resolve(alias, mc->member_name, ctx->module_user_data);
+                if (prefixed) {
+                    Symbol* fsym = scope_find(ctx->current_scope, prefixed);
+                    if (fsym && fsym->kind == SYMBOL_FN &&
+                        fsym->arity == mc->arg_count && fsym->param_full &&
+                        mc->arg_count <= LAMO_MAX_BIND_ARGS) {
+                        AnnSubstMap tmap;
+                        tmap.names = fsym->tp_names;
+                        tmap.values = malloc(sizeof(const char*) * (size_t)(fsym->tp_count > 0 ? fsym->tp_count : 1));
+                        tmap.count = fsym->tp_count;
+                        for (int i = 0; i < fsym->tp_count; i++) tmap.values[i] = NULL;
+                        const char* argf[LAMO_MAX_BIND_ARGS] = {0};
+                        for (int i = 0; i < mc->arg_count; i++) {
+                            semantic_infer_expression(ctx, mc->args[i]);
+                            argf[i] = arg_concrete_full_type(ctx, mc->args[i]);
+                        }
+                        int mismatch = 0;
+                        for (int i = 0; i < mc->arg_count; i++) {
+                            const char* pat = fsym->param_full[i];
+                            if (!pat || !argf[i]) continue;
+                            int r = ann_bind_pattern(pat, argf[i], &tmap);
+                            if (r == 0) {
+                                mismatch = 1;
+                                char message[300];
+                                snprintf(message, sizeof(message),
+                                         "argument %d to '%s.%s': expected type '%s', got '%s'",
+                                         i + 1, alias, mc->member_name, pat, argf[i]);
+                                semantic_error_at(ctx, node->line, node->column, message);
+                            }
+                        }
+                        (void)mismatch;
+                        if (fsym->ret_full) {
+                            char* sub = ann_subst(fsym->ret_full, &tmap);
+                            if (sub) {
+                                node->sema_full_type = lamo_intern_type(sub);
+                                free(sub);
+                            }
+                        }
+                        free(tmap.values);
+                        return LAMO_TYPE_UNKNOWN;
+                    }
+                }
+            }
             /* Phase 2: value method call. Infer the object's type. */
             LamoType obj_type = semantic_infer_expression(ctx, mc->object);
             const char* obj_struct_name = NULL;
@@ -1459,10 +2710,15 @@ static LamoType semantic_infer_expression(SemanticContext* ctx, ASTNode* node) {
                 for (int i = 0; i < mc->arg_count; i++) {
                     semantic_infer_expression(ctx, mc->args[i]);
                 }
+                /* Mark the resolution outcome so CODEGEN picks the array-
+                 * builtin route even when the receiver chain LOOKS like a
+                 * struct field access (self.items.push on generic impls). */
+                node->sema_full_type = lamo_intern_type("array");
+                node->sema_struct_name = NULL;
                 /* Return type: push/pop return int (or the popped value's
                  * type for pop, but we conservatively say UNKNOWN); len
                  * returns int. */
-                if (strcmp(mc->member_name, "len") == 0) return LAMO_TYPE_INT;
+                if (strcmp(mc->member_name, "len") == 0) { return LAMO_TYPE_INT; }
                 return LAMO_TYPE_UNKNOWN;
             }
             if (obj_type == LAMO_TYPE_STRUCT && obj_struct_name) {
@@ -1494,6 +2750,11 @@ static LamoType semantic_infer_expression(SemanticContext* ctx, ASTNode* node) {
                 for (int i = 0; i < mc->arg_count; i++) {
                     semantic_infer_expression(ctx, mc->args[i]);
                 }
+                /* Generics PR 2 §4.4: full typed dispatch when the
+                 * receiver carries an instantiation (annotated vars).
+                 * Runs AFTER arg inference so concrete types exist. */
+                check_struct_method_call(ctx, mc, obj_struct_name, node,
+                                         node->line, node->column);
                 return LAMO_TYPE_UNKNOWN;  /* method return type unknown */
             }
             /* Object is not array, not struct, not module. */
@@ -1577,7 +2838,19 @@ static LamoType semantic_infer_expression(SemanticContext* ctx, ASTNode* node) {
                 }
                 return LAMO_TYPE_UNKNOWN;
             }
-            /* Case 2: struct field access. */
+            /* Case 2: struct field access. Generics PR 2: when direct
+             * symbol typing is unavailable (module fn result etc.), the
+             * substituted full type stashed by the caller machinery
+             * (sema_full_type) still identifies the struct. */
+            if (!obj_struct_name && pe->object->sema_full_type) {
+                char fh[64];
+                ann_head(pe->object->sema_full_type, fh, sizeof(fh));
+                if (find_struct_def(ctx, fh)) {
+                    obj_type = LAMO_TYPE_STRUCT;
+                    obj_struct_name = lamo_intern_type(fh);
+                    node->sema_full_type = pe->object->sema_full_type;
+                }
+            }
             if (obj_type == LAMO_TYPE_STRUCT && obj_struct_name) {
                 ASTStructDecl* sd = find_struct_def(ctx, obj_struct_name);
                 int idx = struct_field_index(sd, pe->prop_name);
@@ -1648,7 +2921,9 @@ static LamoType semantic_infer_expression(SemanticContext* ctx, ASTNode* node) {
                     semantic_error_at(ctx, node->line, node->column, message);
                 }
             }
-            /* Validate each type arg is a known type (builtin or struct). */
+            /* Validate each type arg is a known type (builtin, struct,
+             * or an in-scope TYPE PARAMETER — Generics PR 2 §5.2 makes
+             * `Option<T> { ... }` legal inside generic fn bodies). */
             for (int i = 0; i < sl->type_arg_count; i++) {
                 const char* ta = sl->type_args[i];
                 if (!ta) continue;
@@ -1657,12 +2932,31 @@ static LamoType semantic_infer_expression(SemanticContext* ctx, ASTNode* node) {
                     strcmp(ta, "array") == 0) {
                     continue;
                 }
-                if (find_struct_def(ctx, ta)) continue;
-                char message[256];
-                snprintf(message, sizeof(message),
-                         "type argument '%s' in struct literal '%s' is not a known type (expected a builtin or a declared struct)",
-                         ta, sl->struct_name);
-                semantic_error_at(ctx, node->line, node->column, message);
+                {
+                    char ta_head[64];
+                    ann_head(ta, ta_head, sizeof(ta_head));
+                    int nested_ok = 0;
+                    if (strchr(ta, '<') != NULL && lamo_validate_annotation_tree(ctx, NULL, ta)) {
+                        nested_ok = 1;
+                    }
+                    int tp_ok = 0;
+                    for (int t = 0; t < ctx->cur_fn_tp_count; t++) {
+                        if (strcmp(ta_head, ctx->cur_fn_tp_names[t]) == 0) { tp_ok = 1; break; }
+                    }
+                    if (!tp_ok) {
+                        for (int t = 0; t < ctx->impl_tp_count; t++) {
+                            if (strcmp(ta_head, ctx->impl_tp_names[t]) == 0) { tp_ok = 1; break; }
+                        }
+                    }
+                    if (nested_ok || tp_ok || find_struct_def(ctx, ta_head)) continue;
+                }
+                {
+                    char message[256];
+                    snprintf(message, sizeof(message),
+                             "type argument '%s' in struct literal '%s' is not a known type (expected a builtin, a declared struct, or an in-scope type parameter)",
+                             ta, sl->struct_name);
+                    semantic_error_at(ctx, node->line, node->column, message);
+                }
             }
             /* Validate each field name exists in the struct. */
             for (int i = 0; i < sl->field_count; i++) {
@@ -1751,6 +3045,13 @@ int semantic_analyze_full(ASTProgram* program, const char* file_path,
     ctx.enum_defs = program->declarations;
     ctx.impl_defs = program->declarations;
     ctx.current_impl_struct = NULL;
+    /* Generics PR 2: enclosing-impl type parameters (RFC §4.4). MUST be
+     * initialized here — every annotated parameter reads this list, and
+     * leaving it as stack garbage crashed optimized builds (-O1/-O2). */
+    ctx.impl_tp_names = NULL;
+    ctx.impl_tp_count = 0;
+    ctx.cur_fn_tp_names = NULL;
+    ctx.cur_fn_tp_count = 0;
 
     /* Phase 2: register enum variants as global int constants. Each
      * variant becomes a SYMBOL_VAR with type INT and a known value (its
@@ -1771,19 +3072,138 @@ int semantic_analyze_full(ASTProgram* program, const char* file_path,
             /* Sprint 3: if the function has a return-type annotation, use
              * it as the inferred return type. Otherwise leave UNKNOWN
              * (the call site will infer from the call context, or stay
-             * UNKNOWN if there's no context). */
+             * UNKNOWN if there's no context).
+             *
+             * Generics PR 2/PR 6 additions:
+             *   - type parameter lists are validated: duplicates and
+             *     unknown constraint names are hard errors;
+             *   - RFC §4.3 rule enforced: a GENERIC fn must annotate
+             *     every parameter AND its return type;
+             *   - every annotation resolves through the FULL resolver so
+             *     nested generics ("array<T>", "Pair<int,string>") work,
+             *     with normalized interned strings stored on the symbol
+             *     for call-site binding. `void` is now a legal return. */
             LamoType ret_type = LAMO_TYPE_UNKNOWN;
-            if (fn_decl->return_type_annotation) {
-                ret_type = annotation_to_type_with_ctx(&ctx, fn_decl->return_type_annotation);
-                if (ret_type == LAMO_TYPE_UNKNOWN) {
+
+            /* Type-parameter sanity. */
+            for (int i = 0; i < fn_decl->type_param_count; i++) {
+                for (int j = i + 1; j < fn_decl->type_param_count; j++) {
+                    if (strcmp(fn_decl->type_params[i], fn_decl->type_params[j]) == 0) {
+                        char message[256];
+                        snprintf(message, sizeof(message),
+                                 "duplicate type parameter '%s' in function '%s'",
+                                 fn_decl->type_params[i], fn_decl->name);
+                        semantic_error_at(&ctx, node->line, node->column, message);
+                    }
+                }
+                const char* con = fn_decl->type_param_constraints
+                                      ? fn_decl->type_param_constraints[i] : NULL;
+                if (con && lamo_constraint_kind(con) < 0) {
                     char message[256];
                     snprintf(message, sizeof(message),
-                             "unknown return type annotation '%s' on function '%s' (expected int, float, string, bool, array, or a struct name)",
-                             fn_decl->return_type_annotation, fn_decl->name);
+                             "unknown constraint '%s' on type parameter '%s' of function '%s' (catalogue: Any, Eq, Ord, Num, Hash, Show)",
+                             con, fn_decl->type_params[i], fn_decl->name);
                     semantic_error_at(&ctx, node->line, node->column, message);
                 }
             }
+
+            int generic_fn = fn_decl->type_param_count > 0;
+            if (generic_fn) {
+                int missing = !fn_decl->return_type_annotation;
+                for (int i = 0; i < fn_decl->param_count; i++) {
+                    if (!fn_decl->param_types || !fn_decl->param_types[i]) missing = 1;
+                }
+                if (missing) {
+                    char message[300];
+                    snprintf(message, sizeof(message),
+                             "generic function '%s' must annotate every parameter and its return type (RFC §4.3)",
+                             fn_decl->name);
+                    semantic_error_at(&ctx, node->line, node->column, message);
+                }
+            }
+
+            const char* ret_full_norm = NULL;
+            if (fn_decl->return_type_annotation) {
+                ret_type = annotation_resolve_full(&ctx, fn_decl->return_type_annotation,
+                                                   &ret_full_norm);
+                if (ret_type == LAMO_TYPE_UNKNOWN) {
+                    /* A declared TYPE PARAMETER is fine in return position. */
+                    int is_tp = 0;
+                    for (int t = 0; t < fn_decl->type_param_count; t++) {
+                        if (strcmp(fn_decl->return_type_annotation, fn_decl->type_params[t]) == 0) { is_tp = 1; break; }
+                    }
+                    if (!is_tp) {
+                        char message[256];
+                        snprintf(message, sizeof(message),
+                                 "unknown return type annotation '%s' on function '%s' (expected int, float, string, bool, array<T>, void, a struct name, or a declared type parameter)",
+                                 fn_decl->return_type_annotation, fn_decl->name);
+                        semantic_error_at(&ctx, node->line, node->column, message);
+                        ret_full_norm = NULL;
+                    }
+                }
+            } else {
+                ret_full_norm = NULL;
+            }
+
             scope_define(&ctx, ctx.current_scope, fn_decl->name, SYMBOL_FN, fn_decl->param_count, ret_type, node->line, node->column, node->file_path);
+
+            /* Attach the normalized signature to the freshly-defined
+             * symbol so call sites can validate without re-resolving. */
+            {
+                Symbol* sym = scope_find_in_current(ctx.current_scope, fn_decl->name);
+                if (sym) {
+                    sym->ret_full = ret_full_norm;
+                    sym->tp_count = generic_fn ? fn_decl->type_param_count : 0;
+                    if (sym->tp_count > 0) {
+                        sym->tp_names = malloc(sizeof(const char*) * (size_t)sym->tp_count);
+                        sym->tp_constraints = malloc(sizeof(const char*) * (size_t)sym->tp_count);
+                        if (!sym->tp_names || !sym->tp_constraints) {
+                            perror("Failed to allocate generic signature arrays");
+                            exit(EXIT_FAILURE);
+                        }
+                        for (int i = 0; i < sym->tp_count; i++) {
+                            sym->tp_names[i] = lamo_intern_type(fn_decl->type_params[i]);
+                            sym->tp_constraints[i] =
+                                fn_decl->type_param_constraints && fn_decl->type_param_constraints[i]
+                                    ? lamo_intern_type(fn_decl->type_param_constraints[i])
+                                    : NULL;
+                        }
+                    }
+                    if (fn_decl->param_count > 0) {
+                        sym->param_full = malloc(sizeof(const char*) * (size_t)fn_decl->param_count);
+                        if (!sym->param_full) {
+                            perror("Failed to allocate param signature array");
+                            exit(EXIT_FAILURE);
+                        }
+                        for (int i = 0; i < fn_decl->param_count; i++) {
+                            sym->param_full[i] = NULL;
+                            const char* raw = fn_decl->param_types ? fn_decl->param_types[i] : NULL;
+                            if (raw) {
+                                LamoType pk = LAMO_TYPE_UNKNOWN;
+                                const char* norm = NULL;
+                                pk = annotation_resolve_full(&ctx, raw, &norm);
+                                int is_tp = 0;
+                                for (int t = 0; t < sym->tp_count; t++) {
+                                    char headcmp[64];
+                                    ann_head(norm, headcmp, sizeof(headcmp));
+                                    if (strcmp(headcmp, fn_decl->type_params[t]) == 0 ||
+                                        strcmp(raw, fn_decl->type_params[t]) == 0) { is_tp = 1; break; }
+                                }
+                                if (pk == LAMO_TYPE_UNKNOWN && !is_tp) {
+                                    char message[256];
+                                    snprintf(message, sizeof(message),
+                                             "unknown type annotation '%s' on parameter '%s' of function '%s' (expected int, float, string, bool, array<T>, void, a struct name, or a declared type parameter)",
+                                             raw, fn_decl->params[i], fn_decl->name);
+                                    semantic_error_at(&ctx, node->line, node->column, message);
+                                    sym->param_full[i] = NULL;
+                                } else {
+                                    sym->param_full[i] = norm;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 

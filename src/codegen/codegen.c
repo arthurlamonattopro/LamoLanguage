@@ -170,9 +170,20 @@ static void generate_lang_builtin_call_expr(const char* name, ASTNode** args, in
     (void)arg_count;
 
     if (strcmp(name, "print") == 0) {
-        fprintf(out, "(lamo_print_value(");
-        generate_expression_code(args[0], out);
-        fprintf(out, "), lamo_make_int(0))");
+        /* Backend-alignment: when the semantic pass knows the argument
+         * is a struct (sema_struct_name set), emit the NAMED printer so
+         * output reads `Player { 10, x }` instead of `{ 10, x }` — the
+         * runtime cannot know type names, the compiler does. All other
+         * cases fall through to the legacy printer verbatim. */
+        if (args[0]->sema_struct_name) {
+            fprintf(out, "(lamo_print_struct_named(");
+            generate_expression_code(args[0], out);
+            fprintf(out, ", \"%s\"), lamo_make_int(0))", args[0]->sema_struct_name);
+        } else {
+            fprintf(out, "(lamo_print_value(");
+            generate_expression_code(args[0], out);
+            fprintf(out, "), lamo_make_int(0))");
+        }
         return;
     }
     if (strcmp(name, "input") == 0) {
@@ -1159,9 +1170,18 @@ static void generate_member_call_code(ASTMemberCall* mc, FILE* out) {
         }
     }
     /* Try struct method call. The semantic pass annotated the node (or the
-     * object identifier) with the struct type. */
+     * object identifier) with the struct type.
+     *
+     * Generics PR 2 correction: when semantic analysis resolved this as an
+     * ARRAY-BUILTIN method (it stamps sema_full_type = "array" on the
+     * node), the object tag must be IGNORED — `self.items.push(x)` inside
+     * `impl<T> Box<T>` carries a Box tag on the field chain but resolves
+     * to lamo_array_push, not a Box method. */
+    int sema_says_array = (((ASTNode*)mc)->sema_full_type != NULL &&
+                           strcmp(((ASTNode*)mc)->sema_full_type, "array") == 0);
     const char* struct_name = mc->object ? mc->object->sema_struct_name : NULL;
     if (!struct_name) struct_name = ((ASTNode*)mc)->sema_struct_name;
+    if (sema_says_array) struct_name = NULL;
     if (struct_name) {
         /* Emit `lamo_method_<Type>__<method>(self, args)`. The method's
          * mangled name was set by the semantic pass on the AST_FN_DECL,

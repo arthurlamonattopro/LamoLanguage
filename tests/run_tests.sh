@@ -31,6 +31,12 @@ else
     fi
 fi
 
+# Absolutize so subshells (golden tests cd into temp dirs) still find it.
+case "$LAMO" in
+    /*) ;;
+    *)  LAMO="$(cd "$(dirname "$LAMO")" && pwd)/$(basename "$LAMO")" ;;
+esac
+
 TESTS_DIR="$(cd "$(dirname "$0")" && pwd)"
 VALID_DIR="$TESTS_DIR/valid"
 INVALID_DIR="$TESTS_DIR/invalid"
@@ -111,6 +117,139 @@ if [ -d "$INVALID_DIR" ]; then
         else
             record_pass
             printf "  PASS  %s\n" "$name"
+        fi
+    done
+fi
+
+
+# ---------------------------------------------------------------------------
+# 2.5 Smoke cases (Phase 2: parser smoke tests + diagnostics regression).
+#
+# Layout: tests/smoke/NAME.lamo plus an OPTIONAL directive file:
+#   NAME.expect_err  - compile must FAIL; each line is a substring that must
+#                      appear in stderr.
+#   NAME.expect_ok   - compile must SUCCEED (exit 0); each line in the file
+#                      is a substring that must appear in stderr (used to
+#                      pin warnings, e.g. deprecation notices).
+# Without either file, the case requires success with EMPTY stderr.
+# ---------------------------------------------------------------------------
+echo
+echo "== Smoke / diagnostic cases =="
+SMOKE_DIR="$TESTS_DIR/smoke"
+if [ -d "$SMOKE_DIR" ]; then
+    for src in "$SMOKE_DIR"/*.lamo; do
+        [ -e "$src" ] || continue
+        name=$(basename "$src")
+        base="${src%.lamo}"
+        expect_err="$base.expect_err"
+        expect_ok="$base.expect_ok"
+        if [ -e "$expect_err" ]; then
+            if "$LAMO" check "$src" >"$TMP_DIR/out" 2>"$TMP_DIR/err"; then
+                record_fail "smoke/$name (accepted but expected failure)"
+                printf "  FAIL  %s (expected compile failure)\n" "$name"
+            else
+                missing=""
+                while IFS= read -r want; do
+                    [ -z "$want" ] && continue
+                    if ! grep -qF -- "$want" "$TMP_DIR/err"; then
+                        missing="$missing [$want]"
+                    fi
+                done < "$expect_err"
+                if [ -n "$missing" ]; then
+                    record_fail "smoke/$name (stderr missing$missing)"
+                    printf "  FAIL  %s (stderr missing%s)\n" "$name" "$missing"
+                    sed 's/^/        | /' "$TMP_DIR/err" >&2
+                else
+                    record_pass
+                    printf "  PASS  %s\n" "$name"
+                fi
+            fi
+        elif [ -e "$expect_ok" ]; then
+            if "$LAMO" check "$src" >"$TMP_DIR/out" 2>"$TMP_DIR/err"; then
+                missing=""
+                while IFS= read -r want; do
+                    [ -z "$want" ] && continue
+                    if ! grep -qF -- "$want" "$TMP_DIR/err"; then
+                        missing="$missing [$want]"
+                    fi
+                done < "$expect_ok"
+                if [ -n "$missing" ]; then
+                    record_fail "smoke/$name (warning missing$missing)"
+                    printf "  FAIL  %s (stderr missing%s)\n" "$name" "$missing"
+                    sed 's/^/        | /' "$TMP_DIR/err" >&2
+                else
+                    record_pass
+                    printf "  PASS  %s\n" "$name"
+                fi
+            else
+                record_fail "smoke/$name (rejected, expected success)"
+                printf "  FAIL  %s (rejected)\n" "$name"
+                sed 's/^/        | /' "$TMP_DIR/err" >&2
+            fi
+        else
+            if "$LAMO" check "$src" >"$TMP_DIR/out" 2>"$TMP_DIR/err" && [ ! -s "$TMP_DIR/err" ]; then
+                record_pass
+                printf "  PASS  %s\n" "$name"
+            else
+                record_fail "smoke/$name (must succeed silently)"
+                printf "  FAIL  %s\n" "$name"
+                sed 's/^/        | /' "$TMP_DIR/err" >&2
+            fi
+        fi
+    done
+fi
+
+# ---------------------------------------------------------------------------
+# 3.5 Golden C-output tests (Phase 2: snapshot tests for generated code).
+#
+# Layout: tests/golden/NAME.lamo + NAME.c.expected. Each program is built
+# in an isolated temp CWD via `lamo build` and the generated lamo_exec.c is
+# diffed against the committed snapshot. Codegen is deterministic (no
+# timestamps or absolute paths), which makes plain diff viable. The source
+# file is COPIED into the temp dir under its own name so any embedded
+# relative-path comments stay stable across machines.
+# ---------------------------------------------------------------------------
+echo
+echo "== Golden generated-C snapshot tests =="
+GOLDEN_DIR="$TESTS_DIR/golden"
+if [ -d "$GOLDEN_DIR" ]; then
+    for src in "$GOLDEN_DIR"/*.lamo; do
+        [ -e "$src" ] || continue
+        name=$(basename "$src")
+        expected_file="${src%.lamo}.c.expected"
+        if [ ! -e "$expected_file" ]; then
+            record_fail "golden/$name (missing .c.expected)"
+            printf "  FAIL  %s (missing .c.expected)\n" "$name"
+            continue
+        fi
+        work="$TMP_DIR/golden_$(basename "$name" .lamo)"
+        rm -rf "$work"; mkdir -p "$work"
+        cp "$src" "$work/"
+        if ( cd "$work" && run_with_timeout "$LAMO" build "$(basename "$src")" -o out_bin >build.log 2>&1 ) && [ -f "$work/lamo_exec.c" ]; then
+            # The embedded runtime (~2900 lines) is identical across all
+            # programs and is version-controlled directly as
+            # src/codegen/lamo_runtime.h; snapshots cover the USER-CODE
+            # section only (everything from the trailing #undefs on).
+            tr -d '\r' < "$work/lamo_exec.c" | sed -e '/^#ifndef LAMO_RUNTIME_H$/,/^#endif \/\* LAMO_RUNTIME_H \*\//d' > "$work/gen_clean"
+            tr -d '\r' < "$expected_file" > "$work/exp_clean"
+            if diff -u "$work/exp_clean" "$work/gen_clean" > "$work/diff" 2>&1; then
+                record_pass
+                printf "  PASS  %s\n" "$name"
+            else
+                record_fail "golden/$name (generated C drift)"
+                printf "  FAIL  %s (snapshot mismatch; update .c.expected if intentional)\n" "$name"
+                sed 's/^/        | /' "$work/diff" | head -40 >&2
+            fi
+        else
+            rc=$?
+            if [ "$rc" = 124 ]; then
+                record_fail "golden/$name (timed out)"
+                printf "  FAIL  %s (timed out)\n" "$name"
+            else
+                record_fail "golden/$name (build failed)"
+                printf "  FAIL  %s (build failed)\n" "$name"
+                sed 's/^/        | /' "$work/build.log" >&2
+            fi
         fi
     done
 fi

@@ -132,17 +132,21 @@ top_decl      := import_decl
 
 import_decl   := 'import' ( string_lit [ 'as' IDENT ] | IDENT [ 'as' IDENT ] ) ';'?
 struct_decl   := 'struct' IDENT type_params? '{' field_list '}'
-type_params   := '<' IDENT (',' IDENT)* '>'
+type_params   := '<' tp (',' tp)* '>'                      // PR6: optional constraint per parameter
+tp            := IDENT [':' IDENT]                          // e.g. T, K: Ord, V: Hash
 field_list    := field ( (',' | ';' | NEWLINE) field )*
 field         := IDENT ':' type_ann
 enum_decl     := 'enum' IDENT '{' variant_list '}'
 variant_list  := IDENT ( (',' | NEWLINE) IDENT )*
-impl_decl     := 'impl' IDENT '{' fn_decl* '}'
-fn_decl       := 'fn' IDENT '(' param_list? ')' ('->' type_ann)? block
+impl_decl     := 'impl' type_params? IDENT type_args? '{' fn_decl* '}'   // RFC §4.4: impl<T> Stack<T>
+fn_decl       := 'fn' IDENT type_params? '(' param_list? ')' ('->' type_ann)? block
 param_list    := param (',' param)*
 param         := IDENT (':' type_ann)?
 let_decl      := 'let' IDENT (':' type_ann)? '=' expr
-type_ann      := 'int' | 'float' | 'bool' | 'string' | 'void' | 'array' | IDENT
+type_ann      := ('int' | 'float' | 'bool' | 'string' | 'void') | array_ann | IDENT [ type_args ]
+                 // Generics PR2/PR3: full recursive annotations. `array<T>` and nested
+                 // instantiations (`Pair<int, array<string>>`) are legal at EVERY annotation
+                 // position. Bare `array` is a deprecated alias for array<any> (warning).
 
 block         := '{' statement* '}'
 statement     := let_decl
@@ -191,7 +195,12 @@ primary       := INT_LIT | FLOAT_LIT | STRING_LIT | 'true' | 'false'
               | IDENT | '(' expr ')' | array_lit | struct_lit
 array_lit     := '[' (expr (',' expr)*)? ']'
 struct_lit    := IDENT type_args? '{' field_init (',' field_init)* '}'
-type_args     := '<' IDENT (',' IDENT)* '>'
+type_args     := '<' type_ann (',' type_ann)* '>'      // PR2: arguments may be nested types or
+                                                        // in-scope type parameters
+
+// Generics PR 2 §4.5: explicit call-site type arguments (`pick<int>(1, 2)`).
+// Accepted only when the scanner confirms the full `< ... > (` shape so that
+// comparisons can never misparse. Turbofish `f::<int>` is NOT supported.
 field_init    := IDENT ':' expr
 ```
 
@@ -715,6 +724,69 @@ deliberate simplification.
 
 ---
 
+### 7.7 Generic functions and type parameters (Generics PR 2)
+
+Functions may declare type parameters between name and parameter list:
+
+```lamo
+fn id<T>(x: T) -> T { return x; }
+fn map2<A, B>(xs: array<A>, b: B) -> int { return xs.len(); }
+```
+
+- **Full annotations are mandatory on generic functions** (RFC §4.3):
+  every parameter and the return type must be annotated. A generic function
+  with missing annotations is a compile error.
+- Type parameters are visible in parameter types, return types, struct
+  literal arguments (`Option<T> { ... }`) and anywhere a `type_ann` is read.
+- Generic functions must be annotated, but non-generic functions keep the
+  legacy rules (annotations optional-but-checked).
+- Methods inside `impl<T> Name<T> { ... }` use the impl's parameters like
+  their own (§4.4). The echo `<T>` on the struct name must match the
+  declared parameter list exactly.
+- Runtime representation is UNCHANGED for any instantiation — generics are
+  erased; `array<int>` and `array<string>` lower to the same code.
+
+### 7.8 Constraint catalogue (Generics PR 6)
+
+A constraint restricts which concrete types may stand in for a type
+parameter (`fn sum<T: Num>(...)`). The catalogue is fixed:
+
+| Constraint | Satisfied by |
+|------------|--------------|
+| `Any`      | everything (default) |
+| `Eq`       | int, float, bool, string |
+| `Ord`      | int, float, bool, string |
+| `Hash`     | int, float, bool, string |
+| `Num`      | int, float |
+| `Show`     | builtins + user structs |
+
+User structs satisfy `Any` only in this first rollout (RFC §6 documents why:
+operations dispatch dynamically today). Unknown constraint names and violated
+constraints at call sites are compile errors.
+
+Constraints apply identically to struct type parameter lists
+(`struct SortedMap<K: Ord, V>`).
+
+### 7.9 Typed arrays and deprecation of bare `array` (PR 3)
+
+`let xs: array<int> = [1,2]` fixes the element type compile-time:
+
+- element-type inference follows RFC §5.1 least-upper-bound:
+  `[1, 2]` → array<int>, `[1, 2.5]` → array<float>;
+- heterogeneous literals still RUN (erasure) but typed boundaries reject them;
+- the spelling `Array<int>` is accepted and normalized to `array<int>`;
+- BARE `array` remains valid as an alias of `array<any>` and emits a
+  deprecation warning encouraging migration (warning never fails builds).
+
+### 7.10 Logical operators & void (validation completion)
+
+Per §6.3 truthiness, every value type participates in boolean contexts.
+EXCEPTION: values produced by `-> void` functions are rejected by
+if/while/for conditions and by `&&`/`||`/`!` operands with a dedicated
+compile error ("void value used in boolean context...").
+
+---
+
 ## 8. Built-in Functions
 
 These are treated as ordinary identifiers and may be shadowed by user
@@ -855,18 +927,38 @@ next to their program.
   and recursively loads its imports.
 - **Import cycles** are detected and reported as a compile-time error, with a
   stack showing the cycle: `a.lamo -> b.lamo -> a.lamo`.
-- The same file imported twice (via different paths that normalize to the same
-  absolute path) is loaded once. The second import is a no-op (its
-  declarations are already in the aggregate program).
+- **Import-time duplicate rule (Phase 10, now enforced + tested):** the same
+  file imported twice (via different paths that normalize to the same
+  absolute path) is loaded ONCE. The second import is a no-op at load time
+  AND emits a `warning: file "..." already imported; duplicate import
+  ignored` diagnostic so accidental double imports are visible. Re-importing
+  with a DIFFERENT alias warns and does not re-register the alias: first
+  alias wins (documented limitation). Both behaviors are regression-tested
+  (`tests/smoke/import_same_file_twice.*`).
 - Duplicate top-level symbol names across files produce a compile-time error
   with the file path of the previous declaration.
 
 ### 10.6 Visibility
 
-Today, **every top-level declaration is public**. There is no `pub`/`priv`
-distinction. This is fine for educational use but a wart for real projects.
-Future: add `pub` keyword; only `pub` declarations are exported by a module
-(see `todo.md` Phase 10).
+**Decision (Phase 10):** today, every top-level declaration of a module is
+public THROUGH ITS NAMESPACE; unaliased (legacy) merges place everything into
+the global namespace where normal duplicate-declaration errors apply.
+Rationale recorded here so the eventual upgrade path is mechanical:
+
+1. aliased imports are already the de-facto privacy boundary (nothing outside
+   the module can reach it without the alias),
+2. adding `pub` later only narrows what a namespace exposes — no existing
+   program changes meaning,
+3. two-step plan when introduced: warn on non-`pub` declarations reachable
+   via aliases for one release, then enforce.
+
+**Project/package layout conventions (Phase 10 decision):** a Lamo project
+is any directory containing `lamo.pkg`; `lamo new` scaffolds
+`main.lamo` + `lamo.pkg` + `.gitignore` (which includes `lamo_exec.c`).
+Local packages live under `src/<name>.lamo` or nested directories resolved
+relative to the importing file; published dependency layout and lockfile
+semantics live with lampm (`src/lampm/`). Generator artifacts (`lamo_exec.c`,
+binaries) are never committed.
 
 ### 10.7 Execution modes: `run` vs `eval`/`repl`
 

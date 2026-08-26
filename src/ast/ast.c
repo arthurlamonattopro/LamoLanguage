@@ -68,12 +68,39 @@ ASTFnDecl* ast_new_fn_decl(char* name, char** params, int param_count, ASTNode* 
  * string. The array is taken ownership of (caller should NOT free it).
  * return_type_annotation is owned by the AST (strdup'd here). */
 ASTFnDecl* ast_new_fn_decl_typed(char* name, char** params, char** param_types, int param_count, char* return_type_annotation, ASTNode* body, int line, int column) {
+    return ast_new_fn_decl_generic(name, NULL, NULL, 0,
+                                   params, param_types, param_count,
+                                   return_type_annotation, body, line, column);
+}
+
+/* Generics PR 2: full fn constructor. See ast.h for the contract. */
+ASTFnDecl* ast_new_fn_decl_generic(char* name, char** type_params, char** constraints, int tp_count,
+                                   char** params, char** param_types, int param_count,
+                                   char* return_type_annotation, ASTNode* body, int line, int column) {
     ASTFnDecl* node = (ASTFnDecl*)ast_new_node(AST_FN_DECL, sizeof(ASTFnDecl), line, column);
     node->name = strdup(name);
     node->params = params;
     node->param_types = param_types;
     node->param_count = param_count;
     node->return_type_annotation = return_type_annotation ? strdup(return_type_annotation) : NULL;
+    node->type_param_count = tp_count;
+    if (tp_count > 0 && type_params) {
+        node->type_params = malloc(sizeof(char*) * (size_t)tp_count);
+        node->type_param_constraints = malloc(sizeof(char*) * (size_t)tp_count);
+        if (!node->type_params || !node->type_param_constraints) {
+            perror("Failed to allocate generic fn type parameter list");
+            exit(EXIT_FAILURE);
+        }
+        for (int i = 0; i < tp_count; i++) {
+            node->type_params[i] = strdup(type_params[i] ? type_params[i] : "");
+            node->type_param_constraints[i] =
+                (constraints && constraints[i]) ? strdup(constraints[i]) : NULL;
+        }
+    } else {
+        node->type_params = NULL;
+        node->type_param_constraints = NULL;
+        node->type_param_count = 0;
+    }
     node->body = body;
     return node;
 }
@@ -131,8 +158,27 @@ ASTAssignStmt* ast_new_assign_stmt(char* name, ASTNode* value, LamoTokenType op_
 }
 
 ASTCallStmt* ast_new_call_stmt(char* name, ASTNode** args, int arg_count, int line, int column) {
+    return ast_new_call_stmt_typed(name, NULL, 0, args, arg_count, line, column);
+}
+
+/* Generics PR 2: statement-call ctor with optional explicit type args.
+ * Strings in type_args are strdup'd; caller retains input ownership. */
+ASTCallStmt* ast_new_call_stmt_typed(char* name, char** type_args, int type_arg_count, ASTNode** args, int arg_count, int line, int column) {
     ASTCallStmt* node = (ASTCallStmt*)ast_new_node(AST_CALL_STMT, sizeof(ASTCallStmt), line, column);
     node->name = strdup(name);
+    node->type_arg_count = 0;
+    node->type_args = NULL;
+    if (type_arg_count > 0 && type_args) {
+        node->type_args = malloc(sizeof(char*) * (size_t)type_arg_count);
+        if (!node->type_args) {
+            perror("Failed to allocate call type argument list");
+            exit(EXIT_FAILURE);
+        }
+        for (int i = 0; i < type_arg_count; i++) {
+            node->type_args[i] = strdup(type_args[i] ? type_args[i] : "");
+        }
+        node->type_arg_count = type_arg_count;
+    }
     node->args = args;
     node->arg_count = arg_count;
     return node;
@@ -184,8 +230,27 @@ ASTIdentifier* ast_new_identifier(char* name, int line, int column) {
 }
 
 ASTCallExpr* ast_new_call_expr(char* name, ASTNode** args, int arg_count, int line, int column) {
+    return ast_new_call_expr_typed(name, NULL, 0, args, arg_count, line, column);
+}
+
+/* Generics PR 2: expression-call ctor with optional explicit type args.
+ * Strings in type_args are strdup'd; caller retains input ownership. */
+ASTCallExpr* ast_new_call_expr_typed(char* name, char** type_args, int type_arg_count, ASTNode** args, int arg_count, int line, int column) {
     ASTCallExpr* node = (ASTCallExpr*)ast_new_node(AST_CALL_EXPR, sizeof(ASTCallExpr), line, column);
     node->name = strdup(name);
+    node->type_arg_count = 0;
+    node->type_args = NULL;
+    if (type_arg_count > 0 && type_args) {
+        node->type_args = malloc(sizeof(char*) * (size_t)type_arg_count);
+        if (!node->type_args) {
+            perror("Failed to allocate call type argument list");
+            exit(EXIT_FAILURE);
+        }
+        for (int i = 0; i < type_arg_count; i++) {
+            node->type_args[i] = strdup(type_args[i] ? type_args[i] : "");
+        }
+        node->type_arg_count = type_arg_count;
+    }
     node->args = args;
     node->arg_count = arg_count;
     return node;
@@ -251,7 +316,9 @@ ASTMemberCall* ast_new_member_call(ASTNode* object, char* member_name, ASTNode**
 
 /* ─── Phase 2: structs / methods / enums / match ──────────────────── */
 
-ASTNode* ast_new_struct_decl(char* name, char** field_names, char** field_types, int field_count, char** type_params, int type_param_count, int line, int column) {
+ASTNode* ast_new_struct_decl(char* name, char** field_names, char** field_types, int field_count,
+                             char** type_params, char** type_param_constraints, int type_param_count,
+                             int line, int column) {
     ASTStructDecl* node = (ASTStructDecl*)ast_new_node(AST_STRUCT_DECL, sizeof(ASTStructDecl), line, column);
     int i;
     node->name = strdup(name);
@@ -262,19 +329,56 @@ ASTNode* ast_new_struct_decl(char* name, char** field_names, char** field_types,
         node->field_names[i] = strdup(field_names[i] ? field_names[i] : "");
         node->field_types[i] = field_types && field_types[i] ? strdup(field_types[i]) : NULL;
     }
-    /* Generics PR 1: copy type parameter names. */
+    /* Generics PR 1: copy type parameter names. PR 6: plus constraints. */
     node->type_param_count = type_param_count;
     node->type_params = type_param_count > 0 ? malloc(sizeof(char*) * (size_t)type_param_count) : NULL;
+    node->type_param_constraints = type_param_count > 0 ? malloc(sizeof(char*) * (size_t)type_param_count) : NULL;
     for (i = 0; i < type_param_count; i++) {
         node->type_params[i] = strdup(type_params[i] ? type_params[i] : "");
+        node->type_param_constraints[i] =
+            (type_param_constraints && type_param_constraints[i]) ? strdup(type_param_constraints[i]) : NULL;
     }
     return (ASTNode*)node;
 }
 
 ASTNode* ast_new_impl_decl(char* struct_name, ASTNode* methods, int line, int column) {
+    return ast_new_impl_decl_generic(struct_name, NULL, 0, NULL, 0, methods, line, column);
+}
+
+/* RFC §4.4: generic impl constructor. See ast.h for the contract. */
+ASTNode* ast_new_impl_decl_generic(char* struct_name,
+                                   char** type_params, int type_param_count,
+                                   char** type_args, int type_arg_count,
+                                   ASTNode* methods, int line, int column) {
     ASTImplDecl* node = (ASTImplDecl*)ast_new_node(AST_IMPL_DECL, sizeof(ASTImplDecl), line, column);
     node->struct_name = strdup(struct_name);
     node->methods = methods;
+    node->type_params = NULL;
+    node->type_param_count = 0;
+    node->type_args = NULL;
+    node->type_arg_count = 0;
+    if (type_param_count > 0 && type_params) {
+        node->type_params = malloc(sizeof(char*) * (size_t)type_param_count);
+        if (!node->type_params) {
+            perror("Failed to allocate impl type parameter list");
+            exit(EXIT_FAILURE);
+        }
+        for (int i = 0; i < type_param_count; i++) {
+            node->type_params[i] = strdup(type_params[i] ? type_params[i] : "");
+        }
+        node->type_param_count = type_param_count;
+    }
+    if (type_arg_count > 0 && type_args) {
+        node->type_args = malloc(sizeof(char*) * (size_t)type_arg_count);
+        if (!node->type_args) {
+            perror("Failed to allocate impl type argument list");
+            exit(EXIT_FAILURE);
+        }
+        for (int i = 0; i < type_arg_count; i++) {
+            node->type_args[i] = strdup(type_args[i] ? type_args[i] : "");
+        }
+        node->type_arg_count = type_arg_count;
+    }
     return (ASTNode*)node;
 }
 
@@ -405,6 +509,13 @@ void ast_free(ASTNode* node) {
                     free(((ASTFnDecl*)node)->param_types);
                 }
                 free(((ASTFnDecl*)node)->return_type_annotation);
+                /* Generics PR 2: free the generic type parameter list. */
+                for (int i = 0; i < ((ASTFnDecl*)node)->type_param_count; i++) {
+                    free(((ASTFnDecl*)node)->type_params[i]);
+                    free(((ASTFnDecl*)node)->type_param_constraints[i]);
+                }
+                free(((ASTFnDecl*)node)->type_params);
+                free(((ASTFnDecl*)node)->type_param_constraints);
                 ast_free(((ASTFnDecl*)node)->body);
                 break;
             case AST_BLOCK:
@@ -521,12 +632,23 @@ void ast_free(ASTNode* node) {
                     free(sd->type_params[i]);
                 }
                 free(sd->type_params);
+                if (((ASTStructDecl*)node)->type_param_constraints) {
+                    for (i = 0; i < sd->type_param_count; i++) {
+                        free(((ASTStructDecl*)node)->type_param_constraints[i]);
+                    }
+                    free(((ASTStructDecl*)node)->type_param_constraints);
+                }
                 break;
             }
             case AST_IMPL_DECL: {
                 ASTImplDecl* id = (ASTImplDecl*)node;
                 free(id->struct_name);
                 ast_free(id->methods);
+                /* Generics PR 2: free impl type params/args. */
+                for (int i = 0; i < id->type_param_count; i++) free(id->type_params[i]);
+                free(id->type_params);
+                for (int i = 0; i < id->type_arg_count; i++) free(id->type_args[i]);
+                free(id->type_args);
                 break;
             }
             case AST_ENUM_DECL: {

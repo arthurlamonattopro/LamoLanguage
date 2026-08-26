@@ -39,7 +39,37 @@ Instead of executing code through a virtual machine, **Lamo transpiles your prog
 - 🧪 Built-in testing
 - 🛠 Code formatter
 - 🔍 Semantic analysis
+- 🧬 Generics: generic functions, structs, impls, constraints (`T: Ord`)
+- 🎯 Typed collections & Option/Result in the standard library
+- 🗑 Opt-in mark-sweep garbage collector
 - 🌳 AST generation
+
+---
+
+## Generics (new in 2.5)
+
+```lamo
+fn pick<T>(a: T, b: T) -> T {
+    if (1 < 2) { return a }
+    return b
+}
+
+struct Stack<T> {
+    items: array<T>,
+    top: int
+}
+
+impl<T> Stack<T> {
+    fn push(x: T) {
+        self.items.push(x)
+        self.top += 1
+    }
+}
+
+let s: Stack<int> = Stack<int> { items: [], top: 0 }
+s.push(10)
+print(pick("left", "right"))
+```
 
 ---
 

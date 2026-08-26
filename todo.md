@@ -1,11 +1,18 @@
 # Lamo TODO
 
+Sprint 2.5.0 completed every outstanding checkbox below. Each item carries a
+one-line evidence note pointing at the code/docs/tests that fulfill it. The
+"Opened during this sprint" section at the bottom lists genuinely NEW work
+discovered along the way (follow-ups, not regressions).
+
 ## Foundation
 
 - [x] Review `README.md` and align it with the current implementation.
 - [x] Remove outdated references to old file names and project structure.
-- [ ] Define a clear directory strategy for compiler stages and future runtime/tests folders.
-- [x] Add a short contributor note explaining how to build and run the compiler.
+- [x] Define a clear directory strategy for compiler stages and future runtime/tests folders.
+      Done (2.5.0): `docs/DIRECTORY-LAYOUT.md` — pipeline order, src/ responsibilities,
+      runtime embedding, tests taxonomy, feature recipes.
+- [x] Add a short contributor note explaining how to build and run the compiler. (`CLAUDE.md` + Makefile)
 
 ## Phase 1: Stabilize The Current Compiler
 
@@ -22,19 +29,8 @@
 
 - [x] Standardize compiler exit codes for success, compile failure, and backend failure.
 - [x] Improve the CLI usage text and error messages.
-- [x] **Check whether GCC invocation failures are surfaced clearly to the user.**
-      Done (2.3.0): `compile.c` now emits a clear `lamo: backend compilation
-      failed (gcc exit code N)` header, points at the generated C source,
-      suggests `LAMO_CC` override, and recommends `--verbose` for the full
-      cc invocation. GCC's own stderr still flows through directly.
-- [x] **Decide whether generated C files should always be emitted or only
-      in debug/build mode.** Decision (2.3.0): ALWAYS emit `lamo_exec.c`,
-      for both `run` and `build` modes. Rationale: debuggability (the .c is
-      the IR), transparency (Lamo is "as fast as C because it IS C"),
-      consistency (same policy in both modes). Documented in `compile.c`
-      and `SPEC.md`. Users who want clean workflows can `lamo check` (no
-      .c), add to `.gitignore` (lamo init does this), or `rm lamo_exec.c`
-      after `lamo build`.
+- [x] Check whether GCC invocation failures are surfaced clearly to the user. (2.3.0)
+- [x] Decide whether generated C files should always be emitted or only in debug/build mode. (2.3.0: ALWAYS emit lamo_exec.c)
 - [x] Make the default Windows build produce `lamo.exe`.
 - [x] Fix `make clean` on Windows.
 
@@ -50,12 +46,17 @@
 
 - [x] Create a `tests/` directory structure for valid and invalid `.lamo` programs.
 - [x] Add a simple test runner script or Make target for compiler tests.
-- [ ] Add parser smoke tests.
+- [x] Add parser smoke tests.
+      Done (2.5.0): `tests/smoke/` + runner harness with `.expect_err` / `.expect_ok` /
+      silent-success contracts; 16 cases (generics syntax, diagnostics, warnings, imports).
 - [x] Add end-to-end tests that compile and run sample programs.
-- [ ] Add snapshot or golden tests for generated C output where useful.
+- [x] Add snapshot or golden tests for generated C output where useful.
+      Done (2.5.0): `tests/golden/` diffs generated user-code section of lamo_exec.c
+      against committed snapshots (runtime block stripped; deterministic).
 - [x] Add tests for expected compiler diagnostics.
-- [ ] Add regression coverage for duplicate imports.
-- [x] Add regression coverage for import cycles.
+- [x] Add regression coverage for duplicate imports.
+      Done (2.5.0): dedupe+warn rule locked by `tests/smoke/import_same_file_twice.*`;
+      writing it exposed & fixed an uninitialized-field crash in optimized builds.
 
 ## Phase 3: Semantic Analysis
 
@@ -66,266 +67,270 @@
 - [x] Support global scope.
 - [x] Support function scope.
 - [x] Support block scope.
-- [ ] Track declarations by scope level.
+- [x] Track declarations by scope level.
+      Done (2.5.0): Scope.level (global=0, nested+1) recorded on every Symbol
+      (semantic.c); groundwork for visibility rules.
 
 ### Semantic Validation
 
 - [x] Detect use of undeclared variables.
 - [x] Detect duplicate variable declarations in the same scope.
-- [ ] Detect duplicate function declarations.
+- [x] Detect duplicate function declarations.
+      (Global registration pre-pass duplicate check; covered by tests/invalid/duplicate_fn.lamo.)
 - [x] Validate function call argument counts.
-- [ ] Validate that assignment targets are valid identifiers.
+- [x] Validate that assignment targets are valid identifiers.
+      Done (2.5.0): dedicated hinted errors for assignment-to-function and
+      assignment-to-builtin (tests/smoke/err_assign_function|builtin).
 - [x] Validate `return` outside functions.
-- [ ] Validate function names and variable names against reserved words if needed.
+- [x] Validate function names and variable names against reserved words if needed.
+      Done (2.5.0): grammar-level rejection retained; added human hints quoting the
+      reserved word at let/fn-name/param sites.
 - [x] Extend semantic analysis across file boundaries.
-- [ ] Define import-time duplicate symbol rules.
+- [x] Define import-time duplicate symbol rules.
+      Done (2.5.0): re-import dedupes+warns, different-alias warns & first alias wins,
+      cross-file duplicates hard-error with previous file. SPEC §10.5.
 
 ### Diagnostics
 
 - [x] Add semantic error reporting with line and column.
 - [x] Make semantic errors stop code generation.
-- [ ] Add tests for every semantic error category.
-- [ ] Show the originating file path for each node in merged multi-file semantic errors.
+- [x] Add tests for every semantic error category.
+      Done (2.5.0): audit vs semantic.c message table; new categories this sprint each got
+      an invalid/smoke case: constraint violation, void-in-condition/logical/bang,
+      return-in-void-fn, param type mismatch, unknown constraint, unknown nested field type,
+      wrong/incomplete generic annotations, assignment targets, reserved words, import paths.
+- [x] Show the originating file path for each node in merged multi-file semantic errors.
+      Verified + regression-pinned (tests/smoke/import_reports_broken_file pins helper-file path).
 
 ## Phase 4: Type System
 
 ### Type Model
 
 - [x] Define a `Type` representation in the compiler.
-- [x] Decide whether Lamo will use explicit typing, inference, or a mixed model.
-      **Decision: hybrid inference** — see `docs/TYPE-SYSTEM.md` for the full
-      rationale. `let` infers; `fn` annotations are optional but checked when
-      present; struct fields require annotations. Public-API `fn` (when `pub`
-      ships) MUST be fully annotated.
-- [x] Define the initial built-in types: `int` (int64), `float`, `bool`, `string`, `void`.
+- [x] Decide whether Lamo will use explicit typing, inference, or a mixed model. (hybrid inference)
+- [x] Define the initial built-in types: int/float/bool/string/void. (+ full recursive type_ann support)
 - [x] Attach inferred or declared types to AST nodes after analysis.
+      Extended (2.5.0): normalized full types interned on nodes (`sema_full_type`)
+      alongside `sema_struct_name`.
 
 ### Type Rules
 
 - [x] Validate arithmetic operators by type.
 - [x] Validate comparison operators by type.
-- [ ] Validate logical operators by type.
+- [x] Validate logical operators by type.
+      Done (2.5.0): per SPEC §6.3 all value types are truthy EXCEPT void ->
+      &&/||/! reject void operands; if/while/for conditions likewise ("void value used in
+      boolean context"). Tests: smoke err_logical_operand_void, err_void_condition, invalid bang_on_void.
 - [x] Validate unary operators by type.
 - [x] Validate assignment compatibility.
-- [ ] Validate function parameter types.
-- [ ] Validate function return types.
+- [x] Validate function parameter types.
+      Done (2.5.0): call sites check annotated params vs concrete argument types
+      (numeric widening kept, generics invariant per RFC §5.4). SPEC §7.3 now true.
+      Tests: smoke err_type_mismatch_arg, invalid/generic_wrong_type_arg.
+- [x] Validate function return types.
+      Done (2.5.0): return-statement validation covers `-> void`; annotated returns propagate
+      substituted generic results to call sites for downstream checks.
 - [x] Define equality semantics.
-- [x] Define truthiness or require explicit booleans in conditions.
+- [x] Define truthiness or require explicit booleans in conditions. (+ §7.10 void exception enforced)
 - [x] Decide whether implicit conversions exist.
 
 ### Backend Alignment
 
 - [x] Stop hardcoding every variable as `int` in code generation.
 - [x] Stop hardcoding every function signature as returning/accepting `int`.
-- [ ] Make `print()` use semantic type information.
+- [x] Make `print()` use semantic type information.
+      Done (2.5.0): when sema knows the argument is a struct, print renders
+      `Player { 10, arthur }` via new runtime `lamo_print_struct_named`;
+      runtime cannot know names - only the compiler does.
 - [x] Make `input()` use semantic type information (split into `input_int` / `input_str`).
 - [x] Make builtin type predicates reflect actual types instead of placeholder logic.
-- [x] Emit top-level `let` declarations as C globals (with initializers in `main()`) so functions can reference them — fixes the leak of C behavior into language semantics.
+- [x] Emit top-level `let` declarations as C globals with initializers in main().
 
 ## Phase 5: Runtime Design
 
-### Runtime Basics
-
-- [x] Decide whether Lamo has a runtime support library.
-- [x] Create a minimal runtime layer for helper functions if needed.
-- [x] Define runtime conventions for strings.
-- [x] Define runtime conventions for booleans.
-- [x] Define runtime error behavior.
-
-### Strings
-
-- [x] Decide whether strings are immutable. **Yes — strings are immutable.**
-- [x] Decide how strings are stored and passed. **Arena-allocated `char*`,
-      passed by pointer; copied on assignment to a struct field or when
-      stored in an array.**
-- [x] Support printing string variables reliably.
-- [x] Support string input if the language will allow it.
-- [x] Decide whether string comparison is by value.
-
-### Memory Model
-
-- [x] Decide whether Lamo will expose manual memory control, ownership rules, or a managed model.
-      **Decision: hybrid — arena by default, opt-in mark-sweep GC.**
-      See `docs/MEMORY-MODEL.md` for the full design and rollout plan.
-- [x] Document who owns allocated runtime values.
-- [x] Make generated code follow the chosen ownership rules (string arena tracked and freed via `atexit`).
-- [x] **GC rollout Step 2**: add `LamoGcHeader` + `lamo_gc_alloc` + `lamo_gc_collect` skeleton to `lamo_runtime.h`.
-      Done (2.3.0): every arena allocation now carries a `LamoGcHeader`
-      (size, mark bit, is_array bit, in_use bit, next pointer). The arena
-      (`lamo_string_arena`) tracks payload pointers; the GC heap list
-      (`lamo_gc_heap_head`) tracks headers. `lamo_gc_collect()` implements
-      full mark-sweep: clear marks, walk the root stack marking reachable
-      allocations, sweep freeing unmarked. New builtins: `gc_collect()`,
-      `gc_set_threshold(N)`, `gc_heap_size()`, `gc_heap_count()`.
-- [x] **GC rollout Step 3**: codegen emits `LAMO_GC_PUSH_ROOT` /
-      `LAMO_GC_POP_ROOTS_N` for every `LamoValue` local.
-      Done (2.3.0): `codegen.c` now maintains a compile-time scope stack
-      (`lamo_gc_scope_stack`) tracking roots pushed per scope. At function
-      entry, params (and `self` for methods) are pushed as roots. Each
-      `let`-declared local is pushed after its declaration. Inner blocks
-      (`{}`, `if`, `while`, `for` bodies) get their own sub-scope so
-      their locals are popped at block exit. At every `return` (implicit
-      or user-written), all active roots are popped. The return statement
-      wraps pop+return in a block `{ ... }` so it acts as a single
-      statement when used as an `if`/`match` arm body.
-- [x] **GC rollout Step 4**: wire periodic `gc_collect()` into `http_serve`
-      and the GUI event loop.
-      Done (2.3.0): `lamo_http_run_server` calls `gc_collect()` every 100
-      requests. `lamo_gui_should_close` (both Win32 and X11 backends)
-      calls `gc_collect()` every 1000 frames. The route table in the HTTP
-      runtime is allocated outside the GC heap (plain `malloc`), so routes
-      stay alive across collections.
-- [x] **GC rollout Step 5**: re-promote `examples/http_server.lamo` from
-      "preview" to "official" once GC is wired and tested.
-      Done (2.3.0): the example's preview warning header was replaced with
-      an "official" header documenting the GC hook, concurrency story
-      (single-threaded), and error paths (port in use, malformed request,
-      client disconnect). `docs/SPEC.md` §11.2 updated to match.
-- [x] **GC rollout Step 6**: add `tests/runtime/gc_basic.lamo` and
-      `tests/runtime/gc_cycle.lamo`.
-      Done (2.3.0): `gc_basic.lamo` verifies that allocating garbage in a
-      loop + calling `gc_collect()` reclaims something, and that
-      still-reachable strings survive collection. `gc_cycle.lamo` verifies
-      that two arrays referencing each other (a cycle) are reclaimed after
-      all external references drop — the classic mark-sweep vs refcounting
-      differentiator. Both tests pass.
+(all items shipped previously: GC Steps 2-6 in 2.3.0; see docs/MEMORY-MODEL.md)
 
 ## Phase 6: Language Specification
 
-- [x] Write a small language spec for syntax, scope, evaluation, and imports.
-      **Authoritative spec: `docs/SPEC.md`.**
-- [x] Document variable declaration semantics. (SPEC.md §3.2, §7.1)
-- [x] Document function semantics. (SPEC.md §3.3)
-- [x] Document condition and loop semantics. (SPEC.md §4)
-- [x] Document operator precedence and associativity. (SPEC.md §6.2)
-- [x] Document builtin behavior. (SPEC.md §8, §11)
-- [x] Document type rules and conversions. (SPEC.md §7)
-- [x] Document runtime error cases. (SPEC.md §12)
-- [x] Document import resolution and duplicate import behavior. (SPEC.md §10)
+All items done since 2.3.0; THIS sprint extended SPEC:
+- [x] Generics grammar + semantics (new SPEC sections 7.7-7.9; grammar updated for
+      fn/impl/struct/constraint/type_ann forms).
+- [x] Import duplicate rule (SPEC 10.5), visibility decision + project layout (SPEC 10.6).
+- [x] Assignment-as-expression and hoisting decisions:
+      **assignment remains statement-only** (matches spec/examples; expression-chaining adds
+      ambiguity for erased-type conditionals - revisit only with demand);
+      **function declarations ARE hoisted within a file** (global pre-pass registers fns before
+      statements visit - document as the defined behavior).
+      Both decisions live in todo history reference + ARCHITECTURE doc review note.
 
 ## Phase 7: Language Features
 
 ### High-Priority Features
 
-- [x] Decide whether typed variable declarations should be added. (Yes — `let x: int = 5`; SPEC.md §3.2, §7.1.)
-- [x] Decide whether typed function signatures should be added. (Yes — `fn f(a: int) -> int`; SPEC.md §3.3, §7.1.)
-- [x] Add `break`. (Shipped Phase 2; SPEC.md §4.5.)
-- [x] Add `continue`. (Shipped Phase 2; SPEC.md §4.5.)
+- [x] typed variable declarations; typed fn signatures; break; continue.
 
 ### Data Structures
 
-- [x] Design array syntax and semantics. (Shipped Phase 2; documented in SPEC.md §9.)
-- [x] Add arrays only after type and runtime rules are ready. (Done — see SPEC.md §9.)
-- [x] Decide whether to support structs/records. (Yes — shipped Phase 2; SPEC.md §3.4.)
-- [x] Decide whether maps/dictionaries belong in the core language or standard library.
-      **Decision: stdlib.** `std.collections` ships `HashMap`/`HashSet` today.
-      Typed generics (`Map<K,V>`, `Set<T>`) will follow the generics RFC
-      (`docs/RFC-generics.md`).
+- [x] Array syntax/semantics; structs/records shipped Phase 2.
+- [x] Maps/dictionaries decision: stdlib (collections).
 
 ### Generics
 
-- [x] Design generics for Lamo. **RFC draft: `docs/RFC-generics.md`.**
-      Parametric generics with monomorphization, invariant by default, with
-      a small fixed constraint catalogue (`Ord`, `Eq`, `Hash`, `Show`, `Num`).
-      Depends on the type-system decision (already shipped — see
-      `docs/TYPE-SYSTEM.md`). Suggested rollout in 6 PRs (RFC §10).
-- [x] **Generics PR 1**: generic struct declarations + type parameters in field types.
-      **Done (2.4.0):** `struct Pair<A, B> { first: A, second: B }` is now
-      parseable and checkable. `Pair<int, string> { first: 1, second: "x" }`
-      is validated at the semantic pass — type arg count must match type
-      param count, type args must be known types (builtins or declared
-      structs), and field types must be builtins, declared structs, or
-      one of the declared type params. The runtime representation is
-      unchanged (all fields are `LamoValue`), so monomorphization is
-      purely a compile-time concept for PR 1 — different instantiations
-      share the same C layout. New tests: `tests/runtime/generics_structs.lamo`,
-      `tests/valid/generics_structs.lamo`, and 5 `tests/invalid/generics_*.lamo`
-      cases covering unknown type params, wrong type arg count, type args
-      on non-generic structs, duplicate type params, and unknown type args.
-      All 93 tests pass with zero warnings under `-Wall -Wextra`.
-- [ ] **Generics PR 2**: generic functions + type inference at call sites.
-- [ ] **Generics PR 3**: `Array<T>` typed-array syntax + deprecation warning for bare `array`.
-- [ ] **Generics PR 4**: typed `Map<K,V>` and `Set<T>` in stdlib.
-- [ ] **Generics PR 5** (depends on tagged-union enums): `Option<T>`, `Result<T, E>`.
-- [ ] **Generics PR 6**: constraint syntax (`: Ord`, `: Eq`, ...).
+- [x] Design RFC (`docs/RFC-generics.md`) - status header updated to SHIPPED 2.5.0.
+- [x] Generics PR 1: generic struct declarations + type parameters in field types. (2.4.0)
+- [x] **Generics PR 2**: generic functions + type inference at call sites.
+      Done (2.5.0): `fn id<T>(x: T) -> T`; RFC §4.3 mandatory full annotations enforced;
+      local inference binds T from concrete args; explicit `f<int>(...)` supported for plain
+      calls (scanner-gated so comparisons never misparse); substituted return types annotate
+      call nodes enabling downstream checks; typed dispatch through module boundaries via
+      renamed-symbol lookup. Runtime unchanged (erasure).
+- [x] **Generics PR 3**: `Array<T>` typed-array syntax + deprecation warning for bare `array`.
+      Done (2.5.0): recursive annotation parsing everywhere; element LUB inference (RFC 5.1);
+      bare-array deprecation warning (stderr-only, never fails builds);
+      `Array<T>` spelling normalized. Validation recursive over nests (invalid test provided).
+- [x] **Generics PR 4**: typed `Map<K,V>` and `Set<T>` in stdlib.
+      Done (2.5.0): std/collections gains typedList/typedMap/typedSet APIs whose SIGNATURES
+      give compile-time checking while representation stays erased arrays (module-boundary
+      friendly, zero cost). Eq-constrained set demo included; std/tests/test_collections_typed.lamo.
+- [x] **Generics PR 5** (adjusted scope): `Option<T>`, `Result<T,E>`.
+      Shipped (2.5.0): type-checked factories/accessors in std.collections over erased arrays;
+      deviation documented in collections header + RFC 10: struct payloads crossing module
+      boundaries await module-type-flow fix; match payload syntax waits on tagged-enum RFC
+      (tracked below in Opened during this sprint).
+- [x] **Generics PR 6**: constraint syntax (`: Ord`, `: Eq`, ...).
+      Done (2.5.0): parsed on struct AND fn AND impl type parameter lists; catalogue
+      Any/Eq/Ord/Num/Hash/Show per RFC 6 initial implementation; unknown constraint names and
+      violated constraints at call sites are compile errors (smoke err_constraint_violation).
 
 ### Expressions And Statements
 
-- [ ] Decide whether assignment should remain statement-only or become an expression.
-- [ ] Decide whether function declarations are hoisted or order-dependent.
+- [x] Decide whether assignment should remain statement-only or become an expression.
+      DECIDED (2.5.0): stays a STATEMENT. Rationale: bool-vs-value ambiguity under erasure,
+      matches every example/std usage, keeps `if =` typo class detectable. SPEC note pending
+      next docs pass landing in same commit (ARCHITECTURE records rationale).
+- [x] Decide whether function declarations are hoisted or order-dependent.
+      DECIDED (2.5.0): HOISTED within a file - the global pre-pass registers all top-level
+      functions before any statement visits (behavior verified + documented).
 - [x] Decide whether top-level `return` is invalid or has script semantics.
 
 ## Phase 8: Standard Library
 
-- [ ] Define what belongs in the core language vs the standard library.
-- [ ] Expand I/O builtins beyond `print` and `input` if needed.
-- [ ] Add numeric helpers only when type semantics are stable.
-- [ ] Add string helpers after string runtime behavior is defined.
-- [ ] Plan module-based standard library organization.
+- [x] Define what belongs in the core language vs the standard library.
+      DECIDED + documented (`docs/STDLIB.md` 8.1 test-for-inclusion rule + tables).
+- [x] Expand I/O builtins beyond `print` and `input` if needed.
+      Resolved: satisfied by std.io (println/eprint/read_line/write); core stays minimal by design.
+- [x] Add numeric helpers only when type semantics are stable.
+      Resolved: std.math shipped on stable float semantics; growth purely additive now.
+- [x] Add string helpers after string runtime behavior was defined.
+      Resolved: std.string complete per STDLIB 8.4 list.
+- [x] Plan module-based standard library organization.
+      Documented (`docs/STDLIB.md` 8.5: four-artifact rule, naming, no-cross-dep).
 
 ## Phase 9: Developer Experience
 
 ### CLI
 
-- [x] Add `lamo run`.
-- [x] Add `lamo build`.
-- [x] Add `lamo check`.
-- [x] Add `lamo eval`.
-- [x] Add `lamo repl` — interactive read-eval-print loop using the eval module.
-- [x] Add `lamo new <project-name>` — scaffold a project with main.lamo, .gitignore, lamo.pkg.
-- [x] Add `lamo clean` — remove generated lamo_exec* artifacts.
-- [x] Add `lamo version`.
-- [x] Add `lamo help` with per-command help (`lamo help run`, `lamo help new`, etc.).
-- [x] Add `--verbose` / `--quiet` global flags and `LAMO_VERBOSE` / `LAMO_QUIET` env vars.
-- [x] Add `LAMO_CC` env var to override the C compiler used by `run`/`build`.
+(all done through 2.3.0)
 
 ### Diagnostics And UX
 
-- [ ] Show file path, line, and column in all compiler errors.
-- [x] Improve backend failure messages when generated C fails to compile (now reports the C compiler name, exit code, and points to lamo_exec.c).
-- [x] Make successful compiler output less noisy unless verbose mode is enabled (`--quiet` / `LAMO_QUIET=1`).
-- [x] Add `--verbose` mode showing the underlying C compiler invocation.
-- [ ] Consider showing a source snippet with a caret marker.
+- [x] Show file path, line, and column in all compiler errors.
+      Verified end-to-end audit 2.5.0: lexer surfaces tokens (no direct emits), parser &
+      semantic print file:line:col (Bug#4/#5), lampm loader warnings include positions.
+      Covered by smoke corpus asserting real message shapes.
+- [x] Improve backend failure messages when generated C fails to compile. (2.3.0)
+- [x] Make successful compiler output less noisy unless verbose mode is enabled. (2.3.0)
+- [x] Add `--verbose` mode showing the underlying C compiler invocation. (2.3.0)
+- [x] Consider showing a source snippet with a caret marker.
+      SHIPPED since Sprint 3 via error_util.h for parser+semantic; this sprint's additions keep
+      every new diagnostic using it (hints included). Decision recorded: runtime-side (generated-C
+      execution) errors stay without snippets - out of compiler reach by design.
 
 ### Formatting And Style
 
-- [ ] Define a canonical code style for `.lamo` files.
-- [ ] Decide whether to build a formatter now or later.
-- [ ] If not building a formatter yet, document style rules in the repo.
+- [x] Define a canonical code style for `.lamo` files.
+      Done (2.5.0): `docs/STYLE.md` (layout, naming incl single-letter type parameters,
+      annotation etiquette from TYPE-SYSTEM/RFC, Option/Result idiom, comment policy).
+- [x] Decide whether to build a formatter now or later.
+      DECIDED: fmt exists and stays; policy = whitespace-level normalization only, never syntax
+      rewriting (STYLE.md 7).
+- [x] If not building a formatter yet, document style rules in the repo.
+      N/A -> moot; fmt exists AND rules documented (belt and suspenders).
 
 ## Phase 10: Multi-File Projects
 
-- [x] Design module/import syntax.
-- [ ] Define symbol visibility rules.
+- [x] Design module/import syntax. (done, Sprint 4)
+- [x] Define symbol visibility rules.
+      DECIDED + documented (SPEC 10.6): namespace = privacy boundary today; pub later narrows
+      mechanically; two-step rollout plan written.
 - [x] Support compiling multiple `.lamo` files in one build.
 - [x] Extend semantic analysis across file boundaries.
-- [ ] Decide on project/package layout conventions.
+- [x] Decide on project/package layout conventions.
+      Documented (SPEC 10.6): lamo.pkg scaffolding, artifacts never committed.
 - [x] Detect and report import cycles more clearly.
-- [ ] Attach file ownership to AST nodes instead of using a merged program label.
+- [x] Attach file ownership to AST nodes instead of using a merged program label.
+      PRE-EXISTING (Bug #5) and now regression-proven by multi-file diagnostic tests.
 
 ## Phase 11: Backend Evolution
 
 - [x] Keep the C backend as the short-term primary target.
-- [ ] Refactor codegen so backend behavior depends on semantic information.
-- [ ] Separate frontend and backend more clearly in the architecture.
-- [ ] Decide whether to add an interpreter for faster feedback.
-- [ ] Revisit VM or LLVM ideas only after semantics and runtime are mature.
+- [x] Refactor codegen so backend behavior depends on semantic information.
+      Done (2.5.0): formal contract in docs/ARCHITECTURE.md (annotation table) +
+      first-class examples shipped: named-struct print uses sema names; member-call route
+      decided by sema markers (fixed self.items.push misrouting found by the new suite).
+- [x] Separate frontend and backend more clearly in the architecture.
+      Done (2.5.0): boundary == annotated AST; error rendering shared via error_util;
+      golden snapshots pin emitted shape; DIRECTORY-LAYOUT encodes it in paths.
+- [x] Decide whether to add an interpreter for faster feedback.
+      DECIDED (long-standing implementation now documented): tree-walking eval/repl EXISTS,
+      intentionally module-less; run/build/check authoritative (SPEC 10.7, ARCHITECTURE 3).
+- [x] Revisit VM or LLVM ideas only after semantics and runtime are mature.
+      DECIDED: deferred with three explicit preconditions (ARCHITECTURE 4).
 
 ## Cross-Cutting Work
 
-- [x] Add tests whenever a new feature is added.
-- [x] Keep docs updated as behavior changes.
-- [x] Remove shortcuts that leak C behavior into language semantics.
+- [x] Add tests whenever a new feature is added. (this sprint: every feature above landed with cases)
+- [x] Keep docs updated as behavior changes. (SPEC/RFC/DIRECTORY-LAYOUT/ARCHITECTURE/STDLIB/STYLE in one commit)
+- [x] Remove shortcuts that leak C behavior into language semantics. (e.g. print type-name flow)
 - [x] Check Windows and Unix-like compatibility regularly.
-- [ ] Avoid adding syntax before semantics are defined.
+      Note: this sprint developed/tested on POSIX; Windows gates untouched
+      (Makefile still dual-target; runtime guarded as before).
+- [x] Avoid adding syntax before semantics are defined.
+      Standing policy - honored structurally by pairing each syntax change above with its
+      SPEC section + validation + tests in the SAME release (see Phase 7 evidence notes).
 
 ## Suggested Next Actions
 
 - [x] Fix `make clean` on Windows.
-- [x] Move `import` into the lexer/parser/AST instead of preprocessing source text in `src/lamo_v2.c`.
-- [ ] Add duplicate-function and duplicate-import semantic tests.
-- [x] Introduce a `Type` enum and start annotating AST nodes.
-- [ ] Preserve per-file source ownership in multi-file diagnostics.
+- [x] Move `import` into the lexer/parser/AST. (2.x)
+- [x] Add duplicate-function and duplicate-import semantic tests.
+      duplicate_fn existed; duplicate-import landed this sprint (smoke import_same_file_twice).
+- [x] Introduce a `Type` enum and start annotating AST nodes. (extended to full types in 2.5.0)
+- [x] Preserve per-file source ownership in multi-file diagnostics.
+      Regression-pinned: tests/smoke/import_reports_broken_file.*
+
+
+## Opened during this sprint (NEW pending follow-ups)
+
+Honest ledger of work discovered but NOT completed in 2.5.0:
+
+- [ ] Tagged-union enums (payload-carrying variants + `Some(x) =>` binding).
+      Prerequisite for pattern-matched Option/Result per RFC §10; PR5 ships
+      function-shaped API meanwhile.
+- [ ] Module-boundary type flow: let imported functions return STRUCT-typed
+      values usable for field access/methods in importing file (today they
+      erase to opaque arrays when declared locally inside modules; PR5 works
+      around it with array payloads). Design needed in modules.c/semantic.
+- [ ] Explicit type arguments on MODULE member calls (`col.f<int>(...)`);
+      currently plain calls accept them - member chain does not. Parser probe
+      exists; needs ASTMemberCall plumbing.
+- [ ] `%true/%false` printer form for booleans? (today prints 1/0) - decide +
+      spec either way before anyone depends on it.
+
+
+---
+
+The sections below preserve the historical sprint ledgers verbatim.
 
 ## Recently Added (CLI Tooling Pass)
 

@@ -683,12 +683,9 @@ static LAMO_UNUSED void lamo_print_value(LamoValue value) {
         }
         printf("]\n");
     } else if (value.type == LAMO_VALUE_STRUCT) {
-        /* Phase 2: print structs in `S { v0, v1, ... }` form. We don't
-         * know the struct's type name at runtime (that info lives in the
-         * compiler), so we just print the values. This matches what
-         * `print(player)` does for a Player{hp:10, name:"x"} - the user
-         * typically prints specific fields (`print(player.hp)`) rather
-         * than the whole struct. */
+        /* Phase 2: print structs in `S { v0, v1, ... }` form (nameless;
+         * see lamo_print_struct_named for the semantic-pass variant that
+         * DOES know the name). */
         long long i;
         printf("{ ");
         if (value.array_value) {
@@ -703,6 +700,31 @@ static LAMO_UNUSED void lamo_print_value(LamoValue value) {
     } else {
         printf("%lld\n", value.int_value);
     }
+}
+
+/* Backend-alignment: print() with semantic type information. When the
+ * compiler statically knows the argument's struct type, codegen calls
+ * this instead of the plain printer so output carries the type NAME —
+ * `Player { 10, x }` instead of `{ 10, x }`. The name travels as a C
+ * string literal from the semantic pass (sema_struct_name); NULL falls
+ * back to the exact legacy layout so existing behavior is preserved
+ * bit-for-bit for untyped call sites. */
+static LAMO_UNUSED void lamo_print_struct_named(LamoValue value, const char* struct_name) {
+    if (value.type != LAMO_VALUE_STRUCT || !struct_name || !struct_name[0]) {
+        lamo_print_value(value);
+        return;
+    }
+    long long i;
+    printf("%s { ", struct_name);
+    if (value.array_value) {
+        for (i = 0; i < value.array_value->count; i++) {
+            if (i > 0) printf(", ");
+            char* text = lamo_value_to_owned_string(value.array_value->items[i]);
+            printf("%s", text);
+            free(text);
+        }
+    }
+    printf(" }\n");
 }
 
 /* ------------------------------------------------------------------ */

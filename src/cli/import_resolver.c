@@ -645,24 +645,14 @@ int load_program_recursive_from(CompilationState* state, ASTProgram* aggregate_p
          * (or vice versa), or the aliases differ, we honor the FIRST
          * load's alias (the file's declarations are already renamed).
          * This is a documented limitation: importing the same file twice
-         * with different aliases is not supported. */
-        if (alias) {
-            /* Register the alias so resolution still works on the second
-             * import. We can't re-rename, so if the first import was
-             * NOT aliased, this alias mapping would be wrong. We check
-             * for that case explicitly. */
-            const LamoModuleEntry* existing = lamo_modules_lookup_alias(&state->modules, alias);
-            if (!existing) {
-                /* This alias hasn't been registered. The original file
-                 * was either imported without alias (so its names are
-                 * global, not namespaced) or with a different alias.
-                 * Either way, registering this alias would point at
-                 * wrong names — emit a warning and skip. */
-                fprintf(stderr, "%s:%d:%d: warning: file \"%s\" already imported; "
-                        "alias `%s` will not be registered (re-import with a different alias is not supported)\n",
-                        imported_from, import_line, import_column, path, alias);
-            }
-        }
+         * with different aliases is not supported.
+         *
+         * Import-time duplicate rule (Phase 10 / SPEC §10): a bare
+         * re-import is a harmless no-op — dedupe is by normalized path —
+         * but we WARN so accidental double imports are visible. */
+        fprintf(stderr, "%s:%d:%d: warning: file \"%s\" already imported; duplicate import ignored%s\n",
+                imported_from, import_line, import_column, path,
+                alias ? " (re-import with a different alias is not supported)" : "");
         free(normalized_path);
         return 1;
     }

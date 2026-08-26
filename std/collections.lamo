@@ -350,3 +350,150 @@ fn setClear(setArr) {
 fn setToArray(setArr) {
     return setArr
 }
+
+
+// ─── Generics PR 4: typed collection APIs (RFC §7.2) ──────────────────
+//
+// These are TYPE-CHECKED entry points over the same representations as
+// the legacy functions above. At runtime everything stays an ordinary
+// Lamo array (type erasure — zero cost per RFC §8); at COMPILE time the
+// generic signatures below pin down element/key/value types so mixing
+// them is rejected by `lamo check` instead of corrupting data silently.
+//
+// Spelling rules (RFC §9): the preferred container spelling is
+// `array<T>`; bare `array` still works everywhere (deprecated warning).
+
+// Typed List<T>.
+fn typedListNew<T>() -> array<T> {
+    return []
+}
+
+fn typedListPush<T>(xs: array<T>, value: T) -> int {
+    push(xs, value)
+    return xs.len()
+}
+
+fn typedListPop<T>(xs: array<T>) -> T {
+    return pop(xs)
+}
+
+fn typedListGet<T>(xs: array<T>, i: int) -> T {
+    return xs[i]
+}
+
+fn typedListLen<T>(xs: array<T>) -> int {
+    return xs.len()
+}
+
+// Typed Map<K,V>. Representation stays the flat pair array shared with
+// newHashMap/mapPut above (erasure), but keys and values are now
+// compile-time constrained.
+struct TypedEntry<K, V> { key: K, value: V }
+
+fn typedMapNew<K, V>() -> array<TypedEntry<K,V>> {
+    return []
+}
+
+fn typedMapHas<K, V>(m: array<TypedEntry<K,V>>, key: K) -> bool {
+    let i = 0
+    while (i < m.len()) {
+        if (m[i].key == key) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn typedMapGetOr<K, V>(m: array<TypedEntry<K,V>>, key: K, fallback: V) -> V {
+    let i = 0
+    while (i < m.len()) {
+        if (m[i].key == key) { return m[i].value }
+        i = i + 1
+    }
+    return fallback
+}
+
+fn typedMapLen<K, V>(m: array<TypedEntry<K,V>>) -> int {
+    return m.len()
+}
+
+// Typed Set<T> (no duplicates enforced via equality).
+fn typedSetNew<T>() -> array<T> {
+    return []
+}
+
+fn typedSetAdd<T: Eq>(s: array<T>, value: T) -> bool {
+    let i = 0
+    while (i < s.len()) {
+        if (s[i] == value) { return false }
+        i = i + 1
+    }
+    push(s, value)
+    return true
+}
+
+fn typedSetHas<T: Eq>(s: array<T>, value: T) -> bool {
+    let i = 0
+    while (i < s.len()) {
+        if (s[i] == value) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn typedSetLen<T>(s: array<T>) -> int {
+    return s.len()
+}
+
+
+// ─── Generics PR 5: Option<T> / Result<T,E> ───────────────────────────
+//
+// NOTE ON SCOPE (docs/RFC-generics.md §10 lists tagged-union enums as a
+// separate prerequisite): these ship today behind GENERIC, TYPE-CHECKED
+// factory/accessor signatures. The wire representation is the standard
+// erased Lamo array, matching the module-wide design note above ("types
+// cannot flow across module boundaries"), which keeps every operation a
+// plain O(1) call with zero boxing.
+//
+//   Option<T>   [present:int, value]
+//   Result<T,E> [ok:int, value, error]
+//
+// Callers get compile-time checking exactly where it matters: the
+// payload they put IN and the fallback they take OUT. When the
+// tagged-enum RFC lands, Some(x)/Ok(v) pattern syntax will layer onto
+// these same function names.
+
+fn optionSome<T>(value: T) -> array {
+    return [1, value];
+}
+
+fn optionNone<T>() -> array {
+    return [0, 0];
+}
+
+fn optionIsSome<T>(opt: array) -> bool {
+    if (opt.len() == 2 && opt[0] == 1) { return true; }
+    return false;
+}
+
+fn optionUnwrapOr<T>(opt: array, fallback: T) -> T {
+    if (opt.len() == 2 && opt[0] == 1) { return opt[1]; }
+    return fallback;
+}
+
+fn resultOk<T, E>(value: T) -> array {
+    return [1, value, 0];
+}
+
+fn resultErr<T, E>(error: E) -> array {
+    return [0, 0, error];
+}
+
+fn resultIsOk<T, E>(res: array) -> bool {
+    if (res.len() == 3 && res[0] == 1) { return true; }
+    return false;
+}
+
+fn resultUnwrapOr<T, E>(res: array, fallback: T) -> T {
+    if (res.len() == 3 && res[0] == 1) { return res[1]; }
+    return fallback;
+}

@@ -20,8 +20,20 @@ track *what it means*.
   runtime, modules). Authoritative for "what the language means".
 - `docs/TYPE-SYSTEM.md` — type-system decision record (hybrid inference).
 - `docs/MEMORY-MODEL.md` — memory model and GC design + rollout plan.
-- `docs/RFC-generics.md` — draft RFC for parametric generics (not yet
-  implemented).
+- `docs/RFC-generics.md` — parametric generics RFC: **PRs 1-6 SHIPPED
+  (2.5.0)** (status header inside tracks adjusted scopes).
+- `docs/ARCHITECTURE.md` — frontend/backend boundary + the annotated-AST
+  information contract codegen must honor.
+- `docs/DIRECTORY-LAYOUT.md` — where everything lives and why.
+- `docs/STDLIB.md` — core-vs-stdlib boundary and module organization rules.
+- `docs/STYLE.md` — canonical `.lamo` style; formatter policy.
+
+## Release 2.5.0 highlights
+
+Generics PRs 1-6 complete (generic functions with inference & explicit call
+arguments, typed `array<T>`, constraints, impl<T>, typed stdlib collections
+plus Option/Result APIs), print() driven by semantic types, the full smoke +
+golden test harness, and the architecture/layout/style documentation set.
 
 ## Current State
 

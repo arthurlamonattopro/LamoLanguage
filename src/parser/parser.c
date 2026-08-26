@@ -298,29 +298,130 @@ static long long parse_int_literal(const char* text) {
     return strtoll(text, NULL, 10);
 }
 
-/* Generics PR 1: lookahead helper.
+/* ════════════════════════════════════════════════════════════════════
+ * Generics PR 2 / PR 3 / PR 6: full type-annotation parsing.
  *
- * Disambiguates `Foo<int, string> { ... }` (generic struct literal) from
- * `Foo < bar` (comparison expression). Both start with `IDENTIFIER <`, so
- * we need to peek ahead to see if the tokens form `< IDENT (, IDENT)* > {`.
+ * Previously every annotation site (let / param / return / field) parsed
+ * a single IDENTIFIER, which made `array<int>`, `Pair<int, string>` and
+ * `fn id<T>(x: T) -> T` unparsable. This block adds a recursive
+ * annotation grammar shared by ALL annotation positions:
  *
- * Returns 1 if the pattern matches (i.e., this is a generic struct literal
- * and the caller should parse the type args), 0 otherwise (the `<` is a
- * comparison operator and the caller should fall through to plain
- * identifier).
+ *     TYPE := IDENT [ '<' TYPE (',' TYPE)* '>' ]
  *
- * Does NOT consume any tokens — saves and restores both lexer state and
- * the current token. */
-static int parser_peek_is_generic_struct_literal(Parser* p) {
-    if (p->current.type != TOKEN_LT) return 0;
+ * The produced string is a COMPACT form (no spaces), e.g.
+ * "array<int>" or "pair<int,array<string>>". Case is preserved here;
+ * normalization (Array<T> -> array<T>) happens in the semantic pass so
+ * the parser stays a pure syntax layer.
+ *
+ * Because these functions can be invoked speculatively, they never
+ * mutate global state besides the token stream itself; the probe helper
+ * below saves/restores lexer position exactly like the existing generic
+ * struct literal lookahead introduced in Generics PR 1.
+ * ════════════════════════════════════════════════════════════════════ */
 
-    /* Save lexer state. */
+/* Tiny grow-only string buffer used while assembling nested annotations. */
+typedef struct {
+    char* data;
+    size_t len;
+    size_t cap;
+} TypeStrBuf;
+
+static void tsb_init(TypeStrBuf* sb) {
+    sb->cap = 64;
+    sb->len = 0;
+    sb->data = malloc(sb->cap);
+    if (!sb->data) {
+        perror("Failed to allocate type annotation buffer");
+        exit(EXIT_FAILURE);
+    }
+    sb->data[0] = '\0';
+}
+
+static void tsb_append(TypeStrBuf* sb, const char* text) {
+    size_t need;
+    if (!text) return;
+    need = sb->len + strlen(text) + 1;
+    if (need > sb->cap) {
+        while (sb->cap < need) sb->cap *= 2;
+        char* grown = realloc(sb->data, sb->cap);
+        if (!grown) {
+            perror("Failed to grow type annotation buffer");
+            exit(EXIT_FAILURE);
+        }
+        sb->data = grown;
+    }
+    memcpy(sb->data + sb->len, text, strlen(text) + 1);
+    sb->len += strlen(text);
+}
+
+static void tsb_append_char(TypeStrBuf* sb, char c) {
+    char tmp[2];
+    tmp[0] = c;
+    tmp[1] = '\0';
+    tsb_append(sb, tmp);
+}
+
+/* Recursive TYPE parser as described above. On success returns a
+ * malloc'd compact string owned by the caller. On failure emits ONE
+ * parser error and returns NULL (the caller cleans up and recovers). */
+static char* parse_type_str(Parser* p) {
+    TypeStrBuf sb;
+
+    if (p->current.type != TOKEN_IDENTIFIER) {
+        parser_error(p, "expected a type name");
+        return NULL;
+    }
+
+    tsb_init(&sb);
+    tsb_append(&sb, p->current.value);
+    advance_p(p);
+
+    if (p->current.type == TOKEN_LT) {
+        advance_p(p);  /* consume '<' */
+        tsb_append_char(&sb, '<');
+        while (p->current.type != TOKEN_EOF) {
+            char* inner = parse_type_str(p);
+            if (!inner) {
+                free(sb.data);
+                return NULL;
+            }
+            tsb_append(&sb, inner);
+            free(inner);
+            if (p->current.type == TOKEN_COMMA) {
+                advance_p(p);
+                tsb_append_char(&sb, ',');
+                continue;
+            }
+            break;
+        }
+        if (p->current.type != TOKEN_GT) {
+            parser_error(p, "expected '>' to close the type argument list");
+            free(sb.data);
+            return NULL;
+        }
+        advance_p(p);  /* consume '>' */
+        tsb_append_char(&sb, '>');
+    }
+
+    return sb.data;
+}
+
+/* Speculative scanner for `< IDENT ... > FOLLOW`. Consumes NOTHING on
+ * balance — state is fully restored whether or not the pattern matches.
+ *
+ * Token alphabet inside the angles: IDENTIFIER, '<', ',', '>' only, with
+ * nesting tracked by depth. This accepts nested generics like
+ * `array<pair<int,string>>` while rejecting arithmetic such as
+ * `a < b + c > (d)`.
+ *
+ * `follow` is the single token type required immediately after the
+ * closing '>' (TOKEN_LBRACE for generic struct literals — PR 1 rule,
+ * TOKEN_LPAREN for explicit call-site type arguments — PR 2). */
+static int probe_angle_type_list(Parser* p, LamoTokenType follow) {
+    /* Save lexer + current-token state (same scheme as PR 1). */
     int saved_pos = p->lexer->pos;
     int saved_line = p->lexer->line;
     int saved_column = p->lexer->column;
-    /* Deep-copy the current token so we can restore it. The value may be
-     * NULL for non-value tokens (operators, keywords); strdup(NULL) is
-     * undefined, so guard. */
     Token saved_current;
     saved_current.type = p->current.type;
     saved_current.value = p->current.value ? strdup(p->current.value) : NULL;
@@ -328,36 +429,253 @@ static int parser_peek_is_generic_struct_literal(Parser* p) {
     saved_current.column = p->current.column;
 
     int result = 0;
+    int depth = 0;
+    /* Two-slot state machine:
+     *   ident_allowed: next IDENTIFIER is legal here
+     *   comma_allowed: next ',' is legal here
+     * '<' requires !ident_allowed (opens nesting), '>' requires
+     * !ident_allowed (closes one level), everything else aborts the
+     * probe. This accepts exactly TYPE-list token shapes such as
+     * `int`, `array<int>`, `pair<int,array<string>>, bool>`. */
+    int ident_allowed = 1;
+    int comma_allowed = 0;
+    int saw_any = 0;
+
     advance_p(p);  /* consume '<' */
-    int got_at_least_one = 0;
-    while (p->current.type == TOKEN_IDENTIFIER) {
-        advance_p(p);
-        got_at_least_one = 1;
-        if (p->current.type == TOKEN_COMMA) {
+    depth = 1;
+    while (p->current.type != TOKEN_EOF) {
+        if (p->current.type == TOKEN_IDENTIFIER && ident_allowed) {
+            ident_allowed = 0;
+            comma_allowed = 1;
+            saw_any = 1;
             advance_p(p);
-            /* Allow trailing comma? No — keep strict. If next is not
-             * IDENTIFIER, the loop will exit and we'll fail at the `>`
-             * check below. */
+        } else if (p->current.type == TOKEN_LT && !ident_allowed) {
+            depth++;
+            ident_allowed = 1;
+            comma_allowed = 0;
+            advance_p(p);
+        } else if (p->current.type == TOKEN_GT && !ident_allowed) {
+            advance_p(p);
+            depth--;
+            if (depth == 0) break;
+            /* Closed a NESTED level: an identifier may follow (next
+             * element of this level) and a comma may follow too. */
+            ident_allowed = 1;
+            comma_allowed = 1;
+        } else if (p->current.type == TOKEN_COMMA && comma_allowed) {
+            ident_allowed = 1;
+            comma_allowed = 0;
+            advance_p(p);
         } else {
-            break;
-        }
-    }
-    if (got_at_least_one && p->current.type == TOKEN_GT) {
-        advance_p(p);  /* consume '>' */
-        if (p->current.type == TOKEN_LBRACE) {
-            result = 1;
+            goto done_probe;
         }
     }
 
-    /* Restore state. Free the token we advanced to (it's about to be
-     * replaced by saved_current). */
+    if (depth == 0 && saw_any && p->current.type == follow) {
+        result = 1;
+    }
+
+done_probe:
+    /* Restore. Free whatever token we ended on, then reinstate the
+     * saved one and rewind the lexer. */
     token_free(p->current);
     p->current = saved_current;
     p->lexer->pos = saved_pos;
     p->lexer->line = saved_line;
     p->lexer->column = saved_column;
-
     return result;
+}
+
+/* PR 2: lookahead confirming `name<...>(` at a call site so explicit
+ * type arguments never swallow `x < y` comparisons. */
+static int parser_peek_is_generic_call(Parser* p) {
+    if (p->current.type != TOKEN_LT) return 0;
+    return probe_angle_type_list(p, TOKEN_LPAREN);
+}
+
+/* Shared argument-list parser for every call form (plain / member /
+ * statement). Consumes '(', the comma-separated expressions and ')'.
+ * Returns 1 on success (*out_args may legitimately be NULL when the
+ * list is empty — *out_count is then 0), 0 after emitting an error
+ * (caller should recover). */
+static int parse_paren_args(Parser* p, ASTNode*** out_args, int* out_count) {
+    ASTNode** args = NULL;
+    int arg_count = 0;
+
+    *out_args = NULL;
+    *out_count = 0;
+    if (p->current.type != TOKEN_LPAREN) {
+        parser_error(p, "expected '(' to start the argument list");
+        return 0;
+    }
+    advance_p(p);
+    while (p->current.type != TOKEN_RPAREN && p->current.type != TOKEN_EOF) {
+        ASTNode* arg = parse_expression(p);
+        if (!arg) {
+            free(args);
+            return 0;
+        }
+        {
+            ASTNode** resized = realloc(args, sizeof(ASTNode*) * (size_t)(arg_count + 1));
+            if (!resized) {
+                parser_error(p, "out of memory while growing argument list");
+                ast_free(arg);
+                free(args);
+                return 0;
+            }
+            args = resized;
+        }
+        args[arg_count++] = arg;
+        if (p->current.type == TOKEN_COMMA) advance_p(p);
+    }
+    expect_p(p, TOKEN_RPAREN, "missing ')' - did you forget to close the argument list?");
+    *out_args = args;
+    *out_count = arg_count;
+    return p->panic_mode == 0;
+}
+
+/* Committed consumption of a `<TYPE, TYPE, ...>` list using the real
+ * recursive parser. Caller has already confirmed/decided this IS an
+ * angle list (struct literal args, fn-call explicit args, impl echo).
+ * Returns malloc'd array of malloc'd strings; *out_count receives the
+ * count. On error emits and returns NULL (caller recovers). */
+static char** parse_angle_type_args_real(Parser* p, int* out_count) {
+    char** items = NULL;
+    int count = 0;
+
+    *out_count = 0;
+    if (p->current.type != TOKEN_LT) return NULL;
+    advance_p(p);  /* consume '<' */
+    while (p->current.type != TOKEN_EOF) {
+        char* t = parse_type_str(p);
+        if (!t) {
+            for (int i = 0; i < count; i++) free(items[i]);
+            free(items);
+            return NULL;
+        }
+        char** resized = realloc(items, sizeof(char*) * (size_t)(count + 1));
+        if (!resized) {
+            parser_error(p, "out of memory while growing type argument list");
+            free(t);
+            for (int i = 0; i < count; i++) free(items[i]);
+            free(items);
+            return NULL;
+        }
+        items = resized;
+        items[count++] = t;
+        if (p->current.type == TOKEN_COMMA) {
+            advance_p(p);
+            continue;
+        }
+        break;
+    }
+    if (p->current.type != TOKEN_GT) {
+        parser_error(p, "expected '>' to close the type argument list");
+        for (int i = 0; i < count; i++) free(items[i]);
+        free(items);
+        return NULL;
+    }
+    advance_p(p);  /* consume '>' */
+    *out_count = count;
+    return items;
+}
+
+/* PR 6 constraint catalogue note: type parameter lists now accept an
+ * optional constraint per parameter — `T`, `T: Ord`. Grammar:
+ *     PARAMS := '<' IDENT [':' IDENT] (',' IDENT [':' IDENT])* '>'
+ * Constraint names are validated in the semantic pass against the
+ * catalogue (Ord/Eq/Hash/Show/Num/Any) where better errors live.
+ * Assumes the current token IS '<'. Returns 1 on success (arrays are
+ * malloc'd, each entry strdup'd, constraints may be NULL), 0 after
+ * emitting an error. */
+static int parse_type_param_list(Parser* p, char*** out_names, char*** out_cons, int* out_count) {
+    char** names = NULL;
+    char** cons = NULL;
+    int count = 0;
+
+    *out_names = NULL;
+    *out_cons = NULL;
+    *out_count = 0;
+    if (p->current.type != TOKEN_LT) return 1;  /* absent: trivially ok */
+
+    advance_p(p);  /* consume '<' */
+    while (p->current.type != TOKEN_EOF) {
+        if (p->current.type != TOKEN_IDENTIFIER) {
+            parser_error(p, "expected type parameter name after '<'");
+            goto fail;
+        }
+        char** rn = realloc(names, sizeof(char*) * (size_t)(count + 1));
+        if (!rn) { parser_error(p, "out of memory while growing type parameter list"); goto fail; }
+        names = rn;
+        names[count] = strdup(p->current.value);
+        {
+            char** rc = realloc(cons, sizeof(char*) * (size_t)(count + 1));
+            if (!rc) { parser_error(p, "out of memory while growing type parameter list"); goto fail; }
+            cons = rc;
+            cons[count] = NULL;
+        }
+        advance_p(p);
+        /* Optional `: ConstraintName`. */
+        if (p->current.type == TOKEN_COLON) {
+            advance_p(p);
+            if (p->current.type != TOKEN_IDENTIFIER) {
+                parser_error(p, "expected constraint name after ':' in type parameter");
+                goto fail;
+            }
+            cons[count] = strdup(p->current.value);
+            advance_p(p);
+        }
+        count++;
+        if (p->current.type == TOKEN_COMMA) {
+            advance_p(p);
+            continue;
+        }
+        break;
+    }
+    if (p->current.type != TOKEN_GT) {
+        parser_error(p, "expected '>' to close the type parameter list");
+        goto fail;
+    }
+    advance_p(p);  /* consume '>' */
+    *out_names = names;
+    *out_cons = cons;
+    *out_count = count;
+    return 1;
+
+fail:
+    for (int i = 0; i < count; i++) { free(names ? names[i] : NULL); free(cons ? cons[i] : NULL); }
+    free(names);
+    free(cons);
+    return 0;
+}
+
+/* Friendlier hints when a RESERVED WORD appears where an identifier is
+ * expected (Phase 3 semantic validation item: names vs reserved words —
+ * the grammar already rejects them; this just explains WHY). Keywords
+ * keep their lexeme in token value, so we can quote it. */
+static void parser_reserved_word_hint(char* buf, size_t buf_size, Parser* p) {
+    buf[0] = '\0';
+    if (p->current.type == TOKEN_IDENTIFIER || p->current.type == TOKEN_EOF) {
+        return;
+    }
+    if (p->current.value && p->current.value[0] &&
+        (strncmp(p->current.value, "TOKEN_", 6) != 0)) {
+        snprintf(buf, buf_size,
+                 "'%s' is a reserved word in Lamo and cannot be used as a name",
+                 p->current.value);
+    }
+}
+
+/* Generics PR 1: lookahead helper — REWRITTEN in Generics PR 2 to share
+ * the speculative scanner (probe_angle_type_list) that also powers
+ * explicit call-site type arguments. The acceptance rule is unchanged:
+ * `Foo<...> {` is a generic struct literal; anything else is a
+ * comparison and the caller falls through to a plain identifier.
+ *
+ * Does NOT consume any tokens. */
+static int parser_peek_is_generic_struct_literal(Parser* p) {
+    if (p->current.type != TOKEN_LT) return 0;
+    return probe_angle_type_list(p, TOKEN_LBRACE);
 }
 
 static ASTNode* parse_primary(Parser* p) {
@@ -400,53 +718,23 @@ static ASTNode* parse_primary(Parser* p) {
         int column = p->current.column;
         advance_p(p);
 
-        /* Generics PR 1: optional type argument list for struct literals,
-         * parsed when lookahead confirms `Foo<int, string> { ... }`. The
-         * lookahead is necessary because `Foo < bar` is also valid (a
-         * comparison expression). The arrays are heap-allocated only if we
-         * actually parse type args; otherwise they stay NULL/0 and the
-         * existing struct-literal / identifier / call branches proceed
-         * unchanged.
+        /* Generics PR 1 (rewritten in PR 2): optional type argument list
+         * for struct literals, parsed when lookahead confirms
+         * `Foo<...> {`. The lookahead is necessary because `Foo < bar`
+         * is also valid (a comparison expression). Full NESTED type
+         * arguments are now accepted — `Foo<array<int>> { ... }` — via
+         * the shared committed angle-list parser.
          *
          * We also check !p->no_struct_literal so match-scrutinee parsing
-         * (which sets that flag to prevent `match c { ... }` from being
-         * misparsed as `match (c { ... })`) doesn't get confused by
-         * `match c < X > { ... }` — that's `match (c < X) > { ... }`,
-         * i.e. a comparison scrutinee, NOT a generic struct literal. */
+         * doesn't get confused by comparison scrutinees. */
         char** type_args = NULL;
         int type_arg_count = 0;
         if (p->current.type == TOKEN_LT && !p->no_struct_literal && parser_peek_is_generic_struct_literal(p)) {
-            advance_p(p);  /* consume '<' (confirmed by lookahead) */
-            while (p->current.type != TOKEN_GT && p->current.type != TOKEN_EOF) {
-                if (p->current.type != TOKEN_IDENTIFIER) {
-                    parser_error(p, "expected type argument name after '<' in struct literal");
-                    for (int i = 0; i < type_arg_count; i++) free(type_args[i]);
-                    free(type_args); free(name);
-                    return parser_recover(p);
-                }
-                char* ta = strdup(p->current.value);
-                eat_p(p, TOKEN_IDENTIFIER);
-                {
-                    char** resized = realloc(type_args, sizeof(char*) * (size_t)(type_arg_count + 1));
-                    if (!resized) {
-                        parser_error(p, "out of memory while growing struct literal type argument list");
-                        free(ta);
-                        for (int i = 0; i < type_arg_count; i++) free(type_args[i]);
-                        free(type_args); free(name);
-                        return parser_recover(p);
-                    }
-                    type_args = resized;
-                }
-                type_args[type_arg_count++] = ta;
-                if (p->current.type == TOKEN_COMMA) advance_p(p);
-            }
-            if (p->current.type != TOKEN_GT) {
-                parser_error(p, "expected '>' to close struct literal type argument list");
-                for (int i = 0; i < type_arg_count; i++) free(type_args[i]);
-                free(type_args); free(name);
+            type_args = parse_angle_type_args_real(p, &type_arg_count);
+            if (!type_args) {
+                free(name);
                 return parser_recover(p);
             }
-            advance_p(p);  /* consume '>' */
             /* After '>', the next token MUST be '{' — the lookahead already
              * confirmed this. If it isn't, something is wrong; emit an error. */
             if (p->current.type != TOKEN_LBRACE) {
@@ -479,34 +767,18 @@ static ASTNode* parse_primary(Parser* p) {
              * existing `.len` and future `.prop` forms keep working. The
              * conversion is done by building the prop_expr here and letting
              * parse_postfix continue wrapping if there are more dots. */
-            if (p->current.type == TOKEN_LPAREN) {
-                eat_p(p, TOKEN_LPAREN);
-                ASTNode** args = NULL;
-                int arg_count = 0;
-                while (p->current.type != TOKEN_RPAREN && p->current.type != TOKEN_EOF) {
-                    ASTNode* arg = parse_expression(p);
-                    if (arg) {
-                        ASTNode** resized = realloc(args, sizeof(ASTNode*) * (size_t)(arg_count + 1));
-                        if (!resized) {
-                            parser_error(p, "out of memory while growing argument list");
-                            ast_free(arg);
-                            free(args);
-                            free(name);
-                            free(member_name);
-                            return parser_recover(p);
-                        }
-                        args = resized;
-                        args[arg_count++] = arg;
-                    }
-                    if (p->current.type == TOKEN_COMMA) advance_p(p);
-                }
-                eat_p(p, TOKEN_RPAREN);
-                ASTNode* obj = (ASTNode*)ast_new_identifier(name, obj_line, obj_column);
-                ASTNode* node = (ASTNode*)ast_new_member_call(obj, member_name, args, arg_count, line, column);
-                free(name);
-                free(member_name);
-                return node;
-            } else {
+        if (p->current.type == TOKEN_LPAREN) {
+            int arg_count = 0;
+            ASTNode** args = NULL;
+            if (!parse_paren_args(p, &args, &arg_count)) {
+                free(name); free(member_name); return parser_recover(p);
+            }
+            ASTNode* obj = (ASTNode*)ast_new_identifier(name, obj_line, obj_column);
+            ASTNode* node = (ASTNode*)ast_new_member_call(obj, member_name, args, arg_count, line, column);
+            free(name);
+            free(member_name);
+            return node;
+        } else {
                 /* `module.member` without a call — build a prop_expr so
                  * parse_postfix can keep wrapping further `.x.y.z` chains.
                  * The semantic pass resolves whether `object` is a module
@@ -520,27 +792,35 @@ static ASTNode* parse_primary(Parser* p) {
         }
 
         if (p->current.type == TOKEN_LPAREN) {
-            eat_p(p, TOKEN_LPAREN);
-            ASTNode** args = NULL;
             int arg_count = 0;
-            while (p->current.type != TOKEN_RPAREN && p->current.type != TOKEN_EOF) {
-                ASTNode* arg = parse_expression(p);
-                if (arg) {
-                    ASTNode** resized = realloc(args, sizeof(ASTNode*) * (size_t)(arg_count + 1));
-                    if (!resized) {
-                        parser_error(p, "out of memory while growing argument list");
-                        ast_free(arg);
-                        free(args);
-                        free(name);
-                        return parser_recover(p);
-                    }
-                    args = resized;
-                    args[arg_count++] = arg;
-                }
-                if (p->current.type == TOKEN_COMMA) advance_p(p);
-            }
-            eat_p(p, TOKEN_RPAREN);
+            ASTNode** args = NULL;
+            if (!parse_paren_args(p, &args, &arg_count)) { free(name); return parser_recover(p); }
             ASTNode* node = (ASTNode*)ast_new_call_expr(name, args, arg_count, line, column);
+            free(name);
+            return node;
+        }
+
+        /* Generics PR 2: explicit type arguments at a call site —
+         * `f<int>(5)` or `map<int, string>(xs, f)`. Only taken when the
+         * speculative scanner confirms the full `< ... > (` shape, so
+         * ordinary comparisons like `x < y` can never misparse here
+         * (same disambiguation strategy as PR 1's struct literals).
+         * Turbofish (`f::<int>`) is deliberately not supported — RFC §4.5. */
+        if (p->current.type == TOKEN_LT && parser_peek_is_generic_call(p)) {
+            int ta_count = 0;
+            char** tas = parse_angle_type_args_real(p, &ta_count);
+            if (!tas) { free(name); return parser_recover(p); }
+            int arg_count = 0;
+            ASTNode** args = NULL;
+            if (!parse_paren_args(p, &args, &arg_count)) {
+                for (int i = 0; i < ta_count; i++) free(tas[i]);
+                free(tas); free(name);
+                return parser_recover(p);
+            }
+            ASTNode* node = (ASTNode*)ast_new_call_expr_typed(name, tas, ta_count,
+                                                              args, arg_count, line, column);
+            for (int i = 0; i < ta_count; i++) free(tas[i]);
+            free(tas);
             free(name);
             return node;
         } else if (p->current.type == TOKEN_LBRACE && !p->no_struct_literal) {
@@ -811,7 +1091,11 @@ ASTNode* parse_statement(Parser* p) {
     if (p->current.type == TOKEN_LET) {
         eat_p(p, TOKEN_LET);
         if (p->current.type != TOKEN_IDENTIFIER) {
-            parser_error(p, "expected identifier after let");
+            /* Reserved-word friendliness: `let fn = ...` explains itself. */
+            char rw_hint[160];
+            parser_reserved_word_hint(rw_hint, sizeof(rw_hint), p);
+            parser_error_with_hint(p, "expected identifier after let",
+                                   rw_hint[0] ? rw_hint : NULL);
             return parser_recover(p);
         }
         char* name = strdup(p->current.value);
@@ -819,18 +1103,18 @@ ASTNode* parse_statement(Parser* p) {
         int column = p->current.column;
         eat_p(p, TOKEN_IDENTIFIER);
         /* Sprint 3: optional type annotation `: int | float | string | bool`.
-         * We accept any identifier here — the semantic pass will reject
-         * unknown type names with a clearer message than the parser could. */
+         * Generics PR 2/3: annotations are now FULL types via the shared
+         * recursive parser (TYPE := IDENT [ '<' TYPE,... '>' ]), so
+         * `let xs: array<int> = ...` and `let p: Pair<int, string> = ...`
+         * parse here and are validated semantically downstream. */
         char* type_annotation = NULL;
         if (p->current.type == TOKEN_COLON) {
             eat_p(p, TOKEN_COLON);
-            if (p->current.type != TOKEN_IDENTIFIER) {
-                parser_error(p, "expected type name after ':' in let declaration");
+            type_annotation = parse_type_str(p);
+            if (!type_annotation) {
                 free(name);
                 return parser_recover(p);
             }
-            type_annotation = strdup(p->current.value);
-            eat_p(p, TOKEN_IDENTIFIER);
         }
         eat_p(p, TOKEN_EQUALS);
         /* Sprint 1 fix: explicit "missing initializer" error for `let x = ;`.
@@ -858,13 +1142,33 @@ ASTNode* parse_statement(Parser* p) {
     else if (p->current.type == TOKEN_FN) {
         eat_p(p, TOKEN_FN);
         if (p->current.type != TOKEN_IDENTIFIER) {
-            parser_error(p, "expected function name after fn");
+            char rw_hint[160];
+            parser_reserved_word_hint(rw_hint, sizeof(rw_hint), p);
+            parser_error_with_hint(p, "expected function name after fn",
+                                   rw_hint[0] ? rw_hint : NULL);
             return parser_recover(p);
         }
         char* name = strdup(p->current.value);
         int line = p->current.line;
         int column = p->current.column;
         eat_p(p, TOKEN_IDENTIFIER);
+
+        /* Generics PR 2: optional type parameter list `fn id<T, U>(...)`.
+         * Unambiguous at this position: after a function name the only
+         * legal continuation is '(' (params), so '<' can ONLY start the
+         * generic parameter list — no speculative scanning needed.
+         * PR 6: each parameter optionally carries a constraint (`T: Ord`). */
+        char** fn_type_params = NULL;
+        char** fn_type_constraints = NULL;
+        int fn_type_param_count = 0;
+        if (p->current.type == TOKEN_LT) {
+            if (!parse_type_param_list(p, &fn_type_params, &fn_type_constraints,
+                                       &fn_type_param_count)) {
+                free(name);
+                return parser_recover(p);
+            }
+        }
+
         expect_p(p, TOKEN_LPAREN, "expected '(' after function name");
 
         char** params = NULL;
@@ -874,7 +1178,10 @@ ASTNode* parse_statement(Parser* p) {
 
         while (p->current.type != TOKEN_RPAREN && p->current.type != TOKEN_EOF) {
             if (p->current.type != TOKEN_IDENTIFIER) {
-                parser_error(p, "expected parameter name");
+                char rw_hint[160];
+                parser_reserved_word_hint(rw_hint, sizeof(rw_hint), p);
+                parser_error_with_hint(p, "expected parameter name",
+                                       rw_hint[0] ? rw_hint : NULL);
                 break;
             }
             char** resized = realloc(params, sizeof(char*) * (size_t)(param_count + 1));
@@ -924,17 +1231,19 @@ ASTNode* parse_statement(Parser* p) {
                     param_types[param_count] = NULL;
                 }
                 eat_p(p, TOKEN_COLON);
-                if (p->current.type != TOKEN_IDENTIFIER) {
-                    parser_error(p, "expected type name after ':' in parameter list");
+                /* Generics PR 2/3: full type annotations, including type
+                 * parameters (`x: T`) and nested generics (`xs: array<T>`). */
+                param_types[param_count] = parse_type_str(p);
+                if (!param_types[param_count]) {
                     for (int i = 0; i <= param_count; i++) free(params[i]);
                     free(params);
                     for (int i = 0; i < param_count; i++) free(param_types[i]);
                     free(param_types);
+                    for (int i = 0; i < fn_type_param_count; i++) { free(fn_type_params[i]); free(fn_type_constraints[i]); }
+                    free(fn_type_params); free(fn_type_constraints);
                     free(name);
                     return parser_recover(p);
                 }
-                param_types[param_count] = strdup(p->current.value);
-                eat_p(p, TOKEN_IDENTIFIER);
                 has_any_type_annotation = 1;
             } else if (param_types) {
                 /* Need to grow param_types even when this param has no
@@ -955,20 +1264,34 @@ ASTNode* parse_statement(Parser* p) {
         char* return_type_annotation = NULL;
         if (p->current.type == TOKEN_ARROW) {
             eat_p(p, TOKEN_ARROW);
-            if (p->current.type != TOKEN_IDENTIFIER) {
-                parser_error(p, "expected type name after '->' in function signature");
+            /* Generics PR 2: full return-type annotation (`-> T`,
+             * `-> array<U>`, `-> Option<int>`). `void` allowed; validated
+             * semantically. */
+            return_type_annotation = parse_type_str(p);
+            if (!return_type_annotation) {
+                for (int i = 0; i < param_count; i++) free(params[i]);
+                free(params);
+                if (param_types) {
+                    for (int i = 0; i < param_count; i++) free(param_types[i]);
+                    free(param_types);
+                }
+                for (int i = 0; i < fn_type_param_count; i++) { free(fn_type_params[i]); free(fn_type_constraints[i]); }
+                free(fn_type_params); free(fn_type_constraints);
                 free(name);
                 return parser_recover(p);
             }
-            return_type_annotation = strdup(p->current.value);
-            eat_p(p, TOKEN_IDENTIFIER);
             (void)has_any_type_annotation;
         }
 
         ASTNode* body = parse_block(p);
-        ASTNode* node = (ASTNode*)ast_new_fn_decl_typed(name, params, param_types, param_count, return_type_annotation, body, line, column);
+        ASTNode* node = (ASTNode*)ast_new_fn_decl_generic(name,
+                                                          fn_type_params, fn_type_constraints, fn_type_param_count,
+                                                          params, param_types, param_count,
+                                                          return_type_annotation, body, line, column);
         free(name);
         free(return_type_annotation);
+        free(fn_type_params);
+        free(fn_type_constraints);
         return node;
     }
     else if (p->current.type == TOKEN_IMPORT) {
@@ -1065,45 +1388,22 @@ ASTNode* parse_statement(Parser* p) {
         }
         char* name = strdup(p->current.value);
         eat_p(p, TOKEN_IDENTIFIER);
-        /* Generics PR 1: optional type parameter list `<T, K, V>`. We
-         * distinguish this from the comparison operator `<` by context:
-         * after a struct name, the only valid follow tokens are `{`
-         * (start of body) or `<` (start of type params). A `<` here
-         * cannot be a comparison because there's no left-hand expression. */
+        /* Generics PR 1 (rewritten PR 6): optional type parameter list
+         * `<T, K: Ord, V>`. We distinguish this from the comparison
+         * operator `<` by context: after a struct name, the only valid
+         * follow tokens are `{` (start of body) or `<` (start of type
+         * params). A `<` here cannot be a comparison because there's no
+         * left-hand expression. Constraints (`: Ord`) are parsed here
+         * and validated semantically against the catalogue. */
         char** type_params = NULL;
+        char** struct_param_constraints = NULL;
         int type_param_count = 0;
         if (p->current.type == TOKEN_LT) {
-            advance_p(p);  /* consume '<' */
-            while (p->current.type != TOKEN_GT && p->current.type != TOKEN_EOF) {
-                if (p->current.type != TOKEN_IDENTIFIER) {
-                    parser_error(p, "expected type parameter name after '<' in struct declaration");
-                    for (int i = 0; i < type_param_count; i++) free(type_params[i]);
-                    free(type_params); free(name);
-                    return parser_recover(p);
-                }
-                char* tp = strdup(p->current.value);
-                eat_p(p, TOKEN_IDENTIFIER);
-                {
-                    char** resized = realloc(type_params, sizeof(char*) * (size_t)(type_param_count + 1));
-                    if (!resized) {
-                        parser_error(p, "out of memory while growing struct type parameter list");
-                        free(tp);
-                        for (int i = 0; i < type_param_count; i++) free(type_params[i]);
-                        free(type_params); free(name);
-                        return parser_recover(p);
-                    }
-                    type_params = resized;
-                }
-                type_params[type_param_count++] = tp;
-                if (p->current.type == TOKEN_COMMA) advance_p(p);
-            }
-            if (p->current.type != TOKEN_GT) {
-                parser_error(p, "expected '>' to close struct type parameter list");
-                for (int i = 0; i < type_param_count; i++) free(type_params[i]);
-                free(type_params); free(name);
+            if (!parse_type_param_list(p, &type_params, &struct_param_constraints,
+                                       &type_param_count)) {
+                free(name);
                 return parser_recover(p);
             }
-            advance_p(p);  /* consume '>' */
         }
         expect_p(p, TOKEN_LBRACE, "expected '{' to open struct body");
         char** field_names = NULL;
@@ -1119,15 +1419,17 @@ ASTNode* parse_statement(Parser* p) {
             char* fname = strdup(p->current.value);
             eat_p(p, TOKEN_IDENTIFIER);
             expect_p(p, TOKEN_COLON, "expected ':' after field name in struct");
-            if (p->current.type != TOKEN_IDENTIFIER) {
-                parser_error(p, "expected type name after ':' in struct field");
+            /* Generics PR 2/3: full field-type annotation. Commas INSIDE
+             * '<...>' belong to the type and are consumed by the
+             * parse_type_str recursion; only commas at bracket depth 0
+             * reach the field-separator handling below. */
+            char* ftype = parse_type_str(p);
+            if (!ftype) {
                 free(fname); free(name);
                 for (int i = 0; i < field_count; i++) { free(field_names[i]); free(field_types[i]); }
                 free(field_names); free(field_types);
                 return parser_recover(p);
             }
-            char* ftype = strdup(p->current.value);
-            eat_p(p, TOKEN_IDENTIFIER);
             /* Grow both arrays. Realloc one at a time and assign back
              * immediately to avoid -Wuse-after-free. */
             {
@@ -1165,23 +1467,61 @@ ASTNode* parse_statement(Parser* p) {
         /* Optional trailing semicolon (struct decls usually don't have one,
          * but we allow it for symmetry with other declarations). */
         if (p->current.type == TOKEN_SEMICOLON) advance_p(p);
-        ASTNode* node = (ASTNode*)ast_new_struct_decl(name, field_names, field_types, field_count, type_params, type_param_count, line, column);
+        ASTNode* node = (ASTNode*)ast_new_struct_decl(name, field_names, field_types, field_count,
+                                                      type_params, struct_param_constraints,
+                                                      type_param_count, line, column);
         for (int i = 0; i < field_count; i++) { free(field_names[i]); free(field_types[i]); }
         free(field_names); free(field_types);
-        for (int i = 0; i < type_param_count; i++) free(type_params[i]);
-        free(type_params); free(name);
+        for (int i = 0; i < type_param_count; i++) { free(type_params[i]); free(struct_param_constraints[i]); }
+        free(type_params); free(struct_param_constraints);
+        free(name);
         return node;
     }
     else if (p->current.type == TOKEN_IMPL) {
         int line = p->current.line;
         int column = p->current.column;
         eat_p(p, TOKEN_IMPL);
+
+        /* RFC §4.4: optional type parameter list directly after the
+         * `impl` keyword — `impl<T> Stack<T> { ... }`. Context makes the
+         * '<' unambiguous (an identifier is required next either way). */
+        char** impl_type_params = NULL;
+        char** impl_param_constraints = NULL;
+        int impl_type_param_count = 0;
+        if (p->current.type == TOKEN_LT) {
+            if (!parse_type_param_list(p, &impl_type_params, &impl_param_constraints,
+                                       &impl_type_param_count)) {
+                return parser_recover(p);
+            }
+        }
+
         if (p->current.type != TOKEN_IDENTIFIER) {
             parser_error(p, "expected struct name after 'impl'");
+            for (int i = 0; i < impl_type_param_count; i++) { free(impl_type_params[i]); free(impl_param_constraints[i]); }
+            free(impl_type_params); free(impl_param_constraints);
             return parser_recover(p);
         }
         char* struct_name = strdup(p->current.value);
         eat_p(p, TOKEN_IDENTIFIER);
+
+        /* RFC §4.4: optional echo of the type parameters on the struct
+         * name — `Stack<T>`. Unambiguous in this position: an impl body
+         * must open with '{', so '<' can ONLY start the echo list (same
+         * contextual argument as the struct/impl declaration sites).
+         * Must reference exactly the declared parameter names, validated
+         * semantically with better messages. */
+        char** impl_type_args = NULL;
+        int impl_type_arg_count = 0;
+        if (p->current.type == TOKEN_LT) {
+            impl_type_args = parse_angle_type_args_real(p, &impl_type_arg_count);
+            if (!impl_type_args) {
+                for (int i = 0; i < impl_type_param_count; i++) { free(impl_type_params[i]); free(impl_param_constraints[i]); }
+                free(impl_type_params); free(impl_param_constraints);
+                free(struct_name);
+                return parser_recover(p);
+            }
+        }
+
         expect_p(p, TOKEN_LBRACE, "expected '{' to open impl body");
         /* Parse a sequence of `fn ...` declarations as the methods. */
         ASTNode* head = NULL;
@@ -1208,7 +1548,14 @@ ASTNode* parse_statement(Parser* p) {
         }
         expect_p(p, TOKEN_RBRACE, "missing '}' at end of impl body");
         if (p->current.type == TOKEN_SEMICOLON) advance_p(p);
-        ASTNode* node = (ASTNode*)ast_new_impl_decl(struct_name, head, line, column);
+        ASTNode* node = (ASTNode*)ast_new_impl_decl_generic(struct_name,
+                                                            impl_type_params, impl_type_param_count,
+                                                            impl_type_args, impl_type_arg_count,
+                                                            head, line, column);
+        for (int i = 0; i < impl_type_param_count; i++) { free(impl_type_params[i]); free(impl_param_constraints[i]); }
+        free(impl_type_params); free(impl_param_constraints);
+        for (int i = 0; i < impl_type_arg_count; i++) free(impl_type_args[i]);
+        free(impl_type_args);
         free(struct_name);
         return node;
     }
@@ -1377,29 +1724,66 @@ ASTNode* parse_statement(Parser* p) {
             }
             char* member_name = strdup(p->current.value);
             eat_p(p, TOKEN_IDENTIFIER);
+
+            /* Chained member statements — `self.items.push(x);`.
+             * Previously only ONE `.member` segment was recognized here,
+             * so method calls on a field (the bread and butter of generic
+             * structs, RFC §13.1) failed to parse. Grammar for the chain:
+             *   IDENT (.IDENT)* [( args )]      — final '(' = call.
+             * Intermediate segments become AST_PROP_EXPR links; the last
+             * segment becomes an AST_MEMBER_CALL whose object is the
+             * accumulated chain (same shape as expression-position
+             * postfix parsing produces). */
+            if (p->current.type == TOKEN_DOT) {
+                ASTNode* chain;
+                {
+                    ASTNode* obj = (ASTNode*)ast_new_identifier(name, obj_line, obj_column);
+                    chain = (ASTNode*)ast_new_prop_expr(obj, member_name, line, column);
+                }
+                free(member_name);
+                free(name);
+                name = NULL; member_name = NULL;
+                while (1) {
+                    if (p->current.type != TOKEN_DOT) {
+                        parser_error(p, "expected '.' in chained statement");
+                        ast_free(chain);
+                        return parser_recover(p);
+                    }
+                    advance_p(p);
+                    if (p->current.type != TOKEN_IDENTIFIER) {
+                        parser_error(p, "expected member name after '.' in chained statement");
+                        ast_free(chain);
+                        return parser_recover(p);
+                    }
+                    char* seg = strdup(p->current.value);
+                    int seg_line = p->current.line;
+                    int seg_column = p->current.column;
+                    advance_p(p);
+                    if (p->current.type == TOKEN_LPAREN) {
+                        int arg_count = 0;
+                        ASTNode** args = NULL;
+                        if (!parse_paren_args(p, &args, &arg_count)) {
+                            free(seg); ast_free(chain); return parser_recover(p);
+                        }
+                        optional_semicolon(p);
+                        ASTNode* node = (ASTNode*)ast_new_member_call(chain, seg,
+                                                                      args, arg_count,
+                                                                      seg_line, seg_column);
+                        free(seg);
+                        return node;
+                    }
+                    chain = (ASTNode*)ast_new_prop_expr(chain, seg, seg_line, seg_column);
+                    free(seg);
+                }
+            }
+
             if (p->current.type == TOKEN_LPAREN) {
                 /* Method call: `obj.method(args);` */
-                eat_p(p, TOKEN_LPAREN);
-                ASTNode** args = NULL;
                 int arg_count = 0;
-                while (p->current.type != TOKEN_RPAREN && p->current.type != TOKEN_EOF) {
-                    ASTNode* arg = parse_expression(p);
-                    if (arg) {
-                        ASTNode** resized = realloc(args, sizeof(ASTNode*) * (size_t)(arg_count + 1));
-                        if (!resized) {
-                            parser_error(p, "out of memory while growing argument list");
-                            ast_free(arg);
-                            free(args);
-                            free(name);
-                            free(member_name);
-                            return parser_recover(p);
-                        }
-                        args = resized;
-                        args[arg_count++] = arg;
-                    }
-                    if (p->current.type == TOKEN_COMMA) advance_p(p);
+                ASTNode** args = NULL;
+                if (!parse_paren_args(p, &args, &arg_count)) {
+                    free(name); free(member_name); return parser_recover(p);
                 }
-                expect_p(p, TOKEN_RPAREN, "missing ')' — did you forget to close the argument list?");
                 optional_semicolon(p);  /* Phase 2: `;` optional */
                 ASTNode* obj = (ASTNode*)ast_new_identifier(name, obj_line, obj_column);
                 ASTNode* node = (ASTNode*)ast_new_member_call(obj, member_name, args, arg_count, line, column);
@@ -1461,28 +1845,34 @@ ASTNode* parse_statement(Parser* p) {
         }
 
         if (p->current.type == TOKEN_LPAREN) {
-            eat_p(p, TOKEN_LPAREN);
-            ASTNode** args = NULL;
             int arg_count = 0;
-            while (p->current.type != TOKEN_RPAREN && p->current.type != TOKEN_EOF) {
-                ASTNode* arg = parse_expression(p);
-                if (arg) {
-                    ASTNode** resized = realloc(args, sizeof(ASTNode*) * (size_t)(arg_count + 1));
-                    if (!resized) {
-                        parser_error(p, "out of memory while growing argument list");
-                        ast_free(arg);
-                        free(args);
-                        free(name);
-                        return parser_recover(p);
-                    }
-                    args = resized;
-                    args[arg_count++] = arg;
-                }
-                if (p->current.type == TOKEN_COMMA) advance_p(p);
-            }
-            expect_p(p, TOKEN_RPAREN, "missing ')' — did you forget to close the argument list?");
+            ASTNode** args = NULL;
+            if (!parse_paren_args(p, &args, &arg_count)) { free(name); return parser_recover(p); }
             optional_semicolon(p);  /* Phase 2: `;` optional */
             ASTNode* node = (ASTNode*)ast_new_call_stmt(name, args, arg_count, line, column);
+            free(name);
+            return node;
+        }
+
+        /* Generics PR 2: statement-position explicit type arguments —
+         * `swap<int, int>(a, b);`. Same speculative-gate strategy as the
+         * expression form above. */
+        if (p->current.type == TOKEN_LT && parser_peek_is_generic_call(p)) {
+            int ta_count = 0;
+            char** tas = parse_angle_type_args_real(p, &ta_count);
+            if (!tas) { free(name); return parser_recover(p); }
+            int arg_count = 0;
+            ASTNode** args = NULL;
+            if (!parse_paren_args(p, &args, &arg_count)) {
+                for (int i = 0; i < ta_count; i++) free(tas[i]);
+                free(tas); free(name);
+                return parser_recover(p);
+            }
+            optional_semicolon(p);
+            ASTNode* node = (ASTNode*)ast_new_call_stmt_typed(name, tas, ta_count,
+                                                              args, arg_count, line, column);
+            for (int i = 0; i < ta_count; i++) free(tas[i]);
+            free(tas);
             free(name);
             return node;
         }

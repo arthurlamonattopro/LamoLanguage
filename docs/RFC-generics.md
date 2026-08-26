@@ -1,6 +1,10 @@
 # RFC: Generics for Lamo
 
-**Status:** PR 1 shipped (2.4.0). PRs 2–6 in design / pending. Tracked in `todo.md` Phase 7.
+**Status:** PRs 1–6 SHIPPED (2.5.0). PR 5 shipped the Option/Result API via
+typed signatures over erased arrays (struct payloads cannot yet cross module
+boundaries and tagged-union enums remain a separate RFC — see §10 and
+std/collections.lamo header notes). Constraints ship with the §6 initial
+catalogue (builtins only; structs satisfy `Any`). Tracked in `todo.md` Phase 7.
 **Depends on:** Type-system decision (`docs/TYPE-SYSTEM.md`) — shipped.
 **Author:** Lamo engineering.
 **Discussion:** open a GitHub issue with the `generics` label.
@@ -373,10 +377,14 @@ Suggested rollout order:
 3. **PR 3: `Array<T>` typed-array syntax + deprecation warning for bare
    `array`.**
 4. **PR 4: `Map<K, V>`, `Set<T>` in stdlib with typed signatures.**
-5. **PR 5 (depends on tagged-enum RFC): `Option<T>`, `Result<T, E>`.**
-6. **PR 6: Constraint syntax (`: Ord`, `: Eq`, etc.).** Optional — the
-   initial collections work without constraints, since the operations are
-   just dispatching to existing operator overloads.
+5. **PR 5 (SHIPPED, adjusted scope): `Option<T>`/`Result<T,E>` APIs live in**
+   **`std.collections`** as type-checked factories/accessors over erased
+   arrays; generic STRUCT definitions of Option/Result also parse & check,
+   but struct payloads crossing module boundaries await the module-type-flow
+   fix, and match-payload syntax waits on the tagged-union enum RFC.
+6. **PR 6 (SHIPPED): constraint syntax `T: Ord`.** Catalogue per §6;
+   unknown constraint names are errors; satisfaction checked at call sites
+   against concrete bindings.
 
 Each PR is independently shippable and testable.
 

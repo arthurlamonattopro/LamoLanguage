@@ -89,6 +89,14 @@ typedef struct ASTNode {
      * Used to resolve field access (AST_PROP_EXPR), method calls
      * (AST_MEMBER_CALL on a struct value), and struct literals. */
     const char* sema_struct_name;
+    /* Generics PR 2: optional NORMALIZED full type annotation populated by
+     * the semantic pass and consumed by codegen/backend alignment work.
+     * Examples: "int", "array<int>", "pair<int,string>". Borrowed pointer
+     * into the semantic intern table — NOT owned, NOT freed by ast_free,
+     * valid until process exit (the compiler is short-lived). NULL when
+     * unknown/uneeded. Unlike sema_struct_name this can carry ANY type
+     * including nested generics; see semantic.c::lamo_intern_type(). */
+    const char* sema_full_type;
 } ASTNode;
 
 typedef struct {
@@ -117,6 +125,14 @@ typedef struct {
     /* Sprint 3: optional return-type annotation (e.g. `fn f() -> int`).
      * NULL when no annotation was given. */
     char* return_type_annotation;
+    /* Generics PR 2: optional type parameter list `fn id<T>(x: T) -> T`.
+     * type_params[i] / param_constraints[i] are strdup'd owned strings
+     * (constraints may be NULL). When type_param_count == 0 the function
+     * is non-generic (the legacy case). The strings are freed in
+     * ast_free(). */
+    char** type_params;
+    char** type_param_constraints;
+    int type_param_count;
     struct ASTNode* body;
 } ASTFnDecl;
 
@@ -161,6 +177,10 @@ typedef struct {
 typedef struct {
     ASTNode base;
     char* name;
+    /* Generics PR 2: same explicit-type-argument support as ASTCallExpr,
+     * for statement-position calls like `swap<int, int>(a, b);`. */
+    char** type_args;
+    int type_arg_count;
     struct ASTNode** args;
     int arg_count;
 } ASTCallStmt;
@@ -206,6 +226,13 @@ typedef struct {
 typedef struct {
     ASTNode base;
     char* name;
+    /* Generics PR 2 / RFC §4.5: optional explicit type arguments at the
+     * call site — `f<int>(5)` or `map<int, string>(xs, f)`. Strings are
+     * strdup'd and freed in ast_free(). type_arg_count == 0 for the
+     * common inferred case. Filled by the parser only when lookahead
+     * confirms `< ... > (` so `a < b` comparisons never misparse. */
+    char** type_args;
+    int type_arg_count;
     struct ASTNode** args;
     int arg_count;
 } ASTCallExpr;
@@ -285,6 +312,10 @@ typedef struct {
     char** field_types;
     int field_count;
     char** type_params;
+    /* PR 6: optional per-parameter constraint names ("Ord", "Eq", ...
+     * or NULL when unconstrained). Aligned 1:1 with type_params; both
+     * arrays are owned and freed in ast_free(). */
+    char** type_param_constraints;
     int type_param_count;
 } ASTStructDecl;
 
@@ -296,6 +327,18 @@ typedef struct {
     ASTNode base;
     char* struct_name;
     struct ASTNode* methods;
+    /* RFC §4.4: generic impls declare their own type parameters and
+     * echo them on the struct name:
+     *   impl<T> Stack<T> { fn push(self, x: T) { ... } }
+     * type_params[i] / type_args[i] are strdup'd owned strings (freed in
+     * ast_free()). When both counts are 0 the impl is non-generic
+     * (legacy). Validation of the echo (type_arg_count ==
+     * type_param_count, names match) happens in the semantic pass with
+     * better messages than the parser could produce. */
+    char** type_params;
+    int type_param_count;
+    char** type_args;
+    int type_arg_count;
 } ASTImplDecl;
 
 /* Phase 2: enum declaration.
@@ -375,6 +418,18 @@ ASTVarDecl* ast_new_var_decl(char* name, ASTNode* initializer, int line, int col
 ASTVarDecl* ast_new_var_decl_typed(char* name, ASTNode* initializer, char* type_annotation, int line, int column);
 ASTFnDecl* ast_new_fn_decl(char* name, char** params, int param_count, ASTNode* body, int line, int column);
 ASTFnDecl* ast_new_fn_decl_typed(char* name, char** params, char** param_types, int param_count, char* return_type_annotation, ASTNode* body, int line, int column);
+/* Generics PR 2: full constructor with an optional type parameter list and
+ * per-parameter constraints. type_params may be NULL when tp_count == 0.
+ * Constraints may be NULL entries (unconstrained parameters). All strings
+ * are strdup'd here; caller retains input ownership. */
+ASTFnDecl* ast_new_fn_decl_generic(char* name, char** type_params, char** constraints, int tp_count,
+                                   char** params, char** param_types, int param_count,
+                                   char* return_type_annotation, ASTNode* body, int line, int column);
+/* Generics PR 2: call-site constructors carrying optional explicit type
+ * arguments (`f<int>(x)`). Legacy ctors delegate with count 0. The arrays
+ * are copied (strdup each entry); caller retains input ownership. */
+ASTCallExpr* ast_new_call_expr_typed(char* name, char** type_args, int type_arg_count, ASTNode** args, int arg_count, int line, int column);
+ASTCallStmt* ast_new_call_stmt_typed(char* name, char** type_args, int type_arg_count, ASTNode** args, int arg_count, int line, int column);
 ASTBlock* ast_new_block(ASTNode* statements, int line, int column);
 ASTIfStmt* ast_new_if_stmt(ASTNode* condition, ASTNode* then_branch, ASTNode* else_branch, int line, int column);
 ASTWhileStmt* ast_new_while_stmt(ASTNode* condition, ASTNode* body, int line, int column);
@@ -419,13 +474,24 @@ ASTMemberCall* ast_new_member_call(ASTNode* object, char* member_name, ASTNode**
  * Generics PR 1: type_params / type_param_count carry the optional
  * `<T, K, V>` parameter list. Pass type_param_count = 0 (and type_params
  * = NULL) for non-generic structs — the legacy case. The strings are
- * strdup'd here. */
-ASTNode* ast_new_struct_decl(char* name, char** field_names, char** field_types, int field_count, char** type_params, int type_param_count, int line, int column);
+ * strdup'd here.
+ * PR 6: type_param_constraints may be NULL (all-unconstrained) or an
+ * array of type_param_count entries whose entries may be NULL. */
+ASTNode* ast_new_struct_decl(char* name, char** field_names, char** field_types, int field_count,
+                             char** type_params, char** type_param_constraints, int type_param_count,
+                             int line, int column);
 
 /* impl Type { fn method(...) {...} ... } - `methods` is a linked list of
  * AST_FN_DECL nodes (linked via ->next). The list is taken ownership of;
- * the caller should NOT free it. struct_name is strdup'd. */
+ * the caller should NOT free it. struct_name is strdup'd.
+ * See ast_new_impl_decl_generic for the RFC §4.4 form. */
 ASTNode* ast_new_impl_decl(char* struct_name, ASTNode* methods, int line, int column);
+/* RFC §4.4: generic impl variant. Pass counts 0 + NULL arrays for the
+ * legacy non-generic form. All strings are strdup'd here. */
+ASTNode* ast_new_impl_decl_generic(char* struct_name,
+                                   char** type_params, int type_param_count,
+                                   char** type_args, int type_arg_count,
+                                   ASTNode* methods, int line, int column);
 
 /* enum Name { Variant, ... } - `variants` is an array of strings, strdup'd
  * here. The caller retains ownership of the input array. */
